@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.90"
 description = "Passive network device monitor daemon: watches LAN broadcast and multicast traffic without transmitting"
 license = "MIT"
-repository = "https://github.com/jeremyandrews/netgrasp"
+repository = "https://github.com/jeremyandrews/netgraspd"
 readme = "README.md"
 
 [lib]
