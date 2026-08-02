@@ -1,0 +1,51 @@
+[package]
+name = "netgraspd"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "Passive network device monitor daemon: watches LAN broadcast and multicast traffic without transmitting"
+license = "MIT"
+repository = "https://github.com/jeremyandrews/netgrasp"
+readme = "README.md"
+
+[lib]
+name = "netgraspd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "netgraspd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+async-trait = "0.1.91"
+chrono = { version = "0.4.45", features = ["serde"] }
+clap = { version = "4.6.5", features = ["derive"] }
+deadpool-postgres = "0.14.1"
+figment = { version = "0.10.19", features = ["toml", "env", "test"] }
+hickory-resolver = { version = "0.26.1", features = ["tokio"] }
+pcap = "2.4.0"
+refinery = { version = "0.9.2", features = ["tokio-postgres"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-postgres = { version = "0.7.18", features = [
+    "with-chrono-0_4",
+    "with-serde_json-1",
+] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+libc = "0.2.189"
+tokio-test = "0.4.5"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
