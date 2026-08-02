@@ -25,7 +25,9 @@
 #![warn(missing_docs)]
 
 pub mod capture;
+pub mod cli;
 pub mod config;
+pub mod daemon;
 pub mod db;
 pub mod device;
 pub mod events;
