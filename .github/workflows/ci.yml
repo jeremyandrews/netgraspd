@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: fmt, clippy, unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libpcap
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --lib
+
+      - name: Documentation builds
+        run: cargo doc --no-deps
+
+  integration:
+    name: integration tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: netgrasp
+          POSTGRES_PASSWORD: netgrasp
+          POSTGRES_DB: netgrasp
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U netgrasp"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libpcap
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The integration tests skip themselves when no database is reachable, so
+      # this step asserts they actually ran rather than trusting a green tick.
+      - name: Integration tests
+        env:
+          NETGRASP_TEST_DATABASE_URL: postgres://netgrasp:netgrasp@localhost:5432/netgrasp
+        run: |
+          cargo test --test pipeline -- --nocapture 2>&1 | tee integration.log
+          if grep -q "skipping: no Postgres" integration.log; then
+            echo "::error::the integration tests skipped themselves; the database was not reachable"
+            exit 1
+          fi
+
+  build:
+    name: release build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libpcap
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      # The vendor registry is embedded at build time; a truncated or missing
+      # data file would silently disable every vendor signal.
+      - name: Vendor registry is present
+        run: |
+          entries=$(wc -l < data/oui.tsv)
+          echo "$entries registry entries"
+          test "$entries" -gt 40000

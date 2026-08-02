@@ -211,24 +211,44 @@ impl Entry {
             .map(|s| s.value.clone())
     }
 
-    /// Adds a signal, moving it to the front if it is already known.
+    /// Records a batch of signals from one source, most recently confirmed
+    /// first.
     ///
-    /// Returns true when this was new evidence rather than a repeat.
-    fn record_signal(&mut self, signal: &Signal) -> bool {
-        if let Some(pos) = self
-            .signals
-            .iter()
-            .position(|s| s.kind == signal.kind && s.value == signal.value)
-        {
-            // Already known: move to the front so it counts as the most recently
-            // confirmed value of its kind.
-            let existing = self.signals.remove(pos);
-            self.signals.insert(0, existing);
-            false
-        } else {
-            self.signals.insert(0, signal.clone());
-            true
+    /// The batch is inserted at the front **as a block**, preserving the order
+    /// the source offered it. That ordering is meaningful: an mDNS packet lists
+    /// the instance name (which a human chose) before the host name (which a
+    /// vendor chose), and both are `MdnsName` signals, so the scorer's
+    /// same-kind tie-break is the only thing that keeps `Living Room Apple TV`
+    /// from losing to `living-room-apple-tv`. Inserting them one at a time
+    /// would silently reverse the batch.
+    ///
+    /// Returns true when any of them was new evidence rather than a repeat.
+    fn record_signals(&mut self, incoming: &[Signal]) -> bool {
+        let mut any_new = false;
+        let mut batch: Vec<Signal> = Vec::with_capacity(incoming.len());
+        for signal in incoming {
+            if batch
+                .iter()
+                .any(|s| s.kind == signal.kind && s.value == signal.value)
+            {
+                continue;
+            }
+            match self
+                .signals
+                .iter()
+                .position(|s| s.kind == signal.kind && s.value == signal.value)
+            {
+                Some(pos) => {
+                    self.signals.remove(pos);
+                }
+                None => any_new = true,
+            }
+            batch.push(signal.clone());
         }
+        for signal in batch.into_iter().rev() {
+            self.signals.insert(0, signal);
+        }
+        any_new
     }
 
     fn rescore(&mut self) -> Option<Identity> {
@@ -437,15 +457,19 @@ impl Manager {
         }
         entry.last_interface = Some(obs.interface.clone());
 
-        // Identity evidence.
-        for signal in &obs.signals {
-            if signal.value.trim().is_empty() {
-                continue;
-            }
-            entry.record_signal(signal);
+        // Identity evidence. Recorded as one batch so that the order the source
+        // listed them in survives; see `record_signals`.
+        let usable: Vec<Signal> = obs
+            .signals
+            .iter()
+            .filter(|s| !s.value.trim().is_empty())
+            .cloned()
+            .collect();
+        entry.record_signals(&usable);
+        for signal in usable {
             effects.push(Effect::Signal {
                 mac: entry.mac,
-                signal: signal.clone(),
+                signal,
                 at,
             });
         }
@@ -556,7 +580,7 @@ impl Manager {
         let Some(entry) = self.devices.get_mut(&mac) else {
             return Vec::new();
         };
-        let is_new = entry.record_signal(signal);
+        let is_new = entry.record_signals(std::slice::from_ref(signal));
         entry.dirty = true;
         let mut effects = vec![Effect::Signal {
             mac,
@@ -952,6 +976,48 @@ mod tests {
             Some("ipad.lan"),
             "the weaker signal is still stored"
         );
+    }
+
+    #[test]
+    fn a_batch_of_same_kind_signals_keeps_the_order_the_source_offered() {
+        // Regression: signals used to be front-inserted one at a time, which
+        // reversed each packet's batch. An mDNS packet lists the instance name
+        // (human-chosen) before the host name (vendor-chosen), and both are
+        // MdnsName, so reversing silently promoted `living-room-apple-tv` over
+        // `Living Room Apple TV`.
+        let mut m = Manager::new(config(), false);
+        let obs = obs_at("b8:27:eb:00:00:01", Some("192.168.1.55"), base())
+            .with_signal(Signal::new(SignalKind::MdnsName, "Living Room Apple TV"))
+            .with_signal(Signal::new(SignalKind::MdnsName, "living-room-apple-tv"));
+        let _ = m.observe(&obs);
+        assert_eq!(m.snapshot()[0].display(), "Living Room Apple TV");
+    }
+
+    #[test]
+    fn re_seeing_the_same_batch_does_not_reorder_it_or_raise_an_event() {
+        let mut m = Manager::new(config(), false);
+        let obs = obs_at("b8:27:eb:00:00:01", Some("192.168.1.55"), base())
+            .with_signal(Signal::new(SignalKind::MdnsName, "Living Room Apple TV"))
+            .with_signal(Signal::new(SignalKind::MdnsName, "living-room-apple-tv"));
+        let _ = m.observe(&obs);
+        for i in 1..5 {
+            let repeat = obs_at("b8:27:eb:00:00:01", Some("192.168.1.55"), at(i * 10))
+                .with_signal(Signal::new(SignalKind::MdnsName, "Living Room Apple TV"))
+                .with_signal(Signal::new(SignalKind::MdnsName, "living-room-apple-tv"));
+            let effects = m.observe(&repeat);
+            assert!(events(&effects).is_empty(), "repeat {i}: {effects:?}");
+        }
+        assert_eq!(m.snapshot()[0].display(), "Living Room Apple TV");
+    }
+
+    #[test]
+    fn a_duplicate_inside_one_batch_is_stored_once() {
+        let mut m = Manager::new(config(), false);
+        let obs = obs_at("b8:27:eb:00:00:01", None, base())
+            .with_signal(Signal::new(SignalKind::MdnsName, "Kitchen Speaker"))
+            .with_signal(Signal::new(SignalKind::MdnsName, "Kitchen Speaker"));
+        let _ = m.observe(&obs);
+        assert_eq!(m.snapshot()[0].display(), "Kitchen Speaker");
     }
 
     #[test]

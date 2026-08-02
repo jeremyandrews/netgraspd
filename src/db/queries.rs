@@ -373,9 +373,15 @@ pub async fn upsert_signal(
 pub async fn load_all_signals(client: &Client) -> Result<HashMap<i64, Vec<Signal>>> {
     let rows = client
         .query(
+            // The id tie-break is load-bearing, not cosmetic: several signals
+            // from one packet share a timestamp, and without it the reload order
+            // is whatever Postgres felt like. A device would then rescore to a
+            // different name on every restart and emit a spurious name_updated.
+            // Ascending id is insertion order, which is the order the source
+            // listed them in.
             "SELECT device_id, signal_type, value
                FROM ng_device_signals
-              ORDER BY device_id, last_seen_at DESC",
+              ORDER BY device_id, last_seen_at DESC, id ASC",
             &[],
         )
         .await
@@ -415,8 +421,11 @@ pub async fn open_presence(
 ) -> Result<()> {
     client
         .execute(
-            "INSERT INTO ng_presence (device_id, interface, ip, started_at)
-             SELECT $1, $2, $3, $4
+            // observation_count starts at zero, not at the column default of
+            // one: the observation that opened the session is itself counted by
+            // the next flush, and seeding the counter would double it.
+            "INSERT INTO ng_presence (device_id, interface, ip, started_at, observation_count)
+             SELECT $1, $2, $3, $4, 0
               WHERE NOT EXISTS (
                     SELECT 1 FROM ng_presence
                      WHERE device_id = $1 AND ended_at IS NULL AND is_summary = FALSE)",

@@ -13,7 +13,7 @@ use crate::device::DeviceSnapshot;
 /// Longest any single cell is allowed to be before it is truncated. Wide enough
 /// for a long mDNS instance name, narrow enough that five columns fit an
 /// 80-column terminal.
-const MAX_CELL: usize = 32;
+pub const MAX_CELL: usize = 32;
 
 /// Renders a table with a header row and a rule beneath it.
 ///

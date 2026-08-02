@@ -1,0 +1,108 @@
+# netgraspd configuration.
+#
+# Every value below is the compiled default, so an empty file behaves the same
+# as this one. Copy to netgrasp.toml and change what you need.
+#
+# Precedence, highest first: command-line flags, then NETGRASP_ environment
+# variables (with __ between levels, e.g. NETGRASP_DATABASE__URL), then this
+# file, then the defaults.
+#
+# Durations are 30m, 2h, 1d, 90s, or a bare integer meaning seconds.
+
+[database]
+url = "postgres://netgrasp:netgrasp@localhost:5432/netgrasp"
+# The daemon is not connection-hungry: the flush task and the CLI readers are
+# the only consumers.
+pool_size = 4
+
+[capture]
+# Empty means every non-loopback interface that is up and has an address.
+interfaces = []
+
+# Milestone 1 implements arp and mdns. Naming dhcp, ssdp, ndp or nbns is
+# accepted and logs a warning: they are stubs until milestone 2.
+sources = ["arp", "mdns"]
+
+# A full channel blocks the capture thread, which is the correct backpressure.
+# Dropping packets silently would corrupt presence tracking.
+channel_capacity = 4096
+
+snaplen = 1600
+buffer_size = 1048576
+
+# Cross-interface dedup: the key is (MAC, observation kind, timestamp rounded to
+# this many seconds), so the same broadcast arriving on two interfaces counts
+# once.
+dedup_resolution_secs = 1
+dedup_capacity = 8192
+
+[state]
+# Silence after which an online device becomes idle, then offline.
+idle_timeout = "30m"
+offline_timeout = "180m"
+
+# How often in-memory last_seen_at values are written to Postgres. A crash loses
+# at most this much timestamp precision; state changes are written the moment
+# they happen, so none of those are ever at risk.
+flush_interval = "60s"
+
+# How often timeouts are applied.
+sweep_interval = "30s"
+
+# Devices that are meant to be quiet for long stretches. Keyed by device_type,
+# which milestone 2's classifier sets.
+[state.device_type_overrides.router]
+idle_timeout = "24h"
+offline_timeout = "24h"
+
+[state.device_type_overrides.printer]
+idle_timeout = "12h"
+offline_timeout = "12h"
+
+[identity]
+# Vendor lookup against the IEEE registries embedded in the binary.
+oui = true
+
+# Reverse DNS is the one thing the daemon does that transmits. The queries go to
+# your resolver, never to the monitored device, but it is opt-in anyway.
+reverse_dns = false
+reverse_dns_ttl = "1h"
+
+[learning]
+# Run a baseline window when ng_devices is empty. During the window everything
+# works normally and every event is recorded; only notifications are suppressed.
+on_first_run = true
+duration = "5m"
+
+[notify]
+enabled = true
+
+# Minimum gap between two notifications about the same device.
+debounce = "5m"
+
+# Events are held for batch_window; a window that accumulated at least
+# batch_threshold of them collapses into one summary instead of a storm. That is
+# what makes a router reboot one message rather than forty.
+#
+# The cost is up to batch_window of latency on every notification. Set
+# batch_threshold = 0 to turn batching off entirely.
+batch_threshold = 10
+batch_window = "60s"
+
+# Which events are worth telling a human about. The full set is new_device,
+# returned, ip_changed, went_offline, name_updated.
+event_types = ["new_device", "returned"]
+
+# Optional. Local time, and the period may wrap midnight.
+# [notify.quiet_hours]
+# start = "22:00"
+# end = "07:00"
+
+# Optional. Absent means events are recorded but never delivered anywhere.
+# [notify.ntfy]
+# topic = "my-secret-topic-name"
+# server = "https://ntfy.sh"
+# priority = 3
+# urgent_priority = 5
+# token = "tk_..."
+# timeout = "10s"
