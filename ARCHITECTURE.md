@@ -67,6 +67,34 @@ place. The daemon owns what the sandbox cannot hold:
   kernel content, gathers, tiles, roles, admin editing. The daemon never links
   Trovato and never serves HTTP.
 
+### Depending on Trovato is the point, not a limitation
+
+Ruled 2026-08-02, after this was argued the wrong way round once.
+
+The predecessor had a `--identify` labelling mode and `--custom-hide-filters`,
+so it is tempting to read their absence here as a regression and to propose a
+`netgraspd name <mac>` subcommand or a `--hidden` filter to close the gap. Do
+not. Naming a device, hiding it, assigning an owner and toggling its
+notifications are admin-UI work, and Trovato supplies the form, the roles, the
+audit trail and the access checks for free. Rebuilding any of it daemon-side
+means writing a second, worse copy of a surface that already exists, and then
+owning the question of which copy wins.
+
+The daemon owns what the sandbox cannot hold. That is the whole test. If a
+feature does not need `CAP_NET_RAW` or seconds-matter latency, it is
+plugin-side, and "but then it needs Trovato" is the intended outcome rather
+than an objection.
+
+Practical consequences, so they are not mistaken for oversights:
+
+- `netgraspd devices` shows every device including hidden ones. It is an
+  operator and debugging surface, not the dashboard; hiding is a display
+  concern the plugin's gather applies.
+- There is no daemon-side way to set `display_name`, `notes`, `hidden` or
+  `notify`. The daemon reads them and never writes them.
+- A daemon-only deployment is a deliberately reduced thing: capture, state,
+  events and notifications, with a bare CLI over the top.
+
 ## Storage
 
 **Postgres, not SQLite** (a deliberate divergence from the original design). One
