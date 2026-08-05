@@ -10,6 +10,10 @@
 //! `cargo test` on everything else, and CI sets the variable so the coverage is
 //! not quietly lost there.
 
+// Each integration test binary compiles this module separately, so a helper
+// only one of them uses reads as dead code in the others.
+#![allow(dead_code)]
+
 use netgraspd::db::Db;
 
 use tokio::sync::{Mutex, MutexGuard};

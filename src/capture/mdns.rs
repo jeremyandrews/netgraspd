@@ -37,10 +37,6 @@ pub const FILTER: &str = "udp port 5353";
 /// The mDNS port.
 const MDNS_PORT: u16 = 5353;
 
-/// Longest name Netgrasp will show. Anything longer is a responder being
-/// creative rather than descriptive.
-const MAX_NAME_LEN: usize = 96;
-
 /// Parses one captured frame into an observation.
 ///
 /// Returns `None` when the frame is not mDNS, when the source MAC cannot
@@ -82,9 +78,20 @@ pub fn parse_frame(
         source: SOURCE,
         kind,
         signals: extract_signals(udp.payload, &msg),
+        // mDNS carries no field a security analyzer acts on.
+        detail: None,
         observed_at,
     })
 }
+
+/// TXT record keys that carry a hardware or OS model.
+///
+/// `model` is what `_device-info._tcp` publishes and is the single best mDNS
+/// operating-system signal there is: an Apple device announces
+/// `model=MacBookPro18,1` unprompted. `am` is the same thing under AirPlay's
+/// abbreviated key set, and `ty` and `usb_MDL` are what a printer publishes
+/// under `_ipp._tcp`.
+const MODEL_KEYS: [&str; 4] = ["model", "am", "ty", "usb_MDL"];
 
 /// Pulls identity signals out of a parsed mDNS message.
 ///
@@ -96,6 +103,7 @@ pub fn extract_signals(msg_bytes: &[u8], msg: &dns::Message<'_>) -> Vec<Signal> 
     let mut instances: Vec<String> = Vec::new();
     let mut hosts: Vec<String> = Vec::new();
     let mut services: Vec<String> = Vec::new();
+    let mut models: Vec<String> = Vec::new();
 
     for record in &msg.records {
         match record.rtype {
@@ -108,8 +116,12 @@ pub fn extract_signals(msg_bytes: &[u8], msg: &dns::Message<'_>) -> Vec<Signal> 
                 // one.
                 collect_service(&record.name, &mut services);
             }
-            dns::TYPE_SRV | dns::TYPE_TXT => {
+            dns::TYPE_SRV => {
                 collect_instance(&record.name, &mut instances, &mut services);
+            }
+            dns::TYPE_TXT => {
+                collect_instance(&record.name, &mut instances, &mut services);
+                collect_models(record, &mut models);
             }
             dns::TYPE_A | dns::TYPE_AAAA => {
                 if let Some(host) = host_label(&record.name) {
@@ -131,7 +143,7 @@ pub fn extract_signals(msg_bytes: &[u8], msg: &dns::Message<'_>) -> Vec<Signal> 
         }
     }
 
-    let mut out = Vec::with_capacity(instances.len() + hosts.len() + services.len());
+    let mut out = Vec::with_capacity(instances.len() + hosts.len() + services.len() + models.len());
     out.extend(
         instances
             .into_iter()
@@ -147,7 +159,33 @@ pub fn extract_signals(msg_bytes: &[u8], msg: &dns::Message<'_>) -> Vec<Signal> 
             .into_iter()
             .map(|v| Signal::new(SignalKind::MdnsService, v)),
     );
+    out.extend(
+        models
+            .into_iter()
+            .map(|v| Signal::new(SignalKind::MdnsModel, v)),
+    );
     out
+}
+
+/// Pulls model strings out of a TXT record's key/value pairs.
+///
+/// TXT strings are `key=value`; a string with no `=` is a bare flag and names
+/// nothing.
+fn collect_models(record: &dns::Record<'_>, models: &mut Vec<String>) {
+    for entry in dns::txt_strings(record) {
+        let Some((key, value)) = entry.split_once('=') else {
+            continue;
+        };
+        if !MODEL_KEYS
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case(key.trim()))
+        {
+            continue;
+        }
+        if let Some(model) = crate::capture::names::clean_value(value) {
+            push_unique(models, model);
+        }
+    }
 }
 
 /// Records the instance name and service type of a `instance._svc._proto.local`
@@ -204,18 +242,11 @@ fn host_label(labels: &[String]) -> Option<String> {
 
 /// Rejects names not worth showing a human: blank, over-long, or an address
 /// written with separators swapped for dots.
+///
+/// The rules are shared with every other protocol that volunteers a name; see
+/// [`crate::capture::names`].
 fn usable_name(raw: &str) -> Option<String> {
-    let name = raw.trim();
-    if name.is_empty() || name.len() > MAX_NAME_LEN {
-        return None;
-    }
-    if name
-        .chars()
-        .all(|c| c.is_ascii_digit() || c == '-' || c == '_' || c == '.')
-    {
-        return None;
-    }
-    Some(name.to_string())
+    crate::capture::names::clean_name(raw)
 }
 
 /// Appends a value unless it is already present, preserving first-seen order.
@@ -362,6 +393,91 @@ mod tests {
         assert_eq!(usable_name(""), None);
         assert_eq!(usable_name(&"x".repeat(200)), None);
         assert_eq!(usable_name("pi4"), Some("pi4".into()));
+    }
+
+    #[test]
+    fn a_device_info_txt_record_yields_the_model_that_names_the_os() {
+        // `_device-info._tcp` is what Apple devices publish unprompted, and
+        // `model=` in it is the strongest OS evidence mDNS carries.
+        let msg = txt_message(
+            &["Jeremy's MacBook", "_device-info", "_tcp", "local"],
+            &["model=MacBookPro18,1", "osxvers=21"],
+        );
+        let parsed = dns::parse_message(&msg).expect("parsed");
+        let signals = extract_signals(&msg, &parsed);
+        let models: Vec<&str> = signals
+            .iter()
+            .filter(|s| s.kind == SignalKind::MdnsModel)
+            .map(|s| s.value.as_str())
+            .collect();
+        assert_eq!(models, vec!["MacBookPro18,1"]);
+        assert_eq!(
+            signals
+                .iter()
+                .filter(|s| s.kind == SignalKind::MdnsName)
+                .map(|s| s.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Jeremy's MacBook"],
+            "the instance name is still the naming signal"
+        );
+    }
+
+    #[test]
+    fn a_printer_txt_record_yields_its_model_under_a_different_key() {
+        let msg = txt_message(
+            &["Office Printer", "_ipp", "_tcp", "local"],
+            &["ty=Brother HL-L2350DW", "note=", "rp=ipp/print"],
+        );
+        let parsed = dns::parse_message(&msg).expect("parsed");
+        let models: Vec<String> = extract_signals(&msg, &parsed)
+            .into_iter()
+            .filter(|s| s.kind == SignalKind::MdnsModel)
+            .map(|s| s.value)
+            .collect();
+        assert_eq!(models, vec!["Brother HL-L2350DW"]);
+    }
+
+    #[test]
+    fn txt_strings_that_are_not_key_value_pairs_name_nothing() {
+        let msg = txt_message(
+            &["Thing", "_http", "_tcp", "local"],
+            &["flagonly", "=novalue", "model="],
+        );
+        let parsed = dns::parse_message(&msg).expect("parsed");
+        assert!(
+            extract_signals(&msg, &parsed)
+                .iter()
+                .all(|s| s.kind != SignalKind::MdnsModel)
+        );
+    }
+
+    /// Builds an mDNS response holding one TXT record with the given strings.
+    fn txt_message(owner: &[&str], strings: &[&str]) -> Vec<u8> {
+        let mut m = vec![0, 0, 0x84, 0x00];
+        m.extend_from_slice(&0u16.to_be_bytes()); // questions
+        m.extend_from_slice(&1u16.to_be_bytes()); // answers
+        m.extend_from_slice(&0u16.to_be_bytes()); // authority
+        m.extend_from_slice(&0u16.to_be_bytes()); // additional
+        for label in owner {
+            m.push(u8::try_from(label.len()).expect("label fits"));
+            m.extend_from_slice(label.as_bytes());
+        }
+        m.push(0);
+        m.extend_from_slice(&dns::TYPE_TXT.to_be_bytes());
+        m.extend_from_slice(&0x8001u16.to_be_bytes());
+        m.extend_from_slice(&120u32.to_be_bytes());
+        let mut rdata = Vec::new();
+        for s in strings {
+            rdata.push(u8::try_from(s.len()).expect("string fits"));
+            rdata.extend_from_slice(s.as_bytes());
+        }
+        m.extend_from_slice(
+            &u16::try_from(rdata.len())
+                .expect("rdata fits")
+                .to_be_bytes(),
+        );
+        m.extend_from_slice(&rdata);
+        m
     }
 
     #[test]

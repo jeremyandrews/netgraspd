@@ -418,6 +418,7 @@ async fn a_learning_window_records_every_event_and_notifies_none_of_them() {
     // The quiet half: the dispatcher refuses to deliver any of them.
     let mut dispatcher = Dispatcher::new(
         NotifyConfig::default(),
+        netgraspd::config::SecurityNotifyConfig::default(),
         chrono::FixedOffset::east_opt(0).expect("utc"),
     );
     let mut deliveries: Vec<Delivery> = Vec::new();

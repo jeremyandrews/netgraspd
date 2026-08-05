@@ -174,6 +174,8 @@ pub struct Config {
     pub learning: LearningConfig,
     /// Notification dispatch and delivery.
     pub notify: NotifyConfig,
+    /// The security analyzer chain.
+    pub security: SecurityConfig,
 }
 
 /// Postgres connection settings.
@@ -331,6 +333,16 @@ pub struct IdentityConfig {
     pub reverse_dns: bool,
     /// How long before a reverse lookup for the same address is retried.
     pub reverse_dns_ttl: HumanDuration,
+    /// Where `netgraspd update-fingerprints` writes its download, and where the
+    /// daemon looks for a fingerprint table before falling back to the copy
+    /// compiled into the binary.
+    ///
+    /// A missing file is not an error: the embedded table is the normal case and
+    /// the daemon never downloads on its own.
+    pub fingerprint_path: PathBuf,
+    /// Where `netgraspd update-fingerprints` downloads from when no URL is
+    /// given on the command line.
+    pub fingerprint_url: String,
 }
 
 impl Default for IdentityConfig {
@@ -339,6 +351,8 @@ impl Default for IdentityConfig {
             oui: true,
             reverse_dns: false,
             reverse_dns_ttl: HumanDuration::from_secs(3600),
+            fingerprint_path: PathBuf::from("/var/lib/netgraspd/dhcp_fingerprints.conf"),
+            fingerprint_url: String::new(),
         }
     }
 }
@@ -460,6 +474,330 @@ impl Default for NtfyConfig {
     }
 }
 
+/// The security analyzer chain.
+///
+/// Every analyzer can be switched off individually, because a network with a
+/// legitimate scanner on it (a monitoring box, a vulnerability scanner) would
+/// otherwise generate one alert per sweep forever, and an operator who cannot
+/// silence one detector silences all of them.
+///
+/// Addresses are held as strings rather than parsed types so that a malformed
+/// entry produces a configuration error naming the key, rather than a figment
+/// deserialisation message about a type nobody wrote in the file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SecurityConfig {
+    /// Master switch for the whole chain.
+    pub enabled: bool,
+    /// The gateway's hardware address. Empty means "work it out from traffic".
+    pub gateway_mac: String,
+    /// The gateway's address. Empty means "work it out from traffic".
+    pub gateway_ip: String,
+    /// MAC addresses no analyzer alerts on. For the monitoring box that is
+    /// meant to sweep the network.
+    pub exempt_macs: Vec<String>,
+    /// How many MACs or addresses each analyzer tracks before evicting the
+    /// least recently seen. Bounds memory on a hostile network: a scanner
+    /// forging a new source MAC per packet must not be able to grow the daemon.
+    pub max_tracked: usize,
+    /// Detection of one MAC sweeping the address space.
+    pub arp_scan: ArpScanConfig,
+    /// Detection of a MAC claiming somebody else's address.
+    pub arp_spoof: ArpSpoofConfig,
+    /// Detection of an unexpected DHCP server.
+    pub rogue_dhcp: RogueDhcpConfig,
+    /// Detection of a device changing what it appears to be.
+    pub identity_change: IdentityChangeConfig,
+    /// Detection of two devices using one address.
+    pub ip_conflict: IpConflictConfig,
+    /// Detection of a gratuitous ARP flood.
+    pub gratuitous_arp: GratuitousArpConfig,
+    /// How security events are delivered, overriding the ordinary rules.
+    pub notifications: SecurityNotifyConfig,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        SecurityConfig {
+            enabled: true,
+            gateway_mac: String::new(),
+            gateway_ip: String::new(),
+            exempt_macs: Vec::new(),
+            max_tracked: 4096,
+            arp_scan: ArpScanConfig::default(),
+            arp_spoof: ArpSpoofConfig::default(),
+            rogue_dhcp: RogueDhcpConfig::default(),
+            identity_change: IdentityChangeConfig::default(),
+            ip_conflict: IpConflictConfig::default(),
+            gratuitous_arp: GratuitousArpConfig::default(),
+            notifications: SecurityNotifyConfig::default(),
+        }
+    }
+}
+
+impl SecurityConfig {
+    /// The configured gateway MAC, if one was set and it parses.
+    #[must_use]
+    pub fn gateway_mac(&self) -> Option<crate::types::MacAddr> {
+        parse_optional(&self.gateway_mac)
+    }
+
+    /// The configured gateway address, if one was set and it parses.
+    #[must_use]
+    pub fn gateway_ip(&self) -> Option<std::net::Ipv4Addr> {
+        parse_optional(&self.gateway_ip)
+    }
+
+    /// The exemption list, as parsed addresses.
+    #[must_use]
+    pub fn exempt_macs(&self) -> Vec<crate::types::MacAddr> {
+        self.exempt_macs
+            .iter()
+            .filter_map(|m| m.trim().parse().ok())
+            .collect()
+    }
+
+    /// Rejects unusable combinations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unparseable address, a zero window or threshold,
+    /// or an unknown identity sensitivity.
+    pub fn validate(&self) -> Result<()> {
+        check_optional::<crate::types::MacAddr>(&self.gateway_mac, "security.gateway_mac")?;
+        check_optional::<std::net::Ipv4Addr>(&self.gateway_ip, "security.gateway_ip")?;
+        for (i, mac) in self.exempt_macs.iter().enumerate() {
+            if mac.trim().parse::<crate::types::MacAddr>().is_err() {
+                bail!("security.exempt_macs[{i}] is not a MAC address: {mac:?}");
+            }
+        }
+        for (i, mac) in self.rogue_dhcp.known_servers.iter().enumerate() {
+            if mac.trim().parse::<crate::types::MacAddr>().is_err() {
+                bail!("security.rogue_dhcp.known_servers[{i}] is not a MAC address: {mac:?}");
+            }
+        }
+        if self.max_tracked == 0 {
+            bail!("security.max_tracked must be at least 1");
+        }
+        if self.arp_scan.window.as_secs() == 0 {
+            bail!("security.arp_scan.window must be at least 1s");
+        }
+        if self.arp_scan.threshold == 0 {
+            bail!("security.arp_scan.threshold must be at least 1");
+        }
+        if self.gratuitous_arp.window.as_secs() == 0 {
+            bail!("security.gratuitous_arp.window must be at least 1s");
+        }
+        if self.gratuitous_arp.threshold == 0 {
+            bail!("security.gratuitous_arp.threshold must be at least 1");
+        }
+        if self.ip_conflict.active_within.as_secs() == 0 {
+            bail!("security.ip_conflict.active_within must be at least 1s");
+        }
+        if !matches!(
+            self.identity_change.sensitivity.as_str(),
+            "category" | "any"
+        ) {
+            bail!(
+                "security.identity_change.sensitivity must be \"category\" or \"any\", not {:?}",
+                self.identity_change.sensitivity
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Parses an optional address field, treating blank as absent.
+fn parse_optional<T: std::str::FromStr>(raw: &str) -> Option<T> {
+    let trimmed = raw.trim();
+    (!trimmed.is_empty())
+        .then(|| trimmed.parse().ok())
+        .flatten()
+}
+
+/// Confirms an optional address field is blank or parseable.
+fn check_optional<T: std::str::FromStr>(raw: &str, key: &str) -> Result<()> {
+    let trimmed = raw.trim();
+    if !trimmed.is_empty() && trimmed.parse::<T>().is_err() {
+        bail!("{key} is not a valid address: {trimmed:?}");
+    }
+    Ok(())
+}
+
+/// The `arp_scan` analyzer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ArpScanConfig {
+    /// Whether the analyzer runs.
+    pub enabled: bool,
+    /// Sliding window over which distinct targets are counted.
+    pub window: HumanDuration,
+    /// Distinct target addresses inside the window that constitute a scan.
+    pub threshold: usize,
+    /// The same, for the gateway and anything in `exempt_macs`.
+    ///
+    /// A router legitimately ARPs for everything it forwards to, so holding it
+    /// to the same threshold as a laptop produces one alert per minute forever.
+    pub gateway_threshold: usize,
+}
+
+impl Default for ArpScanConfig {
+    fn default() -> Self {
+        ArpScanConfig {
+            enabled: true,
+            window: HumanDuration::from_secs(30),
+            threshold: 10,
+            gateway_threshold: 100,
+        }
+    }
+}
+
+/// The `arp_spoof` analyzer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ArpSpoofConfig {
+    /// Whether the analyzer runs.
+    pub enabled: bool,
+    /// How recently the previous holder must have been heard from for a new
+    /// claim to be a spoof rather than a DHCP reassignment.
+    ///
+    /// This is the whole difference between a security tool and a nuisance. A
+    /// device goes offline, its lease expires, the address is handed to
+    /// somebody else, and nothing is wrong. Only a claim on an address whose
+    /// current holder is *still talking* is an attack.
+    pub grace_period: HumanDuration,
+}
+
+impl Default for ArpSpoofConfig {
+    fn default() -> Self {
+        ArpSpoofConfig {
+            enabled: true,
+            grace_period: HumanDuration::from_secs(60),
+        }
+    }
+}
+
+/// The `rogue_dhcp` analyzer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RogueDhcpConfig {
+    /// Whether the analyzer runs.
+    pub enabled: bool,
+    /// Hardware addresses that are allowed to answer DHCP.
+    ///
+    /// When empty the first server heard after startup is trusted, which is
+    /// right on a healthy network and wrong on one where a rogue server is
+    /// already running when the daemon starts. Listing the real server here is
+    /// what closes that window.
+    pub known_servers: Vec<String>,
+}
+
+impl Default for RogueDhcpConfig {
+    fn default() -> Self {
+        RogueDhcpConfig {
+            enabled: true,
+            known_servers: Vec::new(),
+        }
+    }
+}
+
+/// The `identity_change` analyzer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IdentityChangeConfig {
+    /// Whether the analyzer runs.
+    pub enabled: bool,
+    /// `category` fires only when a known device type or OS becomes a different
+    /// known one. `any` also fires the first time a device is classified, which
+    /// is noisy on a fresh install and useful when hunting.
+    pub sensitivity: String,
+}
+
+impl Default for IdentityChangeConfig {
+    fn default() -> Self {
+        IdentityChangeConfig {
+            enabled: true,
+            sensitivity: "category".to_string(),
+        }
+    }
+}
+
+/// The `ip_conflict` analyzer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IpConflictConfig {
+    /// Whether the analyzer runs.
+    pub enabled: bool,
+    /// How close together two MACs must use one address to count as
+    /// simultaneous.
+    pub active_within: HumanDuration,
+}
+
+impl Default for IpConflictConfig {
+    fn default() -> Self {
+        IpConflictConfig {
+            enabled: true,
+            active_within: HumanDuration::from_secs(60),
+        }
+    }
+}
+
+/// The gratuitous ARP flood analyzer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GratuitousArpConfig {
+    /// Whether the analyzer runs.
+    pub enabled: bool,
+    /// Sliding window over which announcements are counted.
+    pub window: HumanDuration,
+    /// Announcements inside the window that constitute a flood.
+    pub threshold: usize,
+}
+
+impl Default for GratuitousArpConfig {
+    fn default() -> Self {
+        GratuitousArpConfig {
+            enabled: true,
+            window: HumanDuration::from_secs(10),
+            threshold: 5,
+        }
+    }
+}
+
+/// How security events are delivered.
+///
+/// Security events are not device-lifecycle events and the dispatcher's rules
+/// for the latter are wrong for them. A rate limit that holds "somebody is
+/// poisoning your ARP table" for five minutes because the same device was
+/// mentioned recently is not a rate limit, it is a failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SecurityNotifyConfig {
+    /// Whether security events are delivered at all. They are recorded either
+    /// way.
+    pub enabled: bool,
+    /// Priority to deliver them at, when the transport understands priority.
+    pub priority: crate::types::EventPriority,
+    /// Deliver during quiet hours.
+    pub bypass_quiet_hours: bool,
+    /// Ignore the per-device debounce.
+    pub bypass_debounce: bool,
+    /// Deliver immediately rather than waiting for the batch window to close.
+    pub bypass_batch_window: bool,
+}
+
+impl Default for SecurityNotifyConfig {
+    fn default() -> Self {
+        SecurityNotifyConfig {
+            enabled: true,
+            priority: crate::types::EventPriority::Urgent,
+            bypass_quiet_hours: true,
+            bypass_debounce: true,
+            bypass_batch_window: true,
+        }
+    }
+}
+
 /// A single CLI override, expressed as a dotted config path and a value.
 ///
 /// The CLI layer builds these instead of a partial `Config`, because a partial
@@ -561,6 +899,7 @@ impl Config {
                 bail!("notify.ntfy.server is empty");
             }
         }
+        self.security.validate()?;
         Ok(())
     }
 }

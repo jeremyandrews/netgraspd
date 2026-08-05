@@ -9,6 +9,8 @@
 //!
 //! - [`capture`] turns packets into [`types::Observation`]s. It is the only
 //!   layer that touches libpcap.
+//! - [`analyze`] watches that same observation stream for the six security
+//!   conditions, keeping its own bounded in-memory state and nothing else.
 //! - [`identity`] turns observation signals into a display identity.
 //! - [`device`] holds the MAC-keyed state machine and decides which state
 //!   changes are events.
@@ -24,6 +26,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod analyze;
 pub mod capture;
 pub mod cli;
 pub mod config;

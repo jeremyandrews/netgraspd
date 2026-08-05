@@ -68,6 +68,97 @@ pub fn mdns_query() -> Vec<u8> {
     include_bytes!("../../tests/fixtures/mdns_query.bin").to_vec()
 }
 
+/// A DHCP Discover from the phone, carrying a hostname, an option 55 fingerprint
+/// and an option 60 vendor class.
+#[must_use]
+pub fn dhcp_discover() -> Vec<u8> {
+    include_bytes!("../../tests/fixtures/dhcp_discover.bin").to_vec()
+}
+
+/// The gateway's DHCP Offer, carrying the assigned address and the option 3
+/// router.
+#[must_use]
+pub fn dhcp_offer() -> Vec<u8> {
+    include_bytes!("../../tests/fixtures/dhcp_offer.bin").to_vec()
+}
+
+/// The gateway's DHCP Ack, which echoes the client's hostname and must
+/// therefore contribute no identity signal.
+#[must_use]
+pub fn dhcp_ack() -> Vec<u8> {
+    include_bytes!("../../tests/fixtures/dhcp_ack.bin").to_vec()
+}
+
+/// A DHCP Request using option 52 to spill its options into the `file` field.
+#[must_use]
+pub fn dhcp_request_overloaded() -> Vec<u8> {
+    include_bytes!("../../tests/fixtures/dhcp_request_overloaded.bin").to_vec()
+}
+
+/// An SSDP `NOTIFY` from the NAS announcing a UPnP MediaServer.
+#[must_use]
+pub fn ssdp_notify() -> Vec<u8> {
+    include_bytes!("../../tests/fixtures/ssdp_notify.bin").to_vec()
+}
+
+/// An SSDP `M-SEARCH` from the phone, whose `ST` names what it wants rather than
+/// what it is.
+#[must_use]
+pub fn ssdp_msearch() -> Vec<u8> {
+    include_bytes!("../../tests/fixtures/ssdp_msearch.bin").to_vec()
+}
+
+/// An SSDP `200 OK` from a television, carrying a base64 `X-friendly-name`.
+#[must_use]
+pub fn ssdp_response() -> Vec<u8> {
+    include_bytes!("../../tests/fixtures/ssdp_response.bin").to_vec()
+}
+
+/// An IPv6 Neighbor Solicitation from the phone, asking about somebody else's
+/// address.
+#[must_use]
+pub fn ndp_solicitation() -> Vec<u8> {
+    include_bytes!("../../tests/fixtures/ndp_solicitation.bin").to_vec()
+}
+
+/// A Neighbor Advertisement from the gateway, whose target address is its own.
+#[must_use]
+pub fn ndp_advertisement() -> Vec<u8> {
+    include_bytes!("../../tests/fixtures/ndp_advertisement.bin").to_vec()
+}
+
+/// A Router Advertisement, the one passive signal that identifies a router
+/// beyond argument.
+#[must_use]
+pub fn ndp_router_advertisement() -> Vec<u8> {
+    include_bytes!("../../tests/fixtures/ndp_router_advertisement.bin").to_vec()
+}
+
+/// A Duplicate Address Detection solicitation, sourced from `::` because the
+/// sender has not claimed an address yet.
+#[must_use]
+pub fn ndp_dad() -> Vec<u8> {
+    include_bytes!("../../tests/fixtures/ndp_dad.bin").to_vec()
+}
+
+/// A NetBIOS name registration, the NAS claiming `JEREMY-PC`.
+#[must_use]
+pub fn nbns_registration() -> Vec<u8> {
+    include_bytes!("../../tests/fixtures/nbns_registration.bin").to_vec()
+}
+
+/// A NetBIOS name query, which names what the sender is looking for.
+#[must_use]
+pub fn nbns_query() -> Vec<u8> {
+    include_bytes!("../../tests/fixtures/nbns_query.bin").to_vec()
+}
+
+/// A NetBIOS browser datagram, carrying both a machine name and its workgroup.
+#[must_use]
+pub fn nbns_datagram() -> Vec<u8> {
+    include_bytes!("../../tests/fixtures/nbns_datagram.bin").to_vec()
+}
+
 /// Every fixture, paired with its file name. Used by tests that assert
 /// pipeline-wide properties such as "no parser panics on any truncation".
 #[must_use]
@@ -81,8 +172,24 @@ pub fn all() -> Vec<(&'static str, Vec<u8>)> {
         ("mdns_response_ipv4", mdns_response_ipv4()),
         ("mdns_response_ipv6", mdns_response_ipv6()),
         ("mdns_query", mdns_query()),
+        ("dhcp_discover", dhcp_discover()),
+        ("dhcp_offer", dhcp_offer()),
+        ("dhcp_ack", dhcp_ack()),
+        ("dhcp_request_overloaded", dhcp_request_overloaded()),
+        ("ssdp_notify", ssdp_notify()),
+        ("ssdp_msearch", ssdp_msearch()),
+        ("ssdp_response", ssdp_response()),
+        ("ndp_solicitation", ndp_solicitation()),
+        ("ndp_advertisement", ndp_advertisement()),
+        ("ndp_router_advertisement", ndp_router_advertisement()),
+        ("ndp_dad", ndp_dad()),
+        ("nbns_registration", nbns_registration()),
+        ("nbns_query", nbns_query()),
+        ("nbns_datagram", nbns_datagram()),
     ]
 }
+
+pub mod build;
 
 #[cfg(test)]
 mod tests {

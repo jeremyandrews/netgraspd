@@ -39,6 +39,7 @@ async fn main() -> Result<()> {
         }
         Command::Devices(args) => cli::devices(&config, args).await,
         Command::Events(args) => cli::events(&config, args).await,
+        Command::UpdateFingerprints(args) => cli::update_fingerprints(&config, args).await,
     }
 }
 

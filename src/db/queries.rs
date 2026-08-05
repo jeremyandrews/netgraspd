@@ -45,14 +45,18 @@ pub struct DeviceRecord {
     pub mdns_name: Option<String>,
     /// IEEE-registered vendor for the MAC prefix.
     pub vendor: Option<String>,
-    /// Classified device type. Milestone 2 sets this.
+    /// Classified device type.
     pub device_type: Option<String>,
-    /// Classified operating system family. Milestone 2 sets this.
+    /// How much to trust `device_type`.
+    pub device_type_confidence: Option<f32>,
+    /// Classified operating system family.
     pub os_family: Option<String>,
     /// Lifecycle state.
     pub state: DeviceState,
     /// Most recent IPv4 address.
     pub last_ip: Option<String>,
+    /// Most recent IPv6 address, global preferred over link-local.
+    pub last_ipv6: Option<String>,
     /// Interface the device was last seen on.
     pub last_interface: Option<String>,
     /// When the device was first discovered.
@@ -72,8 +76,9 @@ pub struct DeviceRecord {
 /// Columns selected by every device read, in one place so the row decoder and
 /// the query cannot drift apart.
 const DEVICE_COLUMNS: &str = "id, mac, display_name, resolved_name, identity_source, \
-     identity_confidence, hostname, mdns_name, vendor, device_type, os_family, state, \
-     last_ip, last_interface, first_seen_at, last_seen_at, baseline, hidden, notify, notes";
+     identity_confidence, hostname, mdns_name, vendor, device_type, device_type_confidence, \
+     os_family, state, last_ip, last_ipv6, last_interface, first_seen_at, last_seen_at, \
+     baseline, hidden, notify, notes";
 
 impl DeviceRecord {
     /// Decodes a row selected with [`DEVICE_COLUMNS`].
@@ -93,9 +98,11 @@ impl DeviceRecord {
             mdns_name: row.try_get("mdns_name")?,
             vendor: row.try_get("vendor")?,
             device_type: row.try_get("device_type")?,
+            device_type_confidence: row.try_get("device_type_confidence")?,
             os_family: row.try_get("os_family")?,
             state: DeviceState::from_db(&state),
             last_ip: row.try_get("last_ip")?,
+            last_ipv6: row.try_get("last_ipv6")?,
             last_interface: row.try_get("last_interface")?,
             first_seen_at: row.try_get("first_seen_at")?,
             last_seen_at: row.try_get("last_seen_at")?,
@@ -143,8 +150,10 @@ pub struct DeviceUpdate {
     pub id: i64,
     /// Current lifecycle state.
     pub state: DeviceState,
-    /// Most recent address.
+    /// Most recent IPv4 address.
     pub last_ip: Option<String>,
+    /// Most recent IPv6 address.
+    pub last_ipv6: Option<String>,
     /// Most recent interface.
     pub last_interface: Option<String>,
     /// Most recent sighting.
@@ -161,6 +170,12 @@ pub struct DeviceUpdate {
     pub mdns_name: Option<String>,
     /// Vendor.
     pub vendor: Option<String>,
+    /// Classified device type.
+    pub device_type: Option<String>,
+    /// How much to trust the device type.
+    pub device_type_confidence: Option<f32>,
+    /// Classified operating system family.
+    pub os_family: Option<String>,
 }
 
 /// Fields written when an event is recorded.
@@ -279,17 +294,21 @@ pub async fn insert_device(client: &Client, new: &NewDevice) -> Result<i64> {
 /// Held as a constant so that the test asserting no user-owned column appears in
 /// it inspects the statement itself rather than a copy of it.
 const UPDATE_DEVICE_SQL: &str = "UPDATE ng_devices
-        SET state               = $2,
-            last_ip             = $3,
-            last_interface      = $4,
-            last_seen_at        = $5,
-            resolved_name       = $6,
-            identity_source     = $7,
-            identity_confidence = $8,
-            hostname            = $9,
-            mdns_name           = $10,
-            vendor              = $11,
-            sync_state          = 'dirty'
+        SET state                  = $2,
+            last_ip                = $3,
+            last_interface         = $4,
+            last_seen_at           = $5,
+            resolved_name          = $6,
+            identity_source        = $7,
+            identity_confidence    = $8,
+            hostname               = $9,
+            mdns_name              = $10,
+            vendor                 = $11,
+            device_type            = $12,
+            device_type_confidence = $13,
+            os_family              = $14,
+            last_ipv6              = $15,
+            sync_state             = 'dirty'
       WHERE id = $1";
 
 /// Writes the daemon-owned columns of one device.
@@ -315,6 +334,10 @@ pub async fn update_device(client: &Client, update: &DeviceUpdate) -> Result<()>
                 &update.hostname,
                 &update.mdns_name,
                 &update.vendor,
+                &update.device_type,
+                &update.device_type_confidence,
+                &update.os_family,
+                &update.last_ipv6,
             ],
         )
         .await
@@ -577,19 +600,49 @@ pub async fn recent_events(client: &Client, limit: i64) -> Result<Vec<EventRecor
         )
         .await
         .context("loading events failed")?;
-    rows.iter()
-        .map(|row| {
-            Ok(EventRecord {
-                id: row.try_get("id")?,
-                device_id: row.try_get("device_id")?,
-                device_label: row.try_get("device_label")?,
-                event_type: row.try_get("event_type")?,
-                timestamp: row.try_get("timestamp")?,
-                details: row.try_get("details")?,
-                notified: row.try_get("notified")?,
-            })
-        })
-        .collect()
+    rows.iter().map(decode_event).collect()
+}
+
+/// Decodes one row of the event query, shared by both event readers so their
+/// column lists cannot drift apart.
+fn decode_event(row: &Row) -> Result<EventRecord> {
+    Ok(EventRecord {
+        id: row.try_get("id")?,
+        device_id: row.try_get("device_id")?,
+        device_label: row.try_get("device_label")?,
+        event_type: row.try_get("event_type")?,
+        timestamp: row.try_get("timestamp")?,
+        details: row.try_get("details")?,
+        notified: row.try_get("notified")?,
+    })
+}
+
+/// Loads the most recent security events, newest first.
+///
+/// The `IN` list is the same one the partial index in migration V2 covers, so
+/// this query uses it rather than scanning.
+///
+/// # Errors
+///
+/// Returns an error when the query fails.
+pub async fn recent_security_events(client: &Client, limit: i64) -> Result<Vec<EventRecord>> {
+    let rows = client
+        .query(
+            "SELECT e.id, e.device_id, e.event_type, e.\"timestamp\", e.details, e.notified,
+                    COALESCE(NULLIF(TRIM(d.display_name), \'\'), NULLIF(TRIM(d.resolved_name), \'\'), d.mac)
+                        AS device_label
+               FROM ng_events e
+               LEFT JOIN ng_devices d ON d.id = e.device_id
+              WHERE e.event_type IN (
+                    \'arp_scan\', \'arp_spoof\', \'rogue_dhcp\',
+                    \'identity_change\', \'ip_conflict\', \'gratuitous_arp\')
+              ORDER BY e.\"timestamp\" DESC, e.id DESC
+              LIMIT $1",
+            &[&limit],
+        )
+        .await
+        .context("loading security events failed")?;
+    rows.iter().map(decode_event).collect()
 }
 
 /// Counts events of one type. Used by tests and the learning-mode summary.
@@ -624,9 +677,11 @@ mod tests {
             mdns_name: None,
             vendor: None,
             device_type: None,
+            device_type_confidence: None,
             os_family: None,
             state: DeviceState::Online,
             last_ip: None,
+            last_ipv6: None,
             last_interface: None,
             first_seen_at: Utc::now(),
             last_seen_at: Utc::now(),
@@ -680,7 +735,8 @@ mod tests {
         // ...and a guard against the guard silently passing because the columns
         // were renamed out from under it.
         assert!(UPDATE_DEVICE_SQL.contains("resolved_name"));
-        assert!(UPDATE_DEVICE_SQL.contains("sync_state          = 'dirty'"));
+        assert!(UPDATE_DEVICE_SQL.contains("device_type_confidence"));
+        assert!(UPDATE_DEVICE_SQL.contains("sync_state             = 'dirty'"));
     }
 
     #[test]

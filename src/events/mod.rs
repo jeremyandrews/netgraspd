@@ -89,6 +89,7 @@ mod tests {
                 baseline: false,
                 during_learning: false,
                 notify: true,
+                priority: crate::types::EventPriority::Normal,
                 details: serde_json::Value::Null,
             },
         }

@@ -16,6 +16,7 @@ pub mod dns;
 pub mod ethernet;
 pub mod fixtures;
 pub mod mdns;
+pub mod names;
 pub mod nbns;
 pub mod ndp;
 pub mod ssdp;
@@ -305,10 +306,21 @@ pub fn check_capture_permission(interface: &str) -> Result<()> {
     Ok(())
 }
 
-/// Builds the configured capture sources.
+/// Every capture source Netgrasp knows, paired with its BPF filter and parser.
 ///
-/// Unimplemented sources are built as stubs that log once and stop, so that a
-/// config naming them is not a startup failure.
+/// One table rather than a match arm per source, because every source is the
+/// same [`PcapSource`] with a different filter and parser, and a table cannot
+/// drift out of step with the error message that lists the valid names.
+const SOURCES: [(&str, &str, FrameParser); 6] = [
+    (arp::SOURCE, arp::FILTER, arp::parse_frame),
+    (mdns::SOURCE, mdns::FILTER, mdns::parse_frame),
+    (dhcp::SOURCE, dhcp::FILTER, dhcp::parse_frame),
+    (ssdp::SOURCE, ssdp::FILTER, ssdp::parse_frame),
+    (ndp::SOURCE, ndp::FILTER, ndp::parse_frame),
+    (nbns::SOURCE, nbns::FILTER, nbns::parse_frame),
+];
+
+/// Builds the configured capture sources.
 ///
 /// # Errors
 ///
@@ -320,39 +332,33 @@ pub fn build_sources(
 ) -> Result<Vec<Box<dyn CaptureSource>>> {
     let mut sources: Vec<Box<dyn CaptureSource>> = Vec::with_capacity(cfg.sources.len());
     for name in &cfg.sources {
-        let source: Box<dyn CaptureSource> = match name.as_str() {
-            arp::SOURCE => Box::new(PcapSource::new(
-                arp::SOURCE,
-                arp::FILTER,
-                arp::parse_frame,
-                interfaces.to_vec(),
-                cfg,
-            )),
-            mdns::SOURCE => Box::new(PcapSource::new(
-                mdns::SOURCE,
-                mdns::FILTER,
-                mdns::parse_frame,
-                interfaces.to_vec(),
-                cfg,
-            )),
-            dhcp::SOURCE => Box::new(dhcp::DhcpSource),
-            ssdp::SOURCE => Box::new(ssdp::SsdpSource),
-            ndp::SOURCE => Box::new(ndp::NdpSource),
-            nbns::SOURCE => Box::new(nbns::NbnsSource),
-            other => bail!(
-                "unknown capture source {other:?}; known sources are arp, mdns, dhcp, ssdp, ndp, nbns"
-            ),
+        let Some((source, filter, parser)) = SOURCES.iter().find(|(s, _, _)| *s == name) else {
+            bail!(
+                "unknown capture source {name:?}; known sources are {}",
+                SOURCES
+                    .iter()
+                    .map(|(s, _, _)| *s)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         };
-        sources.push(source);
+        sources.push(Box::new(PcapSource::new(
+            source,
+            filter,
+            *parser,
+            interfaces.to_vec(),
+            cfg,
+        )));
     }
     Ok(sources)
 }
 
 /// A capture source that is not implemented yet.
 ///
-/// It exists so that milestone 2 adds a parser rather than a wiring change: the
-/// source is already nameable in config, already buildable, and already in the
-/// startup path.
+/// Every protocol in [`SOURCES`] is now real. This remains for the next one that
+/// is not: the `CaptureSource` trait leaves a slot for passive Bluetooth
+/// scanning, and when that arrives it can be nameable in config and present in
+/// the startup path before it can capture anything.
 pub struct StubSource {
     name: &'static str,
     milestone: &'static str,

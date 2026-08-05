@@ -19,9 +19,17 @@ pool_size = 4
 # Empty means every non-loopback interface that is up and has an address.
 interfaces = []
 
-# Milestone 1 implements arp and mdns. Naming dhcp, ssdp, ndp or nbns is
-# accepted and logs a warning: they are stubs until milestone 2.
+# All six are implemented. The default is the two that cover an IPv4 LAN on
+# their own; add the rest for full fingerprinting.
+#
+#   dhcp  hostnames, option 55 OS fingerprints, vendor classes, and the
+#         rogue-server detector's only input
+#   ssdp  UPnP device classes and volunteered friendly names
+#   ndp   IPv6 neighbours, and Router Advertisements, which identify routers
+#         beyond argument
+#   nbns  Windows machine names and workgroups
 sources = ["arp", "mdns"]
+# sources = ["arp", "mdns", "dhcp", "ssdp", "ndp", "nbns"]
 
 # A full channel blocks the capture thread, which is the correct backpressure.
 # Dropping packets silently would corrupt presence tracking.
@@ -50,7 +58,7 @@ flush_interval = "60s"
 sweep_interval = "30s"
 
 # Devices that are meant to be quiet for long stretches. Keyed by device_type,
-# which milestone 2's classifier sets.
+# which the classifier sets.
 [state.device_type_overrides.router]
 idle_timeout = "24h"
 offline_timeout = "24h"
@@ -67,6 +75,14 @@ oui = true
 # your resolver, never to the monitored device, but it is opt-in anyway.
 reverse_dns = false
 reverse_dns_ttl = "1h"
+
+# DHCP option 55 fingerprints. A curated table is compiled into the binary, so
+# classification works with no internet access at all. `netgraspd
+# update-fingerprints <url>` downloads a fresh one, validates that it parses
+# before writing anything, and puts it here; the daemon prefers it when it
+# exists. Nothing ever downloads on its own.
+fingerprint_path = "/var/lib/netgraspd/dhcp_fingerprints.conf"
+fingerprint_url = ""
 
 [learning]
 # Run a baseline window when ng_devices is empty. During the window everything
@@ -91,6 +107,10 @@ batch_window = "60s"
 
 # Which events are worth telling a human about. The full set is new_device,
 # returned, ip_changed, went_offline, name_updated.
+#
+# Security events are NOT governed by this list. They are governed by
+# [security.notifications] below, so that a missing entry here cannot silently
+# disable them.
 event_types = ["new_device", "returned"]
 
 # Optional. Local time, and the period may wrap midnight.
@@ -106,3 +126,96 @@ event_types = ["new_device", "returned"]
 # urgent_priority = 5
 # token = "tk_..."
 # timeout = "10s"
+
+[security]
+# The analyzer chain: six detectors between the capture layer and the device
+# state machine. They keep bounded in-memory state, persist nothing, and rebuild
+# from live traffic within one window of a restart.
+enabled = true
+
+# The gateway, which several analyzers treat differently. Leave both empty and
+# they are worked out passively: DHCP option 3 states the address outright, and
+# failing that, the address the most distinct MACs ARP for is the gateway.
+#
+# Setting them explicitly is still worth doing. It is the strongest evidence
+# there is, and it closes the window between startup and the first DHCP lease.
+gateway_mac = ""
+gateway_ip = ""
+
+# MACs no analyzer ever alerts on. For the monitoring box that is meant to sweep
+# the network. Note this silences the analyzers only: the device is still
+# tracked and its arrivals and departures are still recorded.
+exempt_macs = []
+
+# How many MACs or addresses each analyzer tracks before evicting the least
+# recently seen. This is what stops a scanner forging a source MAC per packet
+# from growing the daemon without limit.
+max_tracked = 4096
+
+[security.arp_scan]
+# One MAC asking about many distinct addresses. Distinct addresses, not packets:
+# a device retrying one unanswered ARP two hundred times is not scanning.
+enabled = true
+window = "30s"
+threshold = 10
+# A router legitimately ARPs for everything it forwards to, so holding it to the
+# same threshold as a laptop means an alert a minute forever. A looser threshold
+# rather than an exemption, because a compromised router sweeping the subnet is
+# exactly what you want to hear about.
+gateway_threshold = 100
+
+[security.arp_spoof]
+# A MAC claiming an address that a different, still-active MAC holds.
+enabled = true
+# The whole design. Addresses change hands all day as leases expire, and that is
+# not an attack. Only a claim on an address whose holder was heard from inside
+# this window is one. A claim on the *gateway* address fires regardless.
+grace_period = "60s"
+
+[security.rogue_dhcp]
+# A second DHCP server. Only a server sends an Offer, an Ack or a Nak.
+enabled = true
+# When empty the first server heard after startup is trusted, which is right on
+# a healthy network and wrong on one where a rogue is already running. Listing
+# the real server closes that window; nothing is learned when this is set.
+known_servers = []
+
+[security.identity_change]
+# A device becoming a different kind of device. Because stored signals are never
+# removed, this fires only when higher-rank evidence contradicts what lower-rank
+# evidence said, which is a rare and interesting thing rather than a noisy one.
+enabled = true
+# "category": one known device type or OS family becoming a different known one.
+# "any": also the first time a device is classified at all. Noisy by design, and
+# useful when hunting.
+sensitivity = "category"
+
+[security.ip_conflict]
+# Two active MACs using one address. Usually a static address inside the DHCP
+# pool rather than an attack, which is why it is a separate event from
+# arp_spoof: you may well want to page on one and only log the other.
+enabled = true
+active_within = "60s"
+
+[security.gratuitous_arp]
+# A flood of unsolicited "this address is mine". A few are normal on boot; a
+# stream of them is a failing NIC or somebody keeping a poisoned cache entry
+# alive.
+enabled = true
+window = "10s"
+threshold = 5
+
+[security.notifications]
+# Security events are recorded whatever this says. This governs delivery.
+enabled = true
+
+# normal, high or urgent. Maps onto notify.ntfy.priority and urgent_priority.
+priority = "urgent"
+
+# The dispatcher's rate limiting exists to stop a monitor being annoying about
+# devices coming and going. Applied to an attack in progress it stops being rate
+# limiting and becomes a failure, so security events bypass it by default. Turn
+# these off if you run a noisy lab and would rather have them batched.
+bypass_quiet_hours = true
+bypass_debounce = true
+bypass_batch_window = true

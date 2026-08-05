@@ -22,6 +22,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
 
+use crate::analyze::Chain;
 use crate::capture::{self, ObservationDedup};
 use crate::cli::table;
 use crate::config::Config;
@@ -62,6 +63,8 @@ pub struct RunSummary {
     pub duplicates: u64,
     /// Events recorded.
     pub events: u64,
+    /// Security events recorded, which are a subset of `events`.
+    pub security_events: u64,
     /// Devices known when the run ended.
     pub devices: usize,
     /// Whether a learning window ran.
@@ -84,6 +87,7 @@ pub async fn run(
     let db = Db::connect(&config.database)?;
     Db::migrate(&config.database.url).await?;
     db.health_check().await?;
+    install_fingerprints(config);
 
     // Rehydrate. A restart must not re-announce the whole network.
     let (mut manager, mut persister, device_count) = {
@@ -145,6 +149,12 @@ pub async fn run(
         config.capture.dedup_capacity,
         config.capture.dedup_resolution_secs,
     );
+    let mut analyzers = Chain::new(&config.security);
+    if analyzers.is_active() {
+        tracing::info!(analyzers = ?analyzers.names(), "security analyzers running");
+    } else {
+        tracing::info!("security analyzers are disabled");
+    }
     let mut summary = RunSummary {
         learned: learning,
         ..RunSummary::default()
@@ -175,26 +185,46 @@ pub async fn run(
                     tracing::info!("every capture source has stopped");
                     break;
                 };
-                if !dedup.admit(&observation) {
-                    continue;
-                }
-                summary.observations += 1;
 
-                if let (Some(resolver), Some(ip)) = (resolver.as_ref(), observation.ip)
-                    && ip.is_ipv4()
-                    && asked_for_rdns.insert(ip.to_string())
-                {
-                    spawn_reverse_lookup(resolver.clone(), observation.mac, ip, signal_tx.clone());
+                // The state machine runs first, on the deduplicated stream, so
+                // that a brand-new attacker's device row exists before any alert
+                // about it is recorded and the event can carry a device_id.
+                if dedup.admit(&observation) {
+                    summary.observations += 1;
+
+                    if let (Some(resolver), Some(ip)) = (resolver.as_ref(), observation.ip)
+                        && ip.is_ipv4()
+                        && asked_for_rdns.insert(ip.to_string())
+                    {
+                        spawn_reverse_lookup(
+                            resolver.clone(),
+                            observation.mac,
+                            ip,
+                            signal_tx.clone(),
+                        );
+                    }
+
+                    let effects = manager.observe(&observation);
+                    summary.events += apply(&db, &mut persister, &bus, &effects).await;
                 }
 
-                let effects = manager.observe(&observation);
-                summary.events += apply(&db, &mut persister, &bus, &effects).await;
+                // The analyzers see *every* observation, deduplicated or not.
+                // Dedup collapses on (MAC, kind, second), which is exactly the
+                // shape of a scan burst: two hundred ARP requests in one second
+                // are one observation to the state machine and are the whole
+                // signal to arp_scan.
+                summary.security_events += analyze(
+                    &db, &mut persister, &bus, &mut analyzers, &mut manager, &observation,
+                ).await;
             }
 
             signal = signal_rx.recv() => {
                 if let Some((mac, signal, at)) = signal {
                     let effects = manager.add_signal(mac, &signal, at);
                     summary.events += apply(&db, &mut persister, &bus, &effects).await;
+                    summary.security_events += drain_reclassifications(
+                        &db, &mut persister, &bus, &mut analyzers, &mut manager,
+                    ).await;
                 }
             }
 
@@ -274,6 +304,94 @@ async fn apply(db: &Db, persister: &mut Persister, bus: &EventBus, effects: &[Ef
     }
 }
 
+/// Installs the DHCP fingerprint table, preferring a downloaded one.
+///
+/// A missing file is the normal case, not an error: the embedded table ships
+/// with the binary and `netgraspd update-fingerprints` is the only thing that
+/// ever writes the other one. A file that exists but does not parse *is* worth a
+/// warning, because it means somebody put something there on purpose and it is
+/// silently doing nothing.
+fn install_fingerprints(config: &Config) {
+    let path = &config.identity.fingerprint_path;
+    let table = if path.exists() {
+        match crate::identity::FingerprintDb::from_file(path) {
+            Ok(table) => {
+                tracing::info!(
+                    path = %path.display(),
+                    classes = table.len(),
+                    lists = table.list_count(),
+                    "loaded the downloaded DHCP fingerprint table"
+                );
+                table
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    %err,
+                    "the downloaded fingerprint table is unusable; falling back to the embedded one"
+                );
+                crate::identity::FingerprintDb::embedded()
+            }
+        }
+    } else {
+        crate::identity::FingerprintDb::embedded()
+    };
+    if !crate::identity::fingerprint::install(table) {
+        tracing::debug!("a fingerprint table was already installed");
+    }
+}
+
+/// Runs the analyzer chain over one observation and records what it found.
+///
+/// Also drains the classification changes the state machine queued while
+/// handling the same observation, because `identity_change` watches those rather
+/// than the wire. Returns how many security events were recorded.
+async fn analyze(
+    db: &Db,
+    persister: &mut Persister,
+    bus: &EventBus,
+    analyzers: &mut Chain,
+    manager: &mut Manager,
+    observation: &Observation,
+) -> u64 {
+    let mut recorded = 0;
+    for alert in analyzers.observe(observation) {
+        tracing::warn!(
+            event = %alert.event_type,
+            mac = %alert.mac,
+            details = %alert.details,
+            "security event"
+        );
+        let effects = manager.security_event(&alert);
+        recorded += apply(db, persister, bus, &effects).await;
+    }
+    recorded + drain_reclassifications(db, persister, bus, analyzers, manager).await
+}
+
+/// Feeds queued classification changes to the chain and records what it found.
+async fn drain_reclassifications(
+    db: &Db,
+    persister: &mut Persister,
+    bus: &EventBus,
+    analyzers: &mut Chain,
+    manager: &mut Manager,
+) -> u64 {
+    let mut recorded = 0;
+    for change in manager.take_reclassifications() {
+        for alert in analyzers.reclassified(&change) {
+            tracing::warn!(
+                event = %alert.event_type,
+                mac = %alert.mac,
+                details = %alert.details,
+                "security event"
+            );
+            let effects = manager.security_event(&alert);
+            recorded += apply(db, persister, bus, &effects).await;
+        }
+    }
+    recorded
+}
+
 /// Writes changed devices to Postgres.
 async fn flush_devices(db: &Db, persister: &Persister, manager: &mut Manager) {
     let dirty = manager.take_dirty();
@@ -299,7 +417,8 @@ fn spawn_notifier(
     bus: &EventBus,
     shutdown: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
-    let mut dispatcher = Dispatcher::with_local_offset(config.notify.clone());
+    let mut dispatcher =
+        Dispatcher::with_local_offset(config.notify.clone(), config.security.notifications.clone());
     let mut notifiers: Vec<Box<dyn Notifier>> = Vec::new();
     if let Some(ntfy) = &config.notify.ntfy {
         match NtfyNotifier::new(ntfy) {

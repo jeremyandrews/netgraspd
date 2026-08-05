@@ -6,12 +6,12 @@
 //! address being asked about, not a device known to be present, and treating it
 //! as a sighting invents devices that do not exist.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use chrono::{DateTime, Utc};
 
 use crate::capture::ethernet::{ETHERTYPE_ARP, parse_ethernet};
-use crate::types::{MacAddr, Observation, ObservationKind};
+use crate::types::{ArpDetail, ArpOp, MacAddr, Observation, ObservationKind, ProtocolDetail};
 
 /// Short name of this source, stored on every observation it produces.
 pub const SOURCE: &str = "arp";
@@ -64,8 +64,9 @@ pub fn parse_frame(
         return None;
     }
     // The Ethernet source and the ARP sender disagreeing is either a proxy ARP
-    // device or a spoof attempt. Milestone 2's analyzers will care; here the
-    // link-layer source is the device that actually transmitted, so it wins.
+    // device or a spoof attempt. Here the link-layer source is the device that
+    // actually transmitted, so it wins; the analyzers see the sender field
+    // unaltered in ArpDetail and can compare the two for themselves.
     let mac = if frame.src.is_group() || frame.src.is_zero() {
         sender_mac
     } else {
@@ -74,35 +75,37 @@ pub fn parse_frame(
 
     // A sender address of 0.0.0.0 is an ARP probe: the device is present but has
     // no address yet, so it must not be recorded as owning 0.0.0.0.
-    let ip = match sender_ip {
-        IpAddr::V4(v4) if v4.is_unspecified() => None,
-        other => Some(other),
-    };
+    let claimed = (!sender_ip.is_unspecified()).then_some(sender_ip);
+    let ip = claimed.map(IpAddr::V4);
+    let gratuitous = claimed.is_some() && sender_ip == target_ip;
 
-    let kind = match opcode {
+    let (op, kind) = match opcode {
         // A gratuitous ARP announces the sender's own address rather than
         // asking about somebody else's.
-        OP_REQUEST if ip.is_some() && sender_ip == target_ip => ObservationKind::Announcement,
-        OP_REQUEST => ObservationKind::Request,
-        OP_REPLY if ip.is_some() && sender_ip == target_ip => ObservationKind::Announcement,
-        OP_REPLY => ObservationKind::Reply,
+        OP_REQUEST if gratuitous => (ArpOp::Request, ObservationKind::Announcement),
+        OP_REQUEST => (ArpOp::Request, ObservationKind::Request),
+        OP_REPLY if gratuitous => (ArpOp::Reply, ObservationKind::Announcement),
+        OP_REPLY => (ArpOp::Reply, ObservationKind::Reply),
         _ => return None,
     };
 
-    Some(Observation::new(
-        mac,
-        ip,
-        interface,
-        SOURCE,
-        kind,
-        observed_at,
-    ))
+    Some(
+        Observation::new(mac, ip, interface, SOURCE, kind, observed_at).with_detail(
+            ProtocolDetail::Arp(ArpDetail {
+                op,
+                sender_mac,
+                sender_ip: claimed,
+                target_ip,
+                gratuitous,
+            }),
+        ),
+    )
 }
 
 /// Reads four bytes as an IPv4 address.
-fn ipv4(bytes: &[u8]) -> Option<IpAddr> {
+fn ipv4(bytes: &[u8]) -> Option<Ipv4Addr> {
     let octets: [u8; 4] = bytes.try_into().ok()?;
-    Some(IpAddr::from(octets))
+    Some(Ipv4Addr::from(octets))
 }
 
 #[cfg(test)]
@@ -194,6 +197,56 @@ mod tests {
         let mut f = fixtures::arp_request();
         f[21] = 0x09; // RARP-ish opcode
         assert!(parse_frame(&f, "eth0", ts()).is_none());
+    }
+
+    #[test]
+    fn a_request_carries_the_target_the_analyzers_need() {
+        // The state machine collapses an ARP request to "this MAC was here".
+        // arp_scan counts distinct targets, so the target has to survive.
+        let obs = parse_frame(&fixtures::arp_request(), "eth0", ts()).expect("parsed");
+        let arp = obs.arp().expect("arp detail");
+        assert_eq!(arp.op, ArpOp::Request);
+        assert_eq!(arp.sender_mac, "3c:22:fb:9a:1b:2c".parse().expect("mac"));
+        assert_eq!(arp.sender_ip, Some(Ipv4Addr::new(192, 168, 1, 40)));
+        assert_eq!(arp.target_ip, Ipv4Addr::new(192, 168, 1, 1));
+        assert!(!arp.gratuitous);
+    }
+
+    #[test]
+    fn a_gratuitous_arp_is_flagged_as_such_in_the_detail() {
+        let obs = parse_frame(&fixtures::arp_gratuitous(), "eth0", ts()).expect("parsed");
+        let arp = obs.arp().expect("arp detail");
+        assert!(arp.gratuitous);
+        assert_eq!(arp.sender_ip, Some(Ipv4Addr::new(192, 168, 1, 77)));
+        assert_eq!(arp.target_ip, Ipv4Addr::new(192, 168, 1, 77));
+    }
+
+    #[test]
+    fn a_probe_claims_no_address_in_the_detail_either() {
+        let obs = parse_frame(&fixtures::arp_probe(), "eth0", ts()).expect("parsed");
+        let arp = obs.arp().expect("arp detail");
+        assert_eq!(arp.sender_ip, None, "0.0.0.0 is not a claim");
+        assert!(!arp.gratuitous, "a probe is not an announcement");
+    }
+
+    #[test]
+    fn the_sender_field_survives_even_when_it_disagrees_with_the_frame() {
+        // The shape of a spoof: the Ethernet source is the real transmitter and
+        // the ARP sender is the identity being borrowed. Both must reach the
+        // analyzers.
+        let mut f = fixtures::arp_reply();
+        f[22..28].copy_from_slice(&[0x00, 0x11, 0x32, 0xaa, 0xbb, 0xcc]);
+        let obs = parse_frame(&f, "eth0", ts()).expect("parsed");
+        assert_eq!(
+            obs.mac,
+            "b8:27:eb:44:55:66".parse().expect("mac"),
+            "the link-layer source is who actually transmitted"
+        );
+        assert_eq!(
+            obs.arp().expect("arp detail").sender_mac,
+            "00:11:32:aa:bb:cc".parse().expect("mac"),
+            "the claim is preserved unaltered"
+        );
     }
 
     #[test]

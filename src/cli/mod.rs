@@ -11,13 +11,14 @@ pub mod table;
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 
 use crate::config::{Config, Override};
 use crate::daemon::RunOptions;
 use crate::db::{Db, queries};
+use crate::identity::FingerprintDb;
 
 /// Passive network device monitor. Watches LAN broadcast and multicast traffic
 /// and never transmits.
@@ -50,6 +51,8 @@ pub enum Command {
     Devices(DevicesArgs),
     /// Print recent events and exit.
     Events(EventsArgs),
+    /// Download a fresh DHCP fingerprint table.
+    UpdateFingerprints(UpdateFingerprintsArgs),
 }
 
 /// Arguments to `run`.
@@ -91,6 +94,26 @@ pub struct EventsArgs {
     /// How many events to show.
     #[arg(long, default_value_t = 50)]
     pub limit: i64,
+
+    /// Show only security events from the analyzer chain.
+    #[arg(long)]
+    pub security: bool,
+}
+
+/// Arguments to `update-fingerprints`.
+#[derive(Debug, Args)]
+pub struct UpdateFingerprintsArgs {
+    /// Where to download from. Defaults to `identity.fingerprint_url`.
+    #[arg(value_name = "URL")]
+    pub url: Option<String>,
+
+    /// Where to write it. Defaults to `identity.fingerprint_path`.
+    #[arg(long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+
+    /// Parse and report, without writing anything.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 impl Cli {
@@ -168,12 +191,94 @@ pub async fn events(config: &Config, args: &EventsArgs) -> Result<()> {
     }
     let db = Db::connect(&config.database)?;
     let client = db.client().await?;
-    let records = queries::recent_events(&client, args.limit).await?;
+    let records = if args.security {
+        queries::recent_security_events(&client, args.limit).await?
+    } else {
+        queries::recent_events(&client, args.limit).await?
+    };
     if records.is_empty() {
-        println!("No events recorded yet.");
+        if args.security {
+            println!("No security events recorded yet.");
+        } else {
+            println!("No events recorded yet.");
+        }
         return Ok(());
     }
     print!("{}", table::event_table(&records, Utc::now()));
+    Ok(())
+}
+
+/// Runs `update-fingerprints`.
+///
+/// Downloads a fingerprint table, **parses it before writing anything**, and
+/// installs it only if it parses. A vendor serving an error page, a captive
+/// portal serving a login form, or a truncated download must not be able to
+/// replace a working table with rubbish.
+///
+/// This is the one command that reaches the internet, it only runs when a person
+/// types it, and it never touches the monitored segment.
+///
+/// # Errors
+///
+/// Returns an error when no URL is configured, the download fails, the result is
+/// not a fingerprint table, or the output file cannot be written.
+pub async fn update_fingerprints(config: &Config, args: &UpdateFingerprintsArgs) -> Result<()> {
+    let url = args
+        .url
+        .clone()
+        .filter(|u| !u.trim().is_empty())
+        .or_else(|| Some(config.identity.fingerprint_url.clone()).filter(|u| !u.trim().is_empty()))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no URL given and identity.fingerprint_url is empty; pass one as an argument"
+            )
+        })?;
+    let path = args
+        .output
+        .clone()
+        .unwrap_or_else(|| config.identity.fingerprint_path.clone());
+
+    println!("Downloading {url}");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .user_agent(concat!("netgraspd/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("could not reach {url}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!("{url} returned {status}");
+    }
+    let text = response
+        .text()
+        .await
+        .context("could not read the response")?;
+
+    let table = FingerprintDb::parse(&text).with_context(|| {
+        format!("what {url} returned is not a DHCP fingerprint table; nothing was written")
+    })?;
+    println!(
+        "Parsed {} classes covering {} option lists.",
+        table.len(),
+        table.list_count()
+    );
+
+    if args.dry_run {
+        println!("Dry run: {} was not written.", path.display());
+        return Ok(());
+    }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("could not create {}", parent.display()))?;
+    }
+    std::fs::write(&path, text.as_bytes())
+        .with_context(|| format!("could not write {}", path.display()))?;
+    println!("Wrote {}.", path.display());
     Ok(())
 }
 
@@ -337,9 +442,15 @@ mod tests {
     async fn a_non_positive_limit_is_rejected_before_any_query() {
         let config = Config::default();
         for limit in [0, -1] {
-            let err = events(&config, &EventsArgs { limit })
-                .await
-                .expect_err("must reject");
+            let err = events(
+                &config,
+                &EventsArgs {
+                    limit,
+                    security: false,
+                },
+            )
+            .await
+            .expect_err("must reject");
             assert!(err.to_string().contains("--limit must be"), "{err}");
         }
     }

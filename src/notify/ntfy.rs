@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use crate::config::NtfyConfig;
 use crate::device::DeviceEvent;
 use crate::notify::Notifier;
-use crate::types::EventType;
+use crate::types::{EventPriority, EventType};
 
 /// Publishes notifications to an ntfy topic.
 pub struct NtfyNotifier {
@@ -21,6 +21,7 @@ pub struct NtfyNotifier {
     url: String,
     token: Option<String>,
     priority: u8,
+    urgent_priority: u8,
 }
 
 impl NtfyNotifier {
@@ -45,16 +46,31 @@ impl NtfyNotifier {
             url: format!("{}/{}", cfg.server.trim_end_matches('/'), topic),
             token: cfg.token.clone(),
             priority: cfg.priority,
+            urgent_priority: cfg.urgent_priority,
         })
     }
 
+    /// The ntfy priority header value for an event priority.
+    ///
+    /// `High` sits between the two configured levels rather than getting a third
+    /// setting: an operator who wants a specific number for it is really asking
+    /// for a different urgent level.
+    #[must_use]
+    fn header_priority(&self, priority: EventPriority) -> u8 {
+        match priority {
+            EventPriority::Normal => self.priority,
+            EventPriority::High => self.priority.max(4).min(self.urgent_priority.max(4)),
+            EventPriority::Urgent => self.urgent_priority,
+        }
+    }
+
     /// Posts one message.
-    async fn post(&self, title: &str, body: &str, tags: &str) -> Result<()> {
+    async fn post(&self, title: &str, body: &str, tags: &str, priority: u8) -> Result<()> {
         let mut request = self
             .client
             .post(&self.url)
             .header("X-Title", title)
-            .header("X-Priority", self.priority.to_string())
+            .header("X-Priority", priority.to_string())
             .header("X-Tags", tags)
             .body(body.to_string());
         if let Some(token) = &self.token {
@@ -84,6 +100,7 @@ impl Notifier for NtfyNotifier {
             &title_for(event),
             &body_for(event),
             tags_for(event.event_type),
+            self.header_priority(event.priority),
         )
         .await
     }
@@ -93,10 +110,18 @@ impl Notifier for NtfyNotifier {
             [] => Ok(()),
             [only] => self.send(only).await,
             many => {
+                // A batch takes the loudest priority in it. A summary that
+                // included one urgent event must not arrive quietly.
+                let priority = many
+                    .iter()
+                    .map(|e| e.priority)
+                    .max()
+                    .unwrap_or(EventPriority::Normal);
                 self.post(
                     &format!("{} devices appeared", many.len()),
                     &summary_body(many),
                     "satellite",
+                    self.header_priority(priority),
                 )
                 .await
             }
@@ -109,6 +134,10 @@ impl Notifier for NtfyNotifier {
 }
 
 /// Notification title for one event.
+///
+/// A security title leads with the threat rather than the device, because the
+/// first three words are all a lock-screen notification shows and "ARP spoof" is
+/// the part that decides whether somebody gets out of bed.
 #[must_use]
 pub fn title_for(event: &DeviceEvent) -> String {
     match event.event_type {
@@ -117,6 +146,12 @@ pub fn title_for(event: &DeviceEvent) -> String {
         EventType::WentOffline => format!("Offline: {}", event.display_name),
         EventType::IpChanged => format!("Address changed: {}", event.display_name),
         EventType::NameUpdated => format!("Identified: {}", event.display_name),
+        EventType::ArpScan => format!("ARP scan from {}", event.display_name),
+        EventType::ArpSpoof => format!("ARP spoof by {}", event.display_name),
+        EventType::RogueDhcp => format!("Rogue DHCP server: {}", event.display_name),
+        EventType::IpConflict => format!("Address conflict: {}", event.display_name),
+        EventType::GratuitousArp => format!("Gratuitous ARP flood from {}", event.display_name),
+        EventType::IdentityChange => format!("Device changed identity: {}", event.display_name),
     }
 }
 
@@ -176,6 +211,12 @@ pub const fn tags_for(event_type: EventType) -> &'static str {
         EventType::WentOffline => "zzz",
         EventType::IpChanged => "arrows_counterclockwise",
         EventType::NameUpdated => "label",
+        EventType::ArpScan => "mag",
+        EventType::ArpSpoof => "rotating_light",
+        EventType::RogueDhcp => "no_entry",
+        EventType::IpConflict => "warning",
+        EventType::GratuitousArp => "loudspeaker",
+        EventType::IdentityChange => "twisted_rightwards_arrows",
     }
 }
 
@@ -211,6 +252,7 @@ mod tests {
             baseline: false,
             during_learning: false,
             notify: true,
+            priority: crate::types::EventPriority::Normal,
             details: serde_json::Value::Null,
         }
     }

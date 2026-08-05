@@ -20,10 +20,14 @@ suite asserts it.
 
 ## Status
 
-Milestone 1: ARP and mDNS capture, the device state machine, identity
-resolution from OUI, mDNS and reverse DNS, learning mode, the event bus, an
-ntfy.sh notifier and the CLI. See `ARCHITECTURE.md` for the design record and
-for where the deferred work attaches.
+Milestone 2. Six capture sources (ARP, mDNS, DHCP, SSDP, IPv6 NDP, NetBIOS),
+device-type and OS classification from an embedded DHCP fingerprint table plus
+every other signal on the wire, and six security analyzers. Milestone 1's device
+state machine, identity resolution, learning mode, event bus, ntfy notifier and
+CLI are underneath it unchanged.
+
+See `ARCHITECTURE.md` for the design record and for where the remaining work
+attaches.
 
 ## Building
 
@@ -69,6 +73,8 @@ netgraspd run -i eth0 -i wlan0     # specific interfaces
 netgraspd devices                  # print the device table once
 netgraspd devices --state offline  # ...filtered
 netgraspd events --limit 50        # recent events
+netgraspd events --security        # ...only what the analyzers found
+netgraspd update-fingerprints URL  # refresh the DHCP fingerprint table
 ```
 
 The first run on an empty database spends five minutes learning the network.
@@ -99,16 +105,49 @@ Every signal ever seen is stored in `ng_device_signals` and never overwritten,
 so a later signal *refines* the identity instead of replacing it. The scorer
 picks the highest-weighted one available:
 
-| Signal | Weight | Status |
+| Signal | Weight | Where it comes from |
 |---|---|---|
 | name you typed in Trovato | absolute | honoured; the daemon never overwrites it |
-| mDNS instance name | 0.9 | implemented |
-| DHCP hostname | 0.8 | milestone 2 |
-| reverse DNS | 0.7 | implemented, opt-in |
-| NetBIOS name | 0.6 | milestone 2 |
-| SSDP friendly name | 0.5 | milestone 2 |
-| vendor plus device type | 0.3 | vendor implemented |
+| mDNS instance name | 0.9 | `_airplay._tcp` and friends, and A record owner names |
+| DHCP hostname | 0.8 | option 12 on a client message |
+| reverse DNS | 0.7 | opt-in; the one thing that transmits |
+| NetBIOS name | 0.6 | a name registration or a datagram source name |
+| SSDP friendly name | 0.5 | a header the device volunteered, never a fetch |
+| vendor plus device type | 0.3 | the IEEE registry plus the classifier |
 | bare MAC | 0.1 | always available |
+
+The SSDP friendly name deserves its footnote. The UPnP `friendlyName` lives in
+the device description XML at the `LOCATION` URL, and fetching it means an HTTP
+GET **to the monitored device**. That is not passive, so it does not happen.
+What is read instead is a friendly name a device volunteered in a header, which
+Chromecast and other DIAL devices do as base64 `X-friendly-name`; those bytes are
+already on the wire. A device that volunteers nothing simply has no 0.5 signal.
+
+## How a device gets its type
+
+Separately from its name, because the two come from different signals: a
+fingerprint knows the operating system and a service type knows the device.
+Evidence is ranked by how hard it is to be wrong about, and the first hit wins:
+
+| Evidence | Confidence | Why it ranks there |
+|---|---|---|
+| IPv6 Router Advertisement | 0.99 | a device that sends one *is* a router |
+| SSDP device URN | 0.90 | it declared its own UPnP class, unprompted |
+| mDNS service type | 0.85 | `_ipp._tcp` is a printer, but a laptop sharing one says so too |
+| DHCP option 55 fingerprint | 0.95 exact, less for a near match | Fingerbank-shaped table, embedded |
+| vendor class, mDNS model, SSDP server | 0.70 | self-declared text, where false positives live |
+| NetBIOS presence | 0.50 | a Windows-speaking machine, but so is a Samba NAS |
+| IEEE vendor | 0.40 | Espressif makes IoT chips, but vendors make many things |
+| always-on plus an IoT vendor | 0.35 | inference, not evidence, so it goes last |
+
+The confidence is stored in `ng_devices.device_type_confidence`, so a reader can
+tell "this is a printer because it said so" from "this is probably a printer
+because Brother made it".
+
+The fingerprint table is compiled into the binary, so classification works on a
+network with no internet access. `netgraspd update-fingerprints <url>` downloads
+a fresh one; it parses and validates the download **before** replacing anything,
+so a captive portal serving a login page cannot break classification.
 
 Vendors come from all three IEEE registries (MA-L, MA-M and MA-S) embedded in
 the binary, with longest-prefix lookup so that the 24-bit blocks IEEE has
@@ -132,6 +171,47 @@ The batch window costs up to `notify.batch_window` of latency on every
 notification. Set `notify.batch_threshold = 0` to turn batching off if you would
 rather have them instantly.
 
+## Security analyzers
+
+Six detectors sit between the capture layer and the device state machine. They
+consume the same observation stream, keep bounded in-memory state, persist
+nothing, and emit events onto the same bus.
+
+| Analyzer | Fires when | The false positive it is built to avoid |
+|---|---|---|
+| `arp_scan` | one MAC asks about many *distinct* addresses in a window | a device retrying one unanswered ARP is not scanning |
+| `arp_spoof` | a MAC claims an address whose holder is still talking | leases change hands all day; only a live holder makes it an attack |
+| `rogue_dhcp` | an Offer, Ack or Nak from an unexpected MAC | only a server sends those, so a client never trips it |
+| `identity_change` | stronger evidence contradicts what weaker evidence said | learning what a device is for the first time is a refinement |
+| `ip_conflict` | two active MACs use one address | a handover after the window is a reassignment |
+| `gratuitous_arp` | a flood of unsolicited announcements from one MAC | devices legitimately send a few on boot |
+
+Three properties are worth stating outright.
+
+**They see every observation, including the deduplicated ones.** The
+cross-interface dedup collapses on `(MAC, kind, second)`, which is exactly the
+shape of a scan burst. Running the analyzers downstream of it would make
+`arp_scan` useless, so the daemon feeds them before dedup decides anything.
+
+**They are stateless across restarts.** A detector that trusted state written
+before a crash would be trusting state written by whatever caused it. The cost is
+that `rogue_dhcp` re-learns the legitimate server after a restart; set
+`security.rogue_dhcp.known_servers` to close that window.
+
+**Security events play by different notification rules.** They are recorded
+during a learning window, they ignore the per-device `notify` toggle, they do not
+have to appear in `notify.event_types`, and by default they bypass quiet hours,
+the debounce and the batch window. The one thing they do not bypass is
+`notify.enabled`, because a master switch with an exception is not a master
+switch.
+
+The gateway is worked out passively, because several analyzers treat it
+differently: DHCP option 3 states it outright, and failing that the address the
+most *distinct* MACs ARP for is the gateway. Once known, it is not given up to
+evidence that is no stronger, which is what stops an attacker forging one ARP
+reply to become the gateway and silence the detector that was watching for
+exactly that.
+
 ## Development
 
 ```
@@ -147,6 +227,13 @@ tests print why and pass, so a checkout with no Postgres still goes green on
 everything else.
 
 Refresh the embedded vendor registry with `scripts/refresh-oui.sh`.
+
+Regenerate the packet fixtures with `cargo run --example build-fixtures`. The
+`.bin` files under `tests/fixtures/` are what the parsers actually read; a test
+asserts that they still equal what the builders in
+`src/capture/fixtures/build.rs` produce, so a builder edit that is not
+regenerated fails rather than leaving every parser test quietly green against
+stale bytes.
 
 ## Licence
 

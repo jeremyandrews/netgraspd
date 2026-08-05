@@ -154,9 +154,80 @@ rather than overwrite. A weighted scorer picks the display identity:
 | vendor plus device type | 0.3 |
 | bare MAC | 0.1 |
 
-Milestone 1 implements OUI vendor lookup, mDNS instance name and reverse DNS.
-The other weights are reserved and their signal types already exist in the enum,
-so the later parsers add rows without touching the scorer.
+Milestone 1 implemented OUI vendor lookup, mDNS instance name and reverse DNS.
+Milestone 2 filled in the rest, and the prediction held: the parsers added rows
+and the scorer was not touched.
+
+The SSDP friendly name arrived with one caveat that was flagged in the milestone
+1 stub and survives implementation. The UPnP `friendlyName` is not in the
+multicast announcement; it lives in the device description XML at the `LOCATION`
+URL, and fetching it is an HTTP GET to the monitored device. Netgrasp does not
+transmit on the segment it watches, so that fetch does not happen and must not be
+added. What is read instead is a friendly name a device *volunteered in a
+header*: Chromecast and other DIAL devices send base64 `X-friendly-name`, some
+DLNA stacks send `FRIENDLYNAME.DLNA.ORG`. Those bytes are already on the wire. A
+device that volunteers nothing has no 0.5 signal and the scorer falls through, as
+designed.
+
+### Classifying signals, added in milestone 2
+
+Seven signal kinds carry evidence about what a device *is* rather than what it is
+called. They weigh zero, never compete for the display name, and exist because
+the classifier needs them: `mdns_service`, `mdns_model`, `dhcp_fingerprint`,
+`dhcp_vendor_class`, `ssdp_device_type`, `ssdp_server`, `netbios_workgroup` and
+`ndp_role`.
+
+## Device-type classification
+
+Ranked by how hard the evidence is to be wrong about, first hit wins, and the
+rank sets `ng_devices.device_type_confidence` so a reader downstream can tell a
+declaration from a guess:
+
+| Evidence | Confidence |
+|---|---|
+| IPv6 Router Advertisement | 0.99 |
+| DHCP option 55 fingerprint, exact | 0.95 |
+| SSDP device URN | 0.90 |
+| mDNS service type | 0.85 |
+| DHCP option 55 fingerprint, nearest | up to 0.80 |
+| self-declared text (vendor class, mDNS model, SSDP server) | 0.70 |
+| NetBIOS presence | 0.50 |
+| IEEE vendor | 0.40 |
+| always-on plus an IoT vendor | 0.35 |
+
+Two consequences of stored signals never being removed, both deliberate:
+
+1. **Weaker evidence arriving later cannot move a classification.** A NAS that
+   speaks NetBIOS and advertises `_smb._tcp` stays a NAS rather than becoming a
+   Windows computer.
+2. **A classification therefore changes only when higher-rank evidence
+   contradicts lower-rank evidence.** That is precisely what `identity_change`
+   alerts on, and it is why that analyzer is quiet on a healthy network.
+
+The device-type vocabulary is closed. Anything outside it, including from a
+downloaded fingerprint table, is ignored rather than stored, because
+`state.device_type_overrides` keys on these values and the plugin will facet on
+them.
+
+### The fingerprint table
+
+`data/dhcp_fingerprints.conf` is a curated subset in the shape of the PacketFence
+and Fingerbank files, embedded with `include_str!`. It is **not** a verbatim copy
+of the upstream database, which is much larger and separately licensed; the
+parser ignores unknown keys so the upstream file parses here unchanged if
+somebody drops one in.
+
+Embedded rather than fetched, because a passive monitor that phones a vendor to
+identify a device is not a passive monitor. `netgraspd update-fingerprints <url>`
+refreshes it on demand, parses and validates the download before replacing
+anything, and writes to `identity.fingerprint_path`, which the daemon prefers
+when it exists.
+
+Matching is exact first, then nearest by longest common subsequence of the two
+ordered lists normalised by the longer one. Order is preserved throughout because
+two operating systems routinely request the same options in a different sequence
+and that sequence is most of the discriminating power. A near match reports a
+confidence below any exact one, so a guess never claims as much as a match.
 
 ## Passive means passive
 
@@ -178,29 +249,100 @@ wrong:
 | # | Scope | Milestone |
 |---|---|---|
 | 1 | daemon core: config, refinery schema, ARP + mDNS capture, state machine, identity v1 (OUI, mDNS, rDNS), learning mode, event bus, ntfy notifier, CLI live table | Sees the real LAN passively, correct state tracking, meaningful first notification |
-| 2 | fingerprinting and security: DHCP, SSDP, NDP, NetBIOS parsers; DHCP fingerprints; device-type classification; the six analyzers | Most devices auto-identified by name/type/OS; spoof and rogue-DHCP detection live |
+| 2 | **done.** DHCP, SSDP, NDP, NetBIOS parsers; DHCP fingerprints; device-type classification; the six analyzers | Most devices auto-identified by name/type/OS; spoof and rogue-DHCP detection live |
 | 3 | Trovato plugin: device/person/event content, bidirectional device sync, gathers, tiles, roles, event pruning, friction report | Phone-openable dashboard: name a device, assign an owner, see who is home, viewer role read-only |
 | 4 | enrichment and packaging: UniFi enricher, location model, arrival/departure, people notifications, rollup jobs, docker-compose, cross-compile aarch64 | "Elena is in the backyard"; runs unattended on a Pi; deployable unit |
 
 Milestones 1 and 2 are pure daemon work and can run before, or in parallel with,
 any Trovato session.
 
+## The security analyzer chain
+
+Six analyzers between the capture channel and the device manager, consuming the
+same `Observation` stream and emitting on the existing bus. The milestone 1
+prediction that this would need no schema change held: `ng_events.details` is
+jsonb and the six new event types carry their evidence in it.
+
+Three properties the design turns on.
+
+**Analyzers see every observation, including the deduplicated ones.** The
+cross-interface dedup collapses on `(MAC, kind, second)`, which is exactly the
+shape of a scan burst: two hundred ARP requests from one MAC in one second are
+one observation to the state machine and are the entire signal to `arp_scan`. The
+daemon therefore runs the state machine on the deduplicated stream and the
+analyzers on everything. The state machine runs *first*, so a brand-new
+attacker's device row exists before the alert about it is recorded and the event
+can carry a `device_id`.
+
+**Analyzers are stateless across restarts.** Nothing is persisted. A detector
+that trusted state written before a crash would be trusting state written by
+whatever caused it. The one place this costs something is `rogue_dhcp`, whose
+first-seen-server heuristic re-learns after a restart;
+`security.rogue_dhcp.known_servers` closes that window and the analyzer logs the
+fact the first time it learns one.
+
+**Analyzers know nothing about devices.** They deal in MAC addresses, so they
+need no lock on the device table and no database. `Manager::security_event`
+attaches names, vendors and row ids afterwards.
+
+Every analyzer holds itself back with a cooldown, so a condition that persists
+for an hour produces alerts at a bounded rate rather than one per packet. That is
+not the notification dispatcher's debounce, which security events deliberately
+bypass; it is the detector declining to say the same thing twice.
+
+### The gateway is worked out passively
+
+`arp_spoof` treats a claim on the gateway address as an immediate alert, and
+`arp_scan` holds the gateway to a looser threshold, so the chain needs to know
+which device it is. In order of trust: configuration, then DHCP option 3, then
+the address the most *distinct* MACs have ARPed for. Distinct askers rather than
+total requests, because one device retrying one address would otherwise elect it.
+
+Two rules stop this becoming an attack surface of its own:
+
+- A **learned** gateway MAC may be set by equal-rank evidence but **replaced**
+  only by strictly stronger evidence. The MAC is learned from ARP replies and
+  from traffic sourced at the gateway address, both of which an attacker
+  controls completely. An attacker who could replace it with one forged reply
+  would make `arp_spoof` treat itself as the gateway and stop alerting, turning
+  the detector into an accessory.
+- Gateway impersonation fires **without** requiring a prior ARP claim by the real
+  gateway. On a settled network everybody already has the gateway cached and it
+  may never answer an ARP at all; requiring a prior claim would mean the one
+  attack this analyzer exists for is the one it would miss.
+
+## IPv6 addressing, revisited
+
+The milestone 1 note asked for the IPv4-only `last_ip` decision to be revisited
+once NDP landed. It was, and it stands with one addition.
+
+`ng_devices.last_ip` remains IPv4-only, because it drives `ip_changed` and RFC
+4941 privacy addresses rotate as often as daily; a single current-address column
+would emit a meaningless `ip_changed` per device per day. What was actually
+missing was a current IPv6 address at all, so `ng_devices.last_ipv6` was added in
+migration V2: written on flush, never event-generating, and preferring a global
+address over the link-local one every device always has and which is derived from
+the MAC anyway.
+
+Privacy-extension rotation means one MAC legitimately accumulates many rows in
+`ng_ip_history`. Netgrasp is MAC-keyed so this produces no phantom devices, but
+the row count is worth watching; it is a candidate for the presence rollup job in
+the enrichment milestone.
+
 ## Where deferred work attaches
 
-- **DHCP/SSDP/NDP/NetBIOS parsers:** `src/capture/{dhcp,ssdp,ndp,nbns}.rs`
-  already exist as compiling stubs implementing `CaptureSource`. Each fills in
-  `run()` and emits `Observation`s carrying its existing `SignalKind`.
-- **Security analyzers:** an analyzer chain sits between the capture channel and
-  the device manager, consuming the same `Observation` stream and emitting
-  events on the existing bus. No schema change: `ng_events.details` is jsonb.
 - **Presence rollup:** `ng_presence.is_summary` and `observation_count` exist
-  now, so the nightly rollup job needs no ALTER.
+  now, so the nightly rollup job needs no ALTER. IPv6 history growth under
+  privacy extensions is the first thing it should look at.
 - **Plugin sync:** `ng_devices.sync_state` / `trovato_item_id` and
   `ng_events.sync_state` are written by the daemon and read by nothing here.
 - **People and location:** `ng_devices.current_ap` / `current_location` exist as
   nullable columns; the person mapping is a plugin-owned join table added in
   milestone 4, not a daemon concern.
-- **Bluetooth passive scanning:** the `CaptureSource` trait leaves the slot.
+- **Bluetooth passive scanning:** the `CaptureSource` trait leaves the slot, and
+  `StubSource` survives milestone 2 unused so that the next protocol can be
+  nameable in config and present in the startup path before it can capture
+  anything.
 
 ## Open questions
 

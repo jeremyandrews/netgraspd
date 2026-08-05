@@ -168,10 +168,20 @@ mod tests {
         let runner = embedded::migrations::runner();
         let migrations = runner.get_migrations();
         assert!(!migrations.is_empty(), "migrations/ produced nothing");
-        let mut last = 0;
-        for m in migrations {
-            assert!(m.version() > last, "migration versions must increase");
-            last = m.version();
-        }
+        // refinery sorts by version when it runs, not when it lists, so the
+        // invariant worth asserting is that the versions are unique and
+        // contiguous from one. A duplicate version silently drops a migration.
+        let mut versions: Vec<i32> = migrations
+            .iter()
+            .map(refinery::Migration::version)
+            .collect();
+        versions.sort_unstable();
+        let expected: Vec<i32> =
+            (1..=i32::try_from(versions.len()).expect("few migrations")).collect();
+        assert_eq!(
+            versions, expected,
+            "migration versions must be 1..n with no gaps or repeats"
+        );
+        println!("embedded migrations: {versions:?}");
     }
 }

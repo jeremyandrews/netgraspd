@@ -8,10 +8,14 @@
 //! Every raw signal is stored, never replaced, so later signals refine the
 //! identity rather than overwriting it.
 
+pub mod classify;
+pub mod fingerprint;
 pub mod oui;
 pub mod rdns;
 pub mod scorer;
 
+pub use classify::{Classification, ClassifyInput, classify};
+pub use fingerprint::FingerprintDb;
 pub use rdns::ReverseResolver;
 pub use scorer::{Identity, IdentityInput, improves_on, resolve};
 

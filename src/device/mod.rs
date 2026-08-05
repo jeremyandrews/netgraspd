@@ -22,10 +22,14 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde_json::json;
 
+use crate::analyze::SecurityAlert;
 use crate::config::StateConfig;
 use crate::db::queries::DeviceRecord;
+use crate::identity::classify::{ALWAYS_ON_HOURS, Classification, ClassifyInput};
 use crate::identity::{self, Identity};
-use crate::types::{DeviceState, EventType, MacAddr, Observation, Signal, SignalKind};
+use crate::types::{
+    DeviceState, EventPriority, EventType, MacAddr, Observation, Signal, SignalKind,
+};
 
 /// Something the state machine decided, for the persistence layer to apply.
 #[derive(Debug, Clone, PartialEq)]
@@ -99,6 +103,8 @@ pub struct DeviceEvent {
     pub during_learning: bool,
     /// The user's per-device notification toggle.
     pub notify: bool,
+    /// How loudly to deliver this, when the transport understands priority.
+    pub priority: EventPriority,
     /// Structured detail for `ng_events.details`.
     pub details: serde_json::Value,
 }
@@ -109,10 +115,42 @@ impl DeviceEvent {
     /// Learning-window suppression happens here and nowhere else, so that the
     /// record in `ng_events` is written either way. A security tool that forgets
     /// events during its own warm-up is worse than one that stays quiet.
+    ///
+    /// Security events are never suppressed. A learning window is Netgrasp
+    /// deciding which devices are normal; it is not a reason to stay quiet while
+    /// one of them poisons the ARP table. The per-device `notify` toggle is
+    /// likewise ignored for them: it means "stop telling me when this device
+    /// comes and goes", not "let this device attack the network in silence".
     #[must_use]
     pub const fn deliverable(&self) -> bool {
+        if self.event_type.is_security() {
+            return true;
+        }
         self.notify && !self.during_learning
     }
+}
+
+/// A device whose classification changed.
+///
+/// Produced by the state machine and consumed by the `identity_change`
+/// analyzer, which decides whether the change is worth an event. The state
+/// machine deliberately does not make that call itself: whether a first
+/// classification counts as a change is policy, and policy belongs with the
+/// analyzers and their config.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reclassification {
+    /// Which device.
+    pub mac: MacAddr,
+    /// Name to show in an alert about it.
+    pub display_name: String,
+    /// What it was classified as before.
+    pub previous: Classification,
+    /// What it is classified as now.
+    pub current: Classification,
+    /// Interface it was last seen on.
+    pub interface: Option<String>,
+    /// When the change happened.
+    pub at: DateTime<Utc>,
 }
 
 /// The daemon-owned view of a device, used for flushes and for the CLI table.
@@ -124,6 +162,8 @@ pub struct DeviceSnapshot {
     pub state: DeviceState,
     /// Most recent IPv4 address.
     pub last_ip: Option<String>,
+    /// Most recent IPv6 address, global preferred over link-local.
+    pub last_ipv6: Option<String>,
     /// Interface last seen on.
     pub last_interface: Option<String>,
     /// First sighting.
@@ -142,8 +182,12 @@ pub struct DeviceSnapshot {
     pub mdns_name: Option<String>,
     /// Vendor.
     pub vendor: Option<String>,
-    /// Classified device type, when milestone 2 has set one.
+    /// Classified device type.
     pub device_type: Option<String>,
+    /// How much to trust the device type.
+    pub device_type_confidence: Option<f32>,
+    /// Classified operating system family.
+    pub os_family: Option<String>,
     /// Observations counted since the last flush, added to the open presence
     /// session's counter. This is the only number that summarises packet volume,
     /// and it is a counter rather than a row per packet on purpose.
@@ -170,15 +214,21 @@ struct Entry {
     first_seen_at: DateTime<Utc>,
     last_seen_at: DateTime<Utc>,
     last_ip: Option<String>,
+    last_ipv6: Option<String>,
     last_interface: Option<String>,
     /// Every stored signal, most recently confirmed first, which is the order
     /// the scorer breaks ties in.
     signals: Vec<Signal>,
     identity: Identity,
+    classification: Classification,
     display_name: Option<String>,
-    device_type: Option<String>,
     baseline: bool,
     notify: bool,
+    /// How many times this device has been seen to go offline **since the
+    /// daemon started**. The behavioural classifier reads it, and it is not
+    /// persisted: a restart resets it to zero, which makes the weakest
+    /// classification signal briefly optimistic and nothing else.
+    offline_transitions: u32,
     observations_since_flush: i64,
     dirty: bool,
 }
@@ -189,6 +239,7 @@ impl Entry {
             mac: self.mac,
             state: self.state,
             last_ip: self.last_ip.clone(),
+            last_ipv6: self.last_ipv6.clone(),
             last_interface: self.last_interface.clone(),
             first_seen_at: self.first_seen_at,
             last_seen_at: self.last_seen_at,
@@ -198,8 +249,64 @@ impl Entry {
             hostname: self.best(SignalKind::ReverseDns),
             mdns_name: self.best(SignalKind::MdnsName),
             vendor: self.best(SignalKind::Vendor),
-            device_type: self.device_type.clone(),
+            device_type: self.classification.device_type.clone(),
+            #[allow(clippy::cast_possible_truncation)] // Confidence is in
+            // [0.0, 1.0] and stored as REAL; f64 to f32 loses nothing here.
+            device_type_confidence: self
+                .classification
+                .device_type
+                .is_some()
+                .then_some(self.classification.confidence as f32),
+            os_family: self.classification.os_family.clone(),
             observations_since_flush: self.observations_since_flush,
+        }
+    }
+
+    /// Records an IPv6 address as the device's current one.
+    ///
+    /// A global address always wins over a link-local one. Every IPv6 device has
+    /// a link-local address derived from its MAC, so it carries no information
+    /// the MAC does not already carry; showing it in place of the global address
+    /// would be showing the least useful of the two.
+    fn record_ipv6(&mut self, addr: std::net::Ipv6Addr) {
+        let incoming_is_link_local = crate::capture::ndp::is_link_local(addr);
+        let keep_existing = incoming_is_link_local
+            && self
+                .last_ipv6
+                .as_deref()
+                .and_then(|existing| existing.parse::<std::net::Ipv6Addr>().ok())
+                .is_some_and(|existing| !crate::capture::ndp::is_link_local(existing));
+        if !keep_existing {
+            self.last_ipv6 = Some(addr.to_string());
+        }
+    }
+
+    /// True when the device has been continuously present long enough for that
+    /// to mean something.
+    fn always_on(&self, now: DateTime<Utc>) -> bool {
+        self.offline_transitions == 0
+            && self.state != DeviceState::Offline
+            && (now - self.first_seen_at).num_hours() >= ALWAYS_ON_HOURS
+    }
+
+    /// Recomputes the device type and OS family, returning the previous
+    /// classification when anything changed.
+    fn reclassify(&mut self, now: DateTime<Utc>) -> Option<Classification> {
+        let vendor = self.best(SignalKind::Vendor);
+        let candidate = identity::classify(&ClassifyInput {
+            mac: self.mac,
+            signals: &self.signals,
+            vendor: vendor.as_deref(),
+            always_on: self.always_on(now),
+        });
+        if candidate.changed_at_all(&self.classification) {
+            Some(std::mem::replace(&mut self.classification, candidate))
+        } else {
+            // The reason string can shift without the conclusion changing, for
+            // instance when a stronger signal arrives that agrees. Keep the
+            // newer reason so the stored explanation stays current.
+            self.classification = candidate;
+            None
         }
     }
 
@@ -255,7 +362,7 @@ impl Entry {
         let candidate = identity::resolve(&identity::IdentityInput {
             mac: self.mac,
             signals: &self.signals,
-            device_type: self.device_type.as_deref(),
+            device_type: self.classification.device_type.as_deref(),
         });
         if identity::improves_on(&candidate, &self.identity) {
             let previous = std::mem::replace(&mut self.identity, candidate);
@@ -271,6 +378,8 @@ pub struct Manager {
     devices: HashMap<MacAddr, Entry>,
     config: StateConfig,
     learning: bool,
+    /// Classification changes waiting to be handed to the analyzer chain.
+    reclassifications: Vec<Reclassification>,
 }
 
 impl Manager {
@@ -281,7 +390,18 @@ impl Manager {
             devices: HashMap::new(),
             config,
             learning,
+            reclassifications: Vec::new(),
         }
+    }
+
+    /// Takes every classification change since the last call.
+    ///
+    /// The caller feeds these to the analyzer chain, which decides whether a
+    /// change is worth an event. Draining rather than returning a reference so
+    /// that a caller which never asks cannot grow the list without bound.
+    #[must_use]
+    pub fn take_reclassifications(&mut self) -> Vec<Reclassification> {
+        std::mem::take(&mut self.reclassifications)
     }
 
     /// Whether a learning window is in progress.
@@ -327,6 +447,11 @@ impl Manager {
     /// Restored devices do not re-emit `new_device`: that is the whole point of
     /// persisting them, and the alternative is a notification storm on every
     /// restart.
+    ///
+    /// The stored classification is trusted as the starting point rather than
+    /// being recomputed from scratch, so that a device does not appear to change
+    /// identity every time the daemon restarts. It is recomputed on the next
+    /// signal like any other.
     pub fn restore(&mut self, records: Vec<DeviceRecord>, mut signals: HashMap<i64, Vec<Signal>>) {
         for record in records {
             let stored = signals.remove(&record.id).unwrap_or_default();
@@ -335,6 +460,12 @@ impl Manager {
                 signals: &stored,
                 device_type: record.device_type.as_deref(),
             });
+            let classification = Classification {
+                device_type: record.device_type,
+                os_family: record.os_family,
+                confidence: record.device_type_confidence.map_or(0.0, f64::from),
+                reason: None,
+            };
             self.devices.insert(
                 record.mac,
                 Entry {
@@ -343,13 +474,15 @@ impl Manager {
                     first_seen_at: record.first_seen_at,
                     last_seen_at: record.last_seen_at,
                     last_ip: record.last_ip,
+                    last_ipv6: record.last_ipv6,
                     last_interface: record.last_interface,
                     signals: stored,
                     identity,
+                    classification,
                     display_name: record.display_name,
-                    device_type: record.device_type,
                     baseline: record.baseline,
                     notify: record.notify,
+                    offline_transitions: 0,
                     observations_since_flush: 0,
                     dirty: false,
                 },
@@ -409,6 +542,7 @@ impl Manager {
                 baseline: entry.baseline,
                 during_learning: learning,
                 notify: entry.notify,
+                priority: EventPriority::Normal,
                 details: json!({ "source": obs.source, "interface": obs.interface }),
             })));
         } else if entry.state == DeviceState::Idle {
@@ -418,9 +552,11 @@ impl Manager {
         }
 
         // Addresses. Only IPv4 moves last_ip and can raise ip_changed; an IPv6
-        // sighting is recorded in history but does not compete, because a
-        // dual-stack device would otherwise flap between its two addresses.
-        // Revisit when the NDP source lands.
+        // sighting updates last_ipv6 and ng_ip_history but raises nothing,
+        // because RFC 4941 privacy addresses rotate and a dual-stack device
+        // would otherwise emit meaningless ip_changed events forever. See the
+        // note in capture/ndp.rs, where this decision was reviewed once NDP
+        // landed and kept.
         if let Some(ip) = obs.ip
             && is_recordable(ip)
         {
@@ -446,6 +582,7 @@ impl Manager {
                         baseline: entry.baseline,
                         during_learning: learning,
                         notify: entry.notify,
+                        priority: EventPriority::Normal,
                         details: json!({
                             "previous_ip": previous,
                             "new_ip": v4,
@@ -453,6 +590,9 @@ impl Manager {
                         }),
                     })));
                 }
+            }
+            if let IpAddr::V6(v6) = ip {
+                entry.record_ipv6(v6);
             }
         }
         entry.last_interface = Some(obs.interface.clone());
@@ -487,6 +627,7 @@ impl Manager {
                 baseline: entry.baseline,
                 during_learning: learning,
                 notify: entry.notify,
+                priority: EventPriority::Normal,
                 details: json!({
                     "previous_name": previous.display_name,
                     "previous_source": previous.source.as_str(),
@@ -495,7 +636,19 @@ impl Manager {
                 }),
             })));
         }
+
+        // Classification is recomputed after the signals land, so a packet that
+        // carries both a name and a fingerprint is one pass rather than two.
+        let reclassified = entry.reclassify(at).map(|previous| Reclassification {
+            mac: entry.mac,
+            display_name: entry.snapshot().display(),
+            previous,
+            current: entry.classification.clone(),
+            interface: Some(obs.interface.clone()),
+            at,
+        });
         drop(config);
+        self.reclassifications.extend(reclassified);
         effects
     }
 
@@ -517,13 +670,15 @@ impl Manager {
             first_seen_at: at,
             last_seen_at: at,
             last_ip: None,
+            last_ipv6: None,
             last_interface: Some(obs.interface.clone()),
             signals,
             identity,
+            classification: Classification::default(),
             display_name: None,
-            device_type: None,
             baseline: self.learning,
             notify: true,
+            offline_transitions: 0,
             observations_since_flush: 0,
             dirty: true,
         };
@@ -557,6 +712,7 @@ impl Manager {
             baseline: learning,
             during_learning: learning,
             notify: true,
+            priority: EventPriority::Normal,
             details: json!({
                 "source": obs.source,
                 "interface": obs.interface,
@@ -599,6 +755,7 @@ impl Manager {
                 baseline: entry.baseline,
                 during_learning: learning,
                 notify: entry.notify,
+                priority: EventPriority::Normal,
                 details: json!({
                     "previous_name": previous.display_name,
                     "previous_source": previous.source.as_str(),
@@ -606,7 +763,63 @@ impl Manager {
                 }),
             })));
         }
+        let reclassified = entry.reclassify(at).map(|previous| Reclassification {
+            mac,
+            display_name: entry.snapshot().display(),
+            previous,
+            current: entry.classification.clone(),
+            interface: entry.last_interface.clone(),
+            at,
+        });
+        self.reclassifications.extend(reclassified);
         effects
+    }
+
+    /// Turns an analyzer's finding into recordable effects.
+    ///
+    /// The analyzers know what happened but not who it happened to: they hold no
+    /// device table, deliberately, so that they stay pure and restartable. This
+    /// is where a MAC becomes a name, a vendor and a database row.
+    ///
+    /// An alert about a MAC the state machine has never seen still produces an
+    /// event. `ng_events.device_id` is nullable precisely for this: the first
+    /// thing a scanner does is scan, and refusing to record it because it has
+    /// not introduced itself first would be exactly backwards.
+    #[must_use]
+    pub fn security_event(&self, alert: &SecurityAlert) -> Vec<Effect> {
+        let entry = self.devices.get(&alert.mac);
+        let display_name = entry.map_or_else(
+            || {
+                identity::vendor_signal(alert.mac).map_or_else(
+                    || alert.mac.to_string(),
+                    |vendor| format!("{} device", vendor.value),
+                )
+            },
+            |e| e.snapshot().display(),
+        );
+        let mut details = alert.details.clone();
+        if let Some(object) = details.as_object_mut() {
+            // The flag the plugin and the CLI key on to render these
+            // differently. Set here rather than in each analyzer so that no
+            // analyzer can forget it.
+            object.insert("security".to_string(), json!(true));
+            object.insert("priority".to_string(), json!(alert.priority.as_str()));
+        }
+        vec![Effect::Event(Box::new(DeviceEvent {
+            event_type: alert.event_type,
+            mac: alert.mac,
+            display_name,
+            vendor: entry.and_then(|e| e.best(SignalKind::Vendor)),
+            ip: alert.ip.clone(),
+            interface: alert.interface.clone(),
+            at: alert.at,
+            baseline: entry.is_some_and(|e| e.baseline),
+            // Never suppressed by a learning window; see DeviceEvent::deliverable.
+            during_learning: false,
+            notify: true,
+            priority: alert.priority,
+            details,
+        }))]
     }
 
     /// Applies timeouts, moving quiet devices to idle and silent ones offline.
@@ -620,7 +833,7 @@ impl Manager {
             let silence = (now - entry.last_seen_at)
                 .to_std()
                 .unwrap_or(Duration::ZERO);
-            let device_type = entry.device_type.as_deref();
+            let device_type = entry.classification.device_type.as_deref();
             let offline_after = self.config.offline_timeout_for(device_type);
             let idle_after = self.config.idle_timeout_for(device_type);
 
@@ -630,6 +843,7 @@ impl Manager {
             if silence >= offline_after {
                 entry.state = DeviceState::Offline;
                 entry.dirty = true;
+                entry.offline_transitions = entry.offline_transitions.saturating_add(1);
                 effects.push(Effect::PresenceClosed {
                     mac: entry.mac,
                     at: now,
@@ -645,6 +859,7 @@ impl Manager {
                     baseline: entry.baseline,
                     during_learning: self.learning,
                     notify: entry.notify,
+                    priority: EventPriority::Normal,
                     details: json!({
                         "last_seen_at": entry.last_seen_at,
                         "silent_for_secs": silence.as_secs(),
@@ -1233,9 +1448,11 @@ mod tests {
             mdns_name: None,
             vendor: None,
             device_type: None,
+            device_type_confidence: None,
             os_family: None,
             state,
             last_ip: None,
+            last_ipv6: None,
             last_interface: None,
             first_seen_at: base(),
             last_seen_at: base(),

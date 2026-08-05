@@ -159,6 +159,35 @@ pub fn event_table(events: &[EventRecord], now: DateTime<Utc>) -> String {
     render(&["WHEN", "EVENT", "DEVICE", "NOTIFIED", "DETAIL"], &rows)
 }
 
+/// Detail keys worth showing, in the order they read best.
+///
+/// One list rather than one per event type: a security event and a lifecycle
+/// event never carry the same keys, so a single pass over this picks out
+/// whichever apply. A key that is absent, null or blank contributes nothing,
+/// which is what keeps the column narrow.
+const DETAIL_KEYS: [&str; 17] = [
+    // Device lifecycle.
+    "previous_ip",
+    "new_ip",
+    "previous_name",
+    "new_source",
+    "silent_for_secs",
+    // Security. Without these the DETAIL column is empty for exactly the events
+    // an operator most needs to read at a glance.
+    "claimed_ip",
+    "previous_holder",
+    "gateway_impersonation",
+    "distinct_targets",
+    "announcements",
+    "other_mac",
+    "expected_server",
+    "message_type",
+    "previous_device_type",
+    "device_type",
+    "category_change",
+    "interface",
+];
+
 /// Flattens the interesting parts of an event's JSON detail into one line.
 #[must_use]
 fn detail_summary(details: &serde_json::Value) -> String {
@@ -166,14 +195,7 @@ fn detail_summary(details: &serde_json::Value) -> String {
         return String::new();
     };
     let mut parts = Vec::new();
-    for key in [
-        "previous_ip",
-        "new_ip",
-        "previous_name",
-        "new_source",
-        "silent_for_secs",
-        "interface",
-    ] {
+    for key in DETAIL_KEYS {
         if let Some(value) = object.get(key) {
             let rendered = value
                 .as_str()
@@ -204,6 +226,7 @@ mod tests {
             mac: "3c:22:fb:00:00:01".parse().expect("mac"),
             state: DeviceState::Online,
             last_ip: Some("192.168.1.40".into()),
+            last_ipv6: None,
             last_interface: Some("eth0".into()),
             first_seen_at: now(),
             last_seen_at: now() - chrono::Duration::seconds(ago_secs),
@@ -218,6 +241,8 @@ mod tests {
             mdns_name: Some(name.into()),
             vendor: vendor.map(str::to_string),
             device_type: None,
+            device_type_confidence: None,
+            os_family: None,
             observations_since_flush: 0,
         }
     }
@@ -323,6 +348,31 @@ mod tests {
         assert!(line.contains("previous_ip=192.168.1.40"), "{line}");
         assert!(line.contains("new_ip=192.168.1.41"), "{line}");
         assert!(!line.contains("irrelevant"), "{line}");
+    }
+
+    #[test]
+    fn a_security_events_detail_column_is_not_empty() {
+        // The regression this catches: `events --security` rendering a column of
+        // blanks, which is the one view where the evidence is the whole point.
+        let spoof = detail_summary(&serde_json::json!({
+            "analyzer": "arp_spoof",
+            "claimed_ip": "192.168.1.1",
+            "previous_holder": serde_json::Value::Null,
+            "gateway_impersonation": true,
+            "security": true,
+        }));
+        assert!(spoof.contains("claimed_ip=192.168.1.1"), "{spoof}");
+        assert!(spoof.contains("gateway_impersonation=true"), "{spoof}");
+        assert!(
+            !spoof.contains("previous_holder"),
+            "a null contributes nothing: {spoof}"
+        );
+
+        let scan = detail_summary(&serde_json::json!({
+            "distinct_targets": 10,
+            "threshold": 10,
+        }));
+        assert!(scan.contains("distinct_targets=10"), "{scan}");
     }
 
     #[test]
