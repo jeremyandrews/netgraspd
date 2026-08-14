@@ -129,57 +129,28 @@ jobs:
       - name: Audit
         run: cargo audit --deny warnings
 
-  cross:
-    name: cross compile (${{ matrix.target }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - x86_64-unknown-linux-gnu
-          - aarch64-unknown-linux-gnu
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      # `cross` builds inside a container that already carries the sysroot and
-      # the linker for the target. Cross.toml adds libpcap for the target
-      # architecture, which is the one thing the stock images do not have.
-      - name: Install cross
-        run: cargo install cross --locked
-
-      - name: Build
-        run: cross build --release --locked --target ${{ matrix.target }}
-
-      - name: The binary is for the architecture it claims
-        run: |
-          file target/${{ matrix.target }}/release/netgraspd
-          case "${{ matrix.target }}" in
-            aarch64-*) expected=aarch64 ;;
-            *)         expected=x86-64 ;;
-          esac
-          file target/${{ matrix.target }}/release/netgraspd | grep -qi "$expected"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: netgraspd-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/netgraspd
-          if-no-files-found: error
-
+  # Builds the image and publishes the binary inside it as a standalone
+  # artifact, which is also the cross-compilation story.
+  #
+  # There is no separate `cross` job. It was tried and removed: cross's stock
+  # image for aarch64 is Ubuntu 16.04 and cannot install libpcap for the foreign
+  # architecture, so the build failed at `apt-get install libpcap-dev:arm64`.
+  # Fighting the apt layout of somebody else's base image is not worth it when
+  # this job already produces exactly the binary we want, on a current base, and
+  # asserts that it runs.
   docker:
-    name: docker image (${{ matrix.platform }})
+    name: image and binary (${{ matrix.platform }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        platform:
-          - linux/amd64
-          - linux/arm64
+        include:
+          - platform: linux/amd64
+            target: x86_64-unknown-linux-gnu
+            arch: x86-64
+          - platform: linux/arm64
+            target: aarch64-unknown-linux-gnu
+            arch: aarch64
     steps:
       - uses: actions/checkout@v4
 
@@ -210,6 +181,23 @@ jobs:
 
       - name: Report the image size
         run: docker image ls netgraspd:ci --format '{{.Size}}'
+
+      # The binary out of the image is the release artifact. `file` asserts it
+      # really is for the architecture it claims, so an emulation or buildx
+      # misconfiguration cannot ship an amd64 binary as the Raspberry Pi one.
+      - name: Extract the binary
+        run: |
+          id=$(docker create --platform ${{ matrix.platform }} netgraspd:ci)
+          docker cp "$id:/usr/local/bin/netgraspd" ./netgraspd-${{ matrix.target }}
+          docker rm "$id"
+          file ./netgraspd-${{ matrix.target }}
+          file ./netgraspd-${{ matrix.target }} | grep -qi '${{ matrix.arch }}'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: netgraspd-${{ matrix.target }}
+          path: netgraspd-${{ matrix.target }}
+          if-no-files-found: error
 
   compose:
     name: docker compose is valid

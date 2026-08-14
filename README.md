@@ -390,21 +390,32 @@ parameterised, because this repository does not know which build you run:
 docker compose --profile trovato up -d
 ```
 
-### Cross-compiled binaries
+### Standalone binaries
 
-CI builds `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` with
-[`cross`](https://github.com/cross-rs/cross) and uploads both as artifacts.
-`Cross.toml` installs libpcap for the target architecture, which the stock
-images do not carry; without it the build fails at link time with
-`cannot find -lpcap`, which is a confusing message for something that builds
-fine on the host.
+CI builds the image for `linux/amd64` and `linux/arm64`, extracts the binary
+from each, asserts with `file` that it really is for the architecture it claims,
+and uploads both as artifacts: `netgraspd-x86_64-unknown-linux-gnu` and
+`netgraspd-aarch64-unknown-linux-gnu`.
 
-To build one locally:
+The container build *is* the cross-compilation story here. A separate
+[`cross`](https://github.com/cross-rs/cross) job was tried and removed: its
+stock image for aarch64 is Ubuntu 16.04 and cannot install libpcap for the
+foreign architecture, so the build failed before it reached any Rust. The
+container build produces the same binary on a current base, and it is the one
+that actually ships in the image.
+
+To build one locally, for the Raspberry Pi target:
 
 ```sh
-cargo install cross --locked
-cross build --release --target aarch64-unknown-linux-gnu
+docker build --platform linux/arm64 -t netgraspd:arm64 .
+id=$(docker create --platform linux/arm64 netgraspd:arm64)
+docker cp "$id:/usr/local/bin/netgraspd" ./netgraspd-aarch64
+docker rm "$id"
 ```
+
+Note that the binary is dynamically linked against the image's libpcap and
+glibc, so it wants a comparably recent distribution. Run the image itself if
+that is inconvenient.
 
 ## How a device gets its name
 
