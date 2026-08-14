@@ -2,8 +2,14 @@
 //!
 //! The tests need a real Postgres because the point of them is that the schema,
 //! the upserts and the partial unique indexes behave as designed. Set
-//! `NETGRASP_TEST_DATABASE_URL` to point somewhere else; the default is a local
+//! `NETGRASPD_TEST_DATABASE_URL` to point somewhere else; the default is a local
 //! `netgrasp` database.
+//!
+//! The variable is deliberately spelled `NETGRASPD_`, not `NETGRASP_`. The
+//! daemon reads every `NETGRASP_`-prefixed environment variable as configuration
+//! and rejects unknown keys, so a harness variable under that prefix makes every
+//! configuration test in the same run fail with "failed to assemble
+//! configuration". It did, once.
 //!
 //! When no database is reachable the harness returns `None` and the test prints
 //! why and passes. A developer without Postgres running should still get a green
@@ -67,8 +73,7 @@ impl TestDb {
 /// Returns `None` when no database is reachable, so the caller can skip.
 pub async fn test_db() -> Option<TestDb> {
     let guard = DB_LOCK.lock().await;
-    let url =
-        std::env::var("NETGRASP_TEST_DATABASE_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
+    let url = test_url();
 
     let cfg = netgraspd::config::DatabaseConfig {
         url: url.clone(),
@@ -79,16 +84,20 @@ pub async fn test_db() -> Option<TestDb> {
         eprintln!("skipping: no Postgres at {url}");
         return None;
     }
-    if let Err(err) = Db::migrate(&url).await {
-        eprintln!("skipping: could not migrate {url}: {err}");
-        return None;
-    }
+    // A migration failure against a database that *is* reachable is a real
+    // failure and must never be mistaken for "no Postgres here". Treating it as
+    // a skip is how a whole test binary turns into thirteen green ticks that
+    // proved nothing, which is exactly what happened once.
+    Db::migrate(&url).await.unwrap_or_else(|err| {
+        panic!("the test database at {url} is reachable but could not be migrated: {err:#}")
+    });
 
     {
         let client = db.client().await.expect("a pooled connection");
         client
             .batch_execute(
-                "TRUNCATE ng_events, ng_ip_history, ng_presence, ng_device_signals, ng_devices
+                "TRUNCATE ng_events, ng_ip_history, ng_presence, ng_location_history,
+                          ng_people, ng_device_signals, ng_devices
                  RESTART IDENTITY CASCADE",
             )
             .await
@@ -101,4 +110,67 @@ pub async fn test_db() -> Option<TestDb> {
 /// Asserts a table is empty, with a message naming it.
 pub async fn assert_empty(db: &TestDb, table: &str) {
     assert_eq!(db.count(table).await, 0, "{table} should be empty");
+}
+
+/// The connection URL the harness is using.
+pub fn test_url() -> String {
+    std::env::var("NETGRASPD_TEST_DATABASE_URL").unwrap_or_else(|_| DEFAULT_URL.to_string())
+}
+
+/// Drops every table and migrates from nothing.
+///
+/// Two tests deliberately wreck the schema, because the failures worth proving
+/// are exactly the ones a wrecked schema causes. Both call this afterwards: a
+/// test that leaves `refinery_schema_history` missing makes every test after it
+/// in the same binary *skip*, and a skipped test is a green tick that proved
+/// nothing.
+pub async fn rebuild_schema(db: &TestDb) {
+    db.execute(
+        "DROP TABLE IF EXISTS ng_people, ng_location_history, ng_ip_history, ng_events,
+                              ng_presence, ng_device_signals, ng_devices,
+                              refinery_schema_history CASCADE",
+    )
+    .await;
+    Db::migrate(&test_url())
+        .await
+        .expect("rebuilding the test schema");
+}
+
+impl TestDb {
+    /// Inserts a device directly, returning its id.
+    ///
+    /// For tests about the tables downstream of `ng_devices`, which need a
+    /// device to hang off and do not care how it was discovered.
+    pub async fn seed_device(&self, mac: &str, state: &str) -> i64 {
+        let client = self.client().await;
+        let row = client
+            .query_one(
+                "INSERT INTO ng_devices (mac, state, first_seen_at, last_seen_at)
+                 VALUES ($1, $2, now(), now())
+                 RETURNING id",
+                &[&mac, &state],
+            )
+            .await
+            .unwrap_or_else(|err| panic!("seeding device {mac}: {err}"));
+        row.get(0)
+    }
+
+    /// Runs a statement, panicking with the statement text on failure.
+    pub async fn execute(&self, sql: &str) {
+        let client = self.client().await;
+        client
+            .batch_execute(sql)
+            .await
+            .unwrap_or_else(|err| panic!("running {sql:?}: {err}"));
+    }
+
+    /// Runs a scalar query returning one nullable `i64`.
+    pub async fn maybe_scalar(&self, sql: &str) -> Option<i64> {
+        let client = self.client().await;
+        let row = client
+            .query_one(sql, &[])
+            .await
+            .unwrap_or_else(|err| panic!("running {sql:?}: {err}"));
+        row.get(0)
+    }
 }

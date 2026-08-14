@@ -29,6 +29,9 @@ refinery = { version = "0.9.2", features = ["tokio-postgres"] }
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "json",
+    # The UniFi enricher exchanges local credentials for a session cookie, so it
+    # needs a cookie store to carry that across the reads that follow the login.
+    "cookies",
 ] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

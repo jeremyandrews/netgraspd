@@ -133,6 +133,25 @@ impl Persister {
                             .with_context(|| format!("closing a presence session for {mac}"))?;
                     }
                 }
+                Effect::LocationChanged {
+                    mac,
+                    ap_name,
+                    location,
+                    at,
+                } => {
+                    if let Some(id) = self.id_for(*mac) {
+                        queries::change_location(client, id, ap_name.as_deref(), location, *at)
+                            .await
+                            .with_context(|| format!("recording a location change for {mac}"))?;
+                    }
+                }
+                Effect::LocationClosed { mac, at } => {
+                    if let Some(id) = self.id_for(*mac) {
+                        queries::close_location(client, id, *at)
+                            .await
+                            .with_context(|| format!("closing a location stay for {mac}"))?;
+                    }
+                }
                 Effect::Event(event) => {
                     let device_id = self.id_for(event.mac);
                     let id = queries::insert_event(
@@ -193,6 +212,8 @@ impl Persister {
                     device_type: snapshot.device_type.clone(),
                     device_type_confidence: snapshot.device_type_confidence,
                     os_family: snapshot.os_family.clone(),
+                    current_ap: snapshot.current_ap.clone(),
+                    current_location: snapshot.current_location.clone(),
                 },
             )
             .await
@@ -238,6 +259,9 @@ mod tests {
             hidden: false,
             notify: true,
             notes: None,
+            current_ap: None,
+            current_location: None,
+            owner_item_id: None,
         }
     }
 

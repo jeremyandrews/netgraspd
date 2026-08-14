@@ -1,0 +1,70 @@
+# systemd unit for netgraspd.
+#
+#   sudo install -m 0644 packaging/netgraspd.service /etc/systemd/system/
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin netgraspd
+#   sudo install -d -o netgraspd -g netgraspd /var/lib/netgraspd
+#   sudo install -m 0640 -o root -g netgraspd netgrasp.toml /etc/netgrasp.toml
+#   sudo systemctl daemon-reload && sudo systemctl enable --now netgraspd
+#
+# The daemon does not run as root. Packet capture needs CAP_NET_RAW and nothing
+# else, so systemd grants exactly that through AmbientCapabilities and takes
+# everything else away. `setcap` on the binary is the alternative and works, but
+# it has to be reapplied after every upgrade; this survives one.
+
+[Unit]
+Description=netgraspd, a passive network device monitor
+Documentation=https://github.com/jeremyandrews/netgraspd
+# Wants= rather than Requires=: a database that is briefly away is something the
+# daemon already handles by logging and carrying on, and is not a reason to
+# refuse to start.
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=netgraspd
+Group=netgraspd
+ExecStart=/usr/local/bin/netgraspd run --config /etc/netgrasp.toml --no-table
+
+# The capability, and only the capability.
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+NoNewPrivileges=true
+
+# Everything below is the ordinary hardening for a daemon that reads packets and
+# writes to one directory. StateDirectory creates and owns
+# /var/lib/netgraspd, which is where the runtime status file `netgraspd stats`
+# reads lives.
+StateDirectory=netgraspd
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=false
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# PrivateDevices must stay false: it would hide /dev/bpf* and the packet
+# sockets, which is the one thing this daemon cannot do without.
+
+# The daemon handles SIGTERM: it flushes, closes the open presence sessions'
+# counters and stops the capture threads. Give it room to finish.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=10
+
+# It reads the network and writes to Postgres. Neither is bursty.
+Nice=5
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

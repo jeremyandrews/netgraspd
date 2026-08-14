@@ -13,7 +13,14 @@
 //!   to `ng_events` the moment they happen.
 //! - **learning** ends the baseline window.
 //! - **render** redraws the live table when stdout is a terminal.
+//! - **enrich** asks the orchestrator whether any enricher is due, which is what
+//!   places devices at access points and therefore in rooms.
+//! - **maintenance** asks whether the nightly rollup is due. Coarse rather than
+//!   a sleep until the configured minute, so a machine suspended over that
+//!   minute runs the job when it wakes rather than skipping a day.
+//! - **status** rewrites the runtime file `netgraspd stats` reads.
 
+use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
 use std::time::Duration;
 
@@ -29,11 +36,16 @@ use crate::config::Config;
 use crate::db::{Db, queries};
 use crate::device::persist::Persister;
 use crate::device::{Effect, Manager};
+use crate::enrich::Orchestrator;
 use crate::events::EventBus;
 use crate::identity::ReverseResolver;
+use crate::location::LocationMap;
+use crate::maintenance;
 use crate::notify::ntfy::NtfyNotifier;
 use crate::notify::{Dispatcher, Notifier, deliver};
-use crate::types::{MacAddr, Observation, Signal, SignalKind};
+use crate::people::{self, Registry};
+use crate::runtime::Status;
+use crate::types::{DeviceState, MacAddr, Observation, Signal, SignalKind};
 
 /// How often the learning-mode progress line is redrawn.
 const LEARNING_TICK: Duration = Duration::from_secs(2);
@@ -44,6 +56,13 @@ const RENDER_TICK: Duration = Duration::from_secs(2);
 /// How often the notifier task closes a due batch window even if nothing new
 /// arrived.
 const DISPATCH_TICK: Duration = Duration::from_secs(1);
+
+/// How often the daemon asks whether the nightly maintenance job is due.
+///
+/// Coarse on purpose. Sleeping until the configured minute would mean a machine
+/// suspended over that minute skips a day; checking every minute means it runs
+/// as soon as it wakes.
+const MAINTENANCE_TICK: Duration = Duration::from_secs(60);
 
 /// Options that come from the command line rather than the config file.
 #[derive(Debug, Clone, Copy, Default)]
@@ -69,6 +88,16 @@ pub struct RunSummary {
     pub devices: usize,
     /// Whether a learning window ran.
     pub learned: bool,
+    /// Observations seen per capture source, before deduplication.
+    ///
+    /// Before rather than after, because this answers "is this source seeing
+    /// traffic at all", and a source whose every packet is a duplicate of
+    /// another source's is still working.
+    pub sources: BTreeMap<String, u64>,
+    /// Location changes applied from enrichment.
+    pub location_changes: u64,
+    /// Person arrivals and departures recorded.
+    pub person_events: u64,
 }
 
 /// Starts capture, processes observations, and returns when shutdown is
@@ -87,25 +116,39 @@ pub async fn run(
     let db = Db::connect(&config.database)?;
     Db::migrate(&config.database.url).await?;
     db.health_check().await?;
+    // The schema is a contract with a plugin in another repository, so a
+    // divergence is refused here rather than discovered later as a broken page.
+    db.preflight().await?;
     install_fingerprints(config);
 
     // Rehydrate. A restart must not re-announce the whole network.
-    let (mut manager, mut persister, device_count) = {
+    let (mut manager, mut persister, mut registry, device_count) = {
         let client = db.client().await?;
         let records = queries::load_devices(&client).await?;
         let signals = queries::load_all_signals(&client).await?;
         let count = records.len();
         let mut persister = Persister::new();
         persister.seed(&records);
+
+        // A device that went offline while the daemon was not running left its
+        // location stay open. Close them before anything reads the table.
+        match queries::close_stale_location_stays(&client, Utc::now()).await {
+            Ok(0) => {}
+            Ok(closed) => tracing::info!(closed, "closed location stays left open by a restart"),
+            Err(err) => tracing::warn!(%err, "could not close stale location stays"),
+        }
+
+        let registry = build_registry(&client, config, &records).await;
         let learning = opts.learn || (config.learning.on_first_run && count == 0);
         let mut manager = Manager::new(config.state.clone(), learning);
         manager.restore(records, signals);
-        (manager, persister, count)
+        (manager, persister, registry, count)
     };
     let learning = manager.is_learning();
     tracing::info!(
         devices = device_count,
         learning,
+        people = registry.len(),
         "restored device table from Postgres"
     );
 
@@ -145,6 +188,19 @@ pub async fn run(
         None
     };
 
+    let mut enrichers = Orchestrator::from_config(&config.enrichment)?;
+    let location_map = LocationMap::from_unifi(&config.enrichment.unifi);
+    if enrichers.is_active() {
+        tracing::info!(
+            enrichers = ?enrichers.names(),
+            mapped_aps = location_map.len(),
+            edge_aps = location_map.edge_count(),
+            "enrichment running"
+        );
+    } else {
+        tracing::info!("no enrichers are configured; devices will have no location");
+    }
+
     let mut dedup = ObservationDedup::new(
         config.capture.dedup_capacity,
         config.capture.dedup_resolution_secs,
@@ -164,10 +220,16 @@ pub async fn run(
     let mut flush = ticker(config.state.flush_interval.get());
     let mut learning_tick = ticker(LEARNING_TICK);
     let mut render = ticker(RENDER_TICK);
+    let mut enrich_tick = ticker(crate::enrich::TICK);
+    let mut maintenance_tick = ticker(MAINTENANCE_TICK);
+    let mut status_tick = ticker(config.runtime.status_interval.get());
     let learning_deadline = Instant::now() + config.learning.duration.get();
     let show_table = !opts.no_table && std::io::stdout().is_terminal();
     let mut shutdown_rx = shutdown.clone();
     let mut asked_for_rdns: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let local_offset = *chrono::Local::now().offset();
+    let mut last_maintenance: Option<DateTime<Utc>> = None;
+    let started_at = Utc::now();
 
     loop {
         tokio::select! {
@@ -185,6 +247,11 @@ pub async fn run(
                     tracing::info!("every capture source has stopped");
                     break;
                 };
+
+                // Counted before dedup, because this answers "is this source
+                // seeing traffic at all" and a source whose every packet
+                // duplicates another's is still working.
+                *summary.sources.entry(observation.source.to_string()).or_default() += 1;
 
                 // The state machine runs first, on the deduplicated stream, so
                 // that a brand-new attacker's device row exists before any alert
@@ -204,8 +271,13 @@ pub async fn run(
                         );
                     }
 
+                    registry.device_seen(observation.mac, observation.observed_at);
                     let effects = manager.observe(&observation);
-                    summary.events += apply(&db, &mut persister, &bus, &effects).await;
+                    let (events, people) = apply_and_track(
+                        &db, &mut persister, &bus, &mut manager, &mut registry, &effects,
+                    ).await;
+                    summary.events += events;
+                    summary.person_events += people;
                 }
 
                 // The analyzers see *every* observation, deduplicated or not.
@@ -230,11 +302,50 @@ pub async fn run(
 
             _ = sweep.tick() => {
                 let effects = manager.sweep(Utc::now());
-                summary.events += apply(&db, &mut persister, &bus, &effects).await;
+                let (events, people) = apply_and_track(
+                    &db, &mut persister, &bus, &mut manager, &mut registry, &effects,
+                ).await;
+                summary.events += events;
+                summary.person_events += people;
             }
 
             _ = flush.tick() => {
                 flush_devices(&db, &persister, &mut manager).await;
+            }
+
+            _ = enrich_tick.tick(), if enrichers.is_active() => {
+                let devices = manager.snapshot();
+                let enrichments = enrichers.poll_due(Instant::now(), &devices).await;
+                if !enrichments.is_empty() {
+                    let mut sinks = Sinks {
+                        db: &db,
+                        persister: &mut persister,
+                        bus: &bus,
+                        manager: &mut manager,
+                        registry: &mut registry,
+                    };
+                    let applied = apply_enrichments(
+                        &mut sinks, &location_map, &enrichments, Utc::now(),
+                    ).await;
+                    summary.location_changes += applied.locations;
+                    summary.events += applied.events;
+                    summary.person_events += applied.person_events;
+                }
+            }
+
+            _ = maintenance_tick.tick() => {
+                if maintenance::is_due(
+                    &config.maintenance, Utc::now(), last_maintenance, local_offset,
+                ) {
+                    last_maintenance = Some(Utc::now());
+                    run_maintenance(&db, &config.maintenance).await;
+                }
+            }
+
+            _ = status_tick.tick() => {
+                write_status(
+                    config, started_at, &summary, &manager, &dedup, &enrichers,
+                );
             }
 
             _ = learning_tick.tick(), if manager.is_learning() => {
@@ -302,6 +413,313 @@ async fn apply(db: &Db, persister: &mut Persister, bus: &EventBus, effects: &[Ef
             0
         }
     }
+}
+
+/// Applies effects, then feeds the presence transitions among them to the people
+/// registry and records whatever it made of them.
+///
+/// Presence is the signal rather than the `returned` and `went_offline` events,
+/// because `PresenceOpened` and `PresenceClosed` are exactly "this device is now
+/// online" and "this device is now offline" with no other meaning attached, and
+/// a discovery opens a session without producing a `returned`.
+///
+/// Returns the number of ordinary events and the number of person events
+/// recorded.
+async fn apply_and_track(
+    db: &Db,
+    persister: &mut Persister,
+    bus: &EventBus,
+    manager: &mut Manager,
+    registry: &mut Registry,
+    effects: &[Effect],
+) -> (u64, u64) {
+    let events = apply(db, persister, bus, effects).await;
+    if !registry.is_active() {
+        return (events, 0);
+    }
+    let mut outcome = people::Outcome::default();
+    for effect in effects {
+        match effect {
+            Effect::PresenceOpened { mac, at, .. } => {
+                outcome.merge(registry.device_online(*mac, *at));
+            }
+            Effect::PresenceClosed { mac, at } => {
+                outcome.merge(registry.device_offline(*mac, *at));
+            }
+            _ => {}
+        }
+    }
+    let people = record_people(db, persister, bus, manager, &outcome).await;
+    (events, people)
+}
+
+/// Writes the people the registry changed and records the events it produced.
+///
+/// Returns how many person events were recorded.
+async fn record_people(
+    db: &Db,
+    persister: &mut Persister,
+    bus: &EventBus,
+    manager: &Manager,
+    outcome: &people::Outcome,
+) -> u64 {
+    if outcome.is_empty() {
+        return 0;
+    }
+    if let Ok(client) = db.client().await {
+        for update in &outcome.updates {
+            if let Err(err) = queries::update_person(
+                &client,
+                &update.item_id,
+                update.state.as_str(),
+                update.current_location.as_deref(),
+                update.last_arrived_at,
+                update.last_departed_at,
+            )
+            .await
+            {
+                tracing::warn!(person = %update.item_id, %err, "could not update a person");
+            }
+        }
+    } else {
+        tracing::warn!("could not write people: no database connection");
+    }
+
+    let mut recorded = 0;
+    for event in &outcome.events {
+        tracing::info!(
+            event = %event.event_type,
+            person = %event.name,
+            details = %event.details,
+            "person event"
+        );
+        let effects = manager.person_event(event);
+        recorded += apply(db, persister, bus, &effects).await;
+    }
+    recorded
+}
+
+/// What one round of enrichment produced.
+#[derive(Debug, Default)]
+struct Applied {
+    /// Devices that moved.
+    locations: u64,
+    /// Events recorded for those moves.
+    events: u64,
+    /// Person events recorded as a consequence.
+    person_events: u64,
+}
+
+/// Everything one round of work writes to.
+///
+/// Bundled rather than passed as five arguments because they always travel
+/// together and always in the same order, and a five-argument list of borrows is
+/// where a `&mut` ends up pointing at the wrong thing.
+struct Sinks<'a> {
+    /// The connection pool.
+    db: &'a Db,
+    /// The MAC-to-id map.
+    persister: &'a mut Persister,
+    /// The event bus.
+    bus: &'a EventBus,
+    /// The device state machine.
+    manager: &'a mut Manager,
+    /// The people registry.
+    registry: &'a mut Registry,
+}
+
+/// Turns enrichments into location stays, device events and person events.
+async fn apply_enrichments(
+    sinks: &mut Sinks<'_>,
+    map: &LocationMap,
+    enrichments: &[crate::enrich::Enrichment],
+    now: DateTime<Utc>,
+) -> Applied {
+    let mut applied = Applied::default();
+    let mut outcome = people::Outcome::default();
+    for enrichment in enrichments {
+        // A source that knows the place itself overrides the operator's map;
+        // one that only knows the access point goes through it.
+        let Some(ap) = enrichment.ap_name.as_deref() else {
+            continue;
+        };
+        let mut place = map.place(ap);
+        if let Some(location) = enrichment.ap_location.as_deref()
+            && !location.trim().is_empty()
+        {
+            place.location = location.trim().to_string();
+        }
+        let previous = sinks.manager.current_ap(enrichment.mac);
+        let movement = map.movement(previous.as_deref(), &place.ap_name);
+
+        let effects = sinks.manager.set_location(
+            enrichment.mac,
+            &place,
+            movement,
+            enrichment.telemetry(),
+            now,
+        );
+        if effects.is_empty() {
+            // Already on that access point. An enricher polling every thirty
+            // seconds says so every time, and turning each into a stay would be
+            // the row-per-observation failure this daemon exists to avoid.
+            continue;
+        }
+        applied.locations += 1;
+        applied.events += apply(sinks.db, sinks.persister, sinks.bus, &effects).await;
+        if sinks.registry.is_active() {
+            outcome.merge(
+                sinks
+                    .registry
+                    .device_moved(enrichment.mac, &place, movement, now),
+            );
+        }
+    }
+    applied.person_events = record_people(
+        sinks.db,
+        sinks.persister,
+        sinks.bus,
+        sinks.manager,
+        &outcome,
+    )
+    .await;
+    applied
+}
+
+/// Runs the nightly maintenance job, logging rather than propagating a failure.
+///
+/// A rollup that fails is a database that grows for another day. Stopping the
+/// daemon over it would be a monitor that stops watching the network because it
+/// could not tidy up, which is the wrong trade every time.
+async fn run_maintenance(db: &Db, config: &crate::config::MaintenanceConfig) {
+    let client = match db.client().await {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::error!(%err, "maintenance skipped: no database connection");
+            return;
+        }
+    };
+    match maintenance::run(&client, config, Utc::now()).await {
+        Ok(report) => tracing::info!(summary = %report.summary(), "nightly maintenance complete"),
+        Err(err) => tracing::error!(%err, "nightly maintenance failed"),
+    }
+}
+
+/// Rewrites the runtime status file that `netgraspd stats` reads.
+///
+/// A path that cannot be written is logged at debug and otherwise ignored: an
+/// operator who has not created `/var/lib/netgraspd` should get a daemon that
+/// watches the network, not one that complains once a minute.
+fn write_status(
+    config: &Config,
+    started_at: DateTime<Utc>,
+    summary: &RunSummary,
+    manager: &Manager,
+    dedup: &ObservationDedup,
+    enrichers: &Orchestrator,
+) {
+    let (online, idle, offline) = manager.state_counts();
+    let mut status = Status::new(started_at);
+    status.updated_at = Utc::now();
+    status.learning = manager.is_learning();
+    status.observations = summary.observations;
+    status.duplicates = dedup.duplicates_suppressed();
+    status.events = summary.events;
+    status.security_events = summary.security_events;
+    status.devices = manager.len();
+    status.online = online;
+    status.idle = idle;
+    status.offline = offline;
+    status.sources = summary.sources.clone();
+    status.enrichers = enrichers
+        .counters()
+        .into_iter()
+        .map(|(name, polls, failures)| {
+            (
+                name.to_string(),
+                crate::runtime::EnricherCounters { polls, failures },
+            )
+        })
+        .collect();
+    status.resident_bytes = crate::runtime::resident_bytes();
+
+    if let Err(err) = status.write(&config.runtime.status_path) {
+        tracing::debug!(
+            path = %config.runtime.status_path.display(),
+            %err,
+            "could not write the runtime status file"
+        );
+    }
+}
+
+/// Builds the people registry from configuration and from the database.
+///
+/// Configuration is applied first and the database wins on conflict, because the
+/// database is what somebody edited most recently through an admin UI, and a
+/// config file that has not been touched since the install should not undo it.
+///
+/// Every failure here is a warning rather than an error: a daemon that refuses
+/// to watch the network because it could not work out who owns a phone is worse
+/// than one that watches the network and knows about nobody.
+async fn build_registry(
+    client: &queries::Client,
+    config: &Config,
+    records: &[queries::DeviceRecord],
+) -> Registry {
+    let mut owners: Vec<(MacAddr, String)> = Vec::new();
+
+    for person in &config.people {
+        let name = person.name.trim();
+        match queries::ensure_person(client, name, person.notify_arrive, person.notify_depart).await
+        {
+            Ok(item_id) => {
+                for mac in person.macs() {
+                    owners.push((mac, item_id.clone()));
+                }
+            }
+            Err(err) => tracing::warn!(person = name, %err, "could not create or adopt a person"),
+        }
+    }
+
+    // The database wins: pushed after configuration, and the registry keeps the
+    // last owner recorded for a MAC.
+    for record in records {
+        if let Some(item_id) = &record.owner_item_id {
+            owners.push((record.mac, item_id.clone()));
+        }
+    }
+
+    let people = match queries::load_people(client).await {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|row| people::Person {
+                item_id: row.item_id,
+                name: row.name,
+                notify_arrive: row.notify_arrive,
+                notify_depart: row.notify_depart,
+                state: people::PersonState::from_db(&row.state),
+                current_location: row.current_location,
+                last_arrived_at: row.last_arrived_at,
+                last_departed_at: row.last_departed_at,
+            })
+            .collect(),
+        Err(err) => {
+            tracing::warn!(%err, "could not load people; nobody will be tracked");
+            Vec::new()
+        }
+    };
+
+    let mut registry = people::Roster { people, owners }.into_registry();
+    // Seed device states without announcing anything: the whole household being
+    // home is not news every time the daemon restarts.
+    for record in records {
+        registry.restore_device(
+            record.mac,
+            record.state != DeviceState::Offline,
+            record.last_seen_at,
+        );
+    }
+    registry
 }
 
 /// Installs the DHCP fingerprint table, preferring a downloaded one.

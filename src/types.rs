@@ -654,6 +654,16 @@ pub enum EventType {
     IpConflict,
     /// One MAC emitted a flood of gratuitous ARP announcements.
     GratuitousArp,
+    /// A device moved to a different access point, and therefore a different
+    /// place.
+    DeviceLocationChanged,
+    /// The first device a person owns came online after all of them were
+    /// offline.
+    PersonArrived,
+    /// The last device a person owns went offline.
+    PersonDeparted,
+    /// A person's most recently active device moved somewhere else.
+    PersonLocationChanged,
 }
 
 impl EventType {
@@ -672,7 +682,30 @@ impl EventType {
             EventType::IdentityChange => "identity_change",
             EventType::IpConflict => "ip_conflict",
             EventType::GratuitousArp => "gratuitous_arp",
+            EventType::DeviceLocationChanged => "device_location_changed",
+            EventType::PersonArrived => "person_arrived",
+            EventType::PersonDeparted => "person_departed",
+            EventType::PersonLocationChanged => "person_location_changed",
         }
+    }
+
+    /// True for the three events that are about a person rather than a device.
+    ///
+    /// They are governed by the per-person `notify_arrive` and `notify_depart`
+    /// flags in `ng_people` rather than by `notify.event_types`. Requiring an
+    /// operator who turned `notify_arrive` on to *also* list `person_arrived` in
+    /// the allowlist would make a silent misconfiguration look like a working
+    /// setup, which is the same trap security events already avoid.
+    ///
+    /// Everything else about them is ordinary: they honour quiet hours, the
+    /// per-device debounce and the batch window, because somebody coming home is
+    /// a lifecycle event and not an attack.
+    #[must_use]
+    pub const fn is_person(&self) -> bool {
+        matches!(
+            self,
+            EventType::PersonArrived | EventType::PersonDeparted | EventType::PersonLocationChanged
+        )
     }
 
     /// True for events the analyzer chain produces.
@@ -695,7 +728,7 @@ impl EventType {
     }
 
     /// Every event type, for exhaustiveness tests.
-    pub const ALL: [EventType; 11] = [
+    pub const ALL: [EventType; 15] = [
         EventType::NewDevice,
         EventType::Returned,
         EventType::IpChanged,
@@ -707,6 +740,10 @@ impl EventType {
         EventType::IdentityChange,
         EventType::IpConflict,
         EventType::GratuitousArp,
+        EventType::DeviceLocationChanged,
+        EventType::PersonArrived,
+        EventType::PersonDeparted,
+        EventType::PersonLocationChanged,
     ];
 }
 
@@ -847,6 +884,44 @@ mod tests {
                 "{lifecycle} is not a security event"
             );
         }
+    }
+
+    #[test]
+    fn exactly_the_three_people_events_are_person_events() {
+        let person: Vec<&str> = EventType::ALL
+            .iter()
+            .filter(|e| e.is_person())
+            .map(EventType::as_str)
+            .collect();
+        assert_eq!(
+            person,
+            vec![
+                "person_arrived",
+                "person_departed",
+                "person_location_changed"
+            ]
+        );
+    }
+
+    #[test]
+    fn no_event_is_both_a_security_event_and_a_person_event() {
+        // The two categories each bypass notify.event_types for a different
+        // reason, and the dispatcher asks both questions. An event that answered
+        // yes to both would be governed by nothing.
+        for kind in EventType::ALL {
+            assert!(
+                !(kind.is_security() && kind.is_person()),
+                "{kind} is in both categories"
+            );
+        }
+    }
+
+    #[test]
+    fn a_device_moving_is_a_device_event_not_a_person_event() {
+        // device_location_changed is about a device and stays under the ordinary
+        // notify.event_types allowlist; only the three person_* events escape it.
+        assert!(!EventType::DeviceLocationChanged.is_person());
+        assert!(!EventType::DeviceLocationChanged.is_security());
     }
 
     #[test]

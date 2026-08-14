@@ -152,6 +152,13 @@ pub fn title_for(event: &DeviceEvent) -> String {
         EventType::IpConflict => format!("Address conflict: {}", event.display_name),
         EventType::GratuitousArp => format!("Gratuitous ARP flood from {}", event.display_name),
         EventType::IdentityChange => format!("Device changed identity: {}", event.display_name),
+        EventType::DeviceLocationChanged => format!("Moved: {}", event.display_name),
+        // A person event leads with the name rather than a label, because
+        // "Jeremy arrived" is the entire message and prefixing it would only
+        // push the name out of the three words a lock screen shows.
+        EventType::PersonArrived => format!("{} arrived", event.display_name),
+        EventType::PersonDeparted => format!("{} left", event.display_name),
+        EventType::PersonLocationChanged => format!("{} moved", event.display_name),
     }
 }
 
@@ -162,6 +169,9 @@ pub fn title_for(event: &DeviceEvent) -> String {
 /// address, MAC, and when it turned up.
 #[must_use]
 pub fn body_for(event: &DeviceEvent) -> String {
+    if event.event_type.is_person() {
+        return person_body(event);
+    }
     let mut lines = vec![event.display_name.clone()];
     if let Some(vendor) = &event.vendor {
         lines.push(format!("Vendor: {vendor}"));
@@ -182,6 +192,35 @@ pub fn body_for(event: &DeviceEvent) -> String {
         "{when}: {}",
         event.at.format("%Y-%m-%d %H:%M:%S UTC")
     ));
+    lines.join("\n")
+}
+
+/// Body for an event about a person rather than a device.
+///
+/// Reads the place and the way in from `details` rather than listing the MAC and
+/// the vendor. "Jeremy arrived, through the Driveway" is what somebody wants on a
+/// lock screen; the hardware address of the phone that proved it is not.
+fn person_body(event: &DeviceEvent) -> String {
+    let text = |key: &str| {
+        event
+            .details
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    let mut lines = Vec::new();
+    match (text("location"), text("via")) {
+        (Some(location), Some(via)) => lines.push(format!("In the {location}, via the {via}")),
+        (Some(location), None) => lines.push(format!("In the {location}")),
+        (None, Some(via)) => lines.push(format!("Via the {via}")),
+        (None, None) => {}
+    }
+    if let Some(previous) = text("previous_location")
+        && event.event_type == EventType::PersonLocationChanged
+    {
+        lines.push(format!("Was in the {previous}"));
+    }
+    lines.push(format!("At: {}", event.at.format("%Y-%m-%d %H:%M:%S UTC")));
     lines.join("\n")
 }
 
@@ -217,6 +256,10 @@ pub const fn tags_for(event_type: EventType) -> &'static str {
         EventType::IpConflict => "warning",
         EventType::GratuitousArp => "loudspeaker",
         EventType::IdentityChange => "twisted_rightwards_arrows",
+        EventType::DeviceLocationChanged => "round_pushpin",
+        EventType::PersonArrived => "house",
+        EventType::PersonDeparted => "door",
+        EventType::PersonLocationChanged => "walking",
     }
 }
 

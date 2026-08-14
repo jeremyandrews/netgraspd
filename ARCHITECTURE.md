@@ -329,25 +329,140 @@ Privacy-extension rotation means one MAC legitimately accumulates many rows in
 the row count is worth watching; it is a candidate for the presence rollup job in
 the enrichment milestone.
 
+## Milestone 3: enrichment, location, people and unattended operation
+
+### Enrichment is the one thing that asks
+
+Everything else in the daemon works from frames that arrived on their own. An
+enricher asks a controller the operator already runs which access point a device
+is on. The standing fence holds: it never sends anything to a monitored device.
+
+**Why it is in the daemon and not in the Trovato plugin.** The controller sits on
+a private address, and the kernel's HTTP host function refuses private addresses
+under its SSRF policy. A plugin cannot reach it at all.
+
+The trait takes a poll interval and a device list and returns enrichments. The
+orchestrator holds per-source deadlines and runs each due source in turn; a
+source that fails produces a logged warning and no enrichments, so every device
+keeps the location it had. A controller that is down for an hour makes locations
+stale, never absent.
+
+`stat/sta` reports the access point as `ap_mac`, not as a name, so each poll also
+reads `stat/device` for the inventory. Locations are keyed on names because
+`Living Room AP` is what somebody typed into the controller and `f4:e2:c6:…` is
+not something anybody wants in a config file. An AP that cannot be resolved falls
+back to its MAC: ugly, visible, never silently absent.
+
+### Location is a place plus a crossing
+
+A place comes from the operator's map, with the AP's own name as the fallback so
+that a newly adopted access point shows up as itself.
+
+A crossing is classified from the pair of access points, and this is the whole
+reason edge APs exist. Edge-then-interior is somebody arriving; interior-then-edge
+followed by silence is somebody leaving; interior-to-interior is somebody walking
+about and must never read as either. An unmapped AP counts as interior, so a
+forgotten mapping produces no arrival rather than a false one.
+
+`ng_location_history` carries the same partial unique index `ng_presence` does,
+so at most one stay is open per device. A location change is **one** effect that
+closes and opens, rather than two that could be half-applied.
+
+An enricher polling every thirty seconds reports the same association every time.
+Turning each into a stay would reproduce the row-per-observation failure this
+whole daemon exists to avoid, through a different door, so an unchanged access
+point produces nothing at all.
+
+### People, and what the edge evidence is measured against
+
+A person is home when any device they own is online; the first online after all
+were offline is an arrival and the last offline is a departure. Every
+elaboration of that anybody has tried announces you have left while you are
+sitting in the house.
+
+Edge crossings supply evidence rather than changing the rule. The subtlety that
+cost a rewrite: **an arrival and a departure measure the evidence window against
+different things.** An arrival is decided the moment a device is heard from, so
+the crossing is minutes old. A departure is decided a whole `offline_timeout`
+after the device fell silent, three hours by default, which puts every crossing
+outside a fifteen-minute window forever. So a departure measures the crossing
+against the *device's own last activity*: not "did they cross an edge recently"
+but "did they cross an edge shortly before they stopped talking".
+
+Ownership is merged from two sources rather than chosen between: the plugin's
+`ng_devices.owner_item_id`, and `[[people]]` in the config file for a standalone
+install. A configured person who already exists in `ng_people` is adopted by
+name, which is what makes it safe to be listed in both. That adoption is the only
+place the daemon writes a plugin-owned column, and only when creating a row that
+did not exist.
+
+### The schema is a contract, and it is checked twice
+
+The plugin declares the same tables with `CREATE TABLE IF NOT EXISTS`, so a table
+that already exists with the wrong types is accepted in silence and fails weeks
+later as a broken page. Two checks close that: a plugin-first detector before
+migrating, and a full column-and-type preflight after. Neither adopts and neither
+drops. `EXPECTED` in `db/schema.rs` is the single statement of the contract, and
+an integration test asserts the live schema matches it exactly, so a change here
+breaks this repository's suite rather than the plugin's.
+
+Every `timestamptz` the plugin reads has a generated `bigint` twin, because the
+kernel's database host function decodes a fixed list of types and returns null
+for a `timestamptz`. `GENERATED ALWAYS ... STORED`, so nothing can write one out
+of step with its source.
+
+### Maintenance, and the two invariants it may never break
+
+The current day is never touched, and an open session is never compacted. Both
+are enforced in the queries rather than trusted: every cutoff comes from one
+function that returns the start of a UTC day, and every rollup requires
+`ended_at IS NOT NULL`.
+
+Cutoffs are computed in Rust from a `now` passed in rather than from the
+database's `now()`, which is what lets a test seed six months of history and roll
+it up without waiting six months.
+
+Location rolls up per device per **location** per day, unlike presence which is
+per device per day. Merging across locations would record a stay somewhere
+between the kitchen and the driveway, which is not a place.
+
+### Runtime status is a file, not a table
+
+`netgraspd stats` is a separate process, so uptime, resident memory and
+per-source capture rates cannot come from Postgres. An `ng_stats` table would be
+a schema change the plugin has not seen, written once a minute forever, to hold
+numbers that are meaningless the moment the daemon stops. So the daemon writes a
+small JSON file atomically and `stats` reads it, says plainly when it is missing
+or stale, and answers the database half regardless.
+
+Resident memory scales with interfaces × sources × `capture.buffer_size`, since
+each is a pcap handle with a kernel buffer: 15 MB on one interface with all six
+sources, 185 MB on a Docker host with twenty-three.
+
 ## Where deferred work attaches
 
-- **Presence rollup:** `ng_presence.is_summary` and `observation_count` exist
-  now, so the nightly rollup job needs no ALTER. IPv6 history growth under
-  privacy extensions is the first thing it should look at.
+- **Bluetooth passive scanning:** the `CaptureSource` trait leaves the slot, and
+  `StubSource` survives unused so that the next protocol can be nameable in
+  config and present in the startup path before it can capture anything.
+- **A second enricher:** the `Enricher` trait takes a poll interval and returns
+  enrichments; nothing about the orchestrator, the location model or the people
+  registry is UniFi-specific.
 - **Plugin sync:** `ng_devices.sync_state` / `trovato_item_id` and
   `ng_events.sync_state` are written by the daemon and read by nothing here.
-- **People and location:** `ng_devices.current_ap` / `current_location` exist as
-  nullable columns; the person mapping is a plugin-owned join table added in
-  milestone 4, not a daemon concern.
-- **Bluetooth passive scanning:** the `CaptureSource` trait leaves the slot, and
-  `StubSource` survives milestone 2 unused so that the next protocol can be
-  nameable in config and present in the startup path before it can capture
-  anything.
+- **Per-poll telemetry:** VLAN and byte counters ride into
+  `ng_events.details` on a location change rather than into columns. If anybody
+  ever wants to chart them, that is a schema change the plugin has to see first.
 
 ## Open questions
 
 1. macOS daemon support: pcap over BPF works but needs root or a `/dev/bpf*`
    group, and each protocol wants re-verification there. Linux is the target;
    macOS is a development convenience.
-2. Whether devices become kernel Items or lightweight records is a milestone-3
-   decision, not a daemon one.
+2. Whether devices become kernel Items or lightweight records is a plugin
+   decision, not a daemon one. The daemon's side of it is settled:
+   `ng_devices.trovato_item_id` is a UUID the plugin fills and the daemon only
+   reads.
+3. No real UniFi controller has been contacted. The decoder ignores unknown
+   fields and tolerates missing ones, which is the most that can be done from
+   published response shapes; the first contact with real firmware is the thing
+   most likely to need a fix.

@@ -77,6 +77,27 @@ pub enum Effect {
         /// When it ended.
         at: DateTime<Utc>,
     },
+    /// A device is somewhere new. Closes the open location stay and opens
+    /// another, which is one effect rather than two so that the "at most one
+    /// open stay per device" invariant cannot be broken by applying half of it.
+    LocationChanged {
+        /// Which device.
+        mac: MacAddr,
+        /// The access point it is now on.
+        ap_name: Option<String>,
+        /// The place that access point is in.
+        location: String,
+        /// When it moved.
+        at: DateTime<Utc>,
+    },
+    /// A device is no longer anywhere: it went offline, so its stay ends and no
+    /// new one opens until an enricher places it again.
+    LocationClosed {
+        /// Which device.
+        mac: MacAddr,
+        /// When the stay ended.
+        at: DateTime<Utc>,
+    },
 }
 
 /// A state change worth recording.
@@ -188,6 +209,14 @@ pub struct DeviceSnapshot {
     pub device_type_confidence: Option<f32>,
     /// Classified operating system family.
     pub os_family: Option<String>,
+    /// The access point it is associated with, when an enricher has said.
+    ///
+    /// Cleared when the device goes offline: where an offline device is, is
+    /// nowhere, and the history of where it has been lives in
+    /// `ng_location_history`.
+    pub current_ap: Option<String>,
+    /// The place that access point is in.
+    pub current_location: Option<String>,
     /// Observations counted since the last flush, added to the open presence
     /// session's counter. This is the only number that summarises packet volume,
     /// and it is a counter rather than a row per packet on purpose.
@@ -222,6 +251,8 @@ struct Entry {
     identity: Identity,
     classification: Classification,
     display_name: Option<String>,
+    current_ap: Option<String>,
+    current_location: Option<String>,
     baseline: bool,
     notify: bool,
     /// How many times this device has been seen to go offline **since the
@@ -258,6 +289,8 @@ impl Entry {
                 .is_some()
                 .then_some(self.classification.confidence as f32),
             os_family: self.classification.os_family.clone(),
+            current_ap: self.current_ap.clone(),
+            current_location: self.current_location.clone(),
             observations_since_flush: self.observations_since_flush,
         }
     }
@@ -466,6 +499,12 @@ impl Manager {
                 confidence: record.device_type_confidence.map_or(0.0, f64::from),
                 reason: None,
             };
+            // An offline device is nowhere, so its stored place is dropped
+            // rather than restored. Keeping it would leave a device that went
+            // offline weeks ago still apparently sitting in the kitchen, and
+            // would stop the next enrichment poll from opening a fresh stay
+            // because the access point would compare equal.
+            let placed = record.state != DeviceState::Offline;
             self.devices.insert(
                 record.mac,
                 Entry {
@@ -480,6 +519,8 @@ impl Manager {
                     identity,
                     classification,
                     display_name: record.display_name,
+                    current_ap: record.current_ap.filter(|_| placed),
+                    current_location: record.current_location.filter(|_| placed),
                     baseline: record.baseline,
                     notify: record.notify,
                     offline_transitions: 0,
@@ -676,6 +717,8 @@ impl Manager {
             identity,
             classification: Classification::default(),
             display_name: None,
+            current_ap: None,
+            current_location: None,
             baseline: self.learning,
             notify: true,
             offline_transitions: 0,
@@ -775,6 +818,119 @@ impl Manager {
         effects
     }
 
+    /// The access point a device is currently on, so the caller can work out
+    /// what the next one means.
+    ///
+    /// The state machine deliberately does not classify the crossing itself:
+    /// which access points are edges is the operator's map, and the map belongs
+    /// with [`crate::location`] rather than in here.
+    #[must_use]
+    pub fn current_ap(&self, mac: MacAddr) -> Option<String> {
+        self.devices.get(&mac).and_then(|e| e.current_ap.clone())
+    }
+
+    /// Places a device at an access point.
+    ///
+    /// Returns nothing when the device is unknown, or when it is already on that
+    /// access point: an enricher polling every thirty seconds reports the same
+    /// association over and over, and turning each one into a location stay
+    /// would reproduce exactly the row-per-observation failure this daemon
+    /// exists to avoid.
+    ///
+    /// `movement` and `telemetry` only ride into the event's details. The state
+    /// machine does not act on either, because what a crossing *means* is the
+    /// people registry's business.
+    #[must_use]
+    pub fn set_location(
+        &mut self,
+        mac: MacAddr,
+        place: &crate::location::Place,
+        movement: crate::location::Movement,
+        telemetry: Option<serde_json::Value>,
+        at: DateTime<Utc>,
+    ) -> Vec<Effect> {
+        let learning = self.learning;
+        let Some(entry) = self.devices.get_mut(&mac) else {
+            return Vec::new();
+        };
+        if entry.current_ap.as_deref() == Some(place.ap_name.as_str()) {
+            return Vec::new();
+        }
+        let previous_ap = entry.current_ap.replace(place.ap_name.clone());
+        let previous_location = entry.current_location.replace(place.location.clone());
+        entry.dirty = true;
+
+        let mut details = json!({
+            "ap": place.ap_name,
+            "location": place.location,
+            "previous_ap": previous_ap,
+            "previous_location": previous_location,
+            "movement": movement.as_str(),
+            "edge": place.edge,
+        });
+        // Per-poll telemetry rides in the event rather than in a column: it is
+        // not device identity, and a vlan or bandwidth column would be a schema
+        // change the Trovato plugin has not seen.
+        if let (Some(telemetry), Some(object)) = (telemetry, details.as_object_mut()) {
+            object.insert("telemetry".to_string(), telemetry);
+        }
+
+        vec![
+            Effect::LocationChanged {
+                mac,
+                ap_name: Some(place.ap_name.clone()),
+                location: place.location.clone(),
+                at,
+            },
+            Effect::Event(Box::new(DeviceEvent {
+                event_type: EventType::DeviceLocationChanged,
+                mac,
+                display_name: entry.snapshot().display(),
+                vendor: entry.best(SignalKind::Vendor),
+                ip: entry.last_ip.clone(),
+                interface: entry.last_interface.clone(),
+                at,
+                baseline: entry.baseline,
+                during_learning: learning,
+                notify: entry.notify,
+                priority: EventPriority::Normal,
+                details,
+            })),
+        ]
+    }
+
+    /// Records an event about a person, keyed to the device that revealed it.
+    ///
+    /// People are not devices, but a person event still wants a row in
+    /// `ng_events`, a `device_id`, and the same notification path as everything
+    /// else. Rather than a second event pipeline, the triggering device carries
+    /// it: the display name becomes the person's, and the notification flag
+    /// becomes the person's.
+    ///
+    /// Returns nothing for a MAC the state machine has never seen, which cannot
+    /// happen through the ordinary path because the registry only learns about a
+    /// device from its presence transitions.
+    #[must_use]
+    pub fn person_event(&self, event: &crate::people::PersonEvent) -> Vec<Effect> {
+        let entry = self.devices.get(&event.mac);
+        vec![Effect::Event(Box::new(DeviceEvent {
+            event_type: event.event_type,
+            mac: event.mac,
+            display_name: event.name.clone(),
+            vendor: entry.and_then(|e| e.best(SignalKind::Vendor)),
+            ip: entry.and_then(|e| e.last_ip.clone()),
+            interface: entry.and_then(|e| e.last_interface.clone()),
+            at: event.at,
+            baseline: entry.is_some_and(|e| e.baseline),
+            // A person arriving during a learning window is still worth
+            // knowing; the window is about which *devices* are normal.
+            during_learning: false,
+            notify: event.notify,
+            priority: EventPriority::Normal,
+            details: event.details.clone(),
+        }))]
+    }
+
     /// Turns an analyzer's finding into recordable effects.
     ///
     /// The analyzers know what happened but not who it happened to: they hold no
@@ -848,6 +1004,17 @@ impl Manager {
                     mac: entry.mac,
                     at: now,
                 });
+                // Where an offline device is, is nowhere. Its stay ends here and
+                // the next enrichment poll opens another; leaving it open would
+                // mean a device that left the house last March still counts as
+                // being in the kitchen.
+                if entry.current_ap.take().is_some() {
+                    entry.current_location = None;
+                    effects.push(Effect::LocationClosed {
+                        mac: entry.mac,
+                        at: now,
+                    });
+                }
                 effects.push(Effect::Event(Box::new(DeviceEvent {
                     event_type: EventType::WentOffline,
                     mac: entry.mac,
@@ -1460,6 +1627,9 @@ mod tests {
             hidden: false,
             notify: true,
             notes: None,
+            current_ap: None,
+            current_location: None,
+            owner_item_id: None,
         }
     }
 }

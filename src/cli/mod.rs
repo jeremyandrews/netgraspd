@@ -1,7 +1,9 @@
 //! Command-line surface.
 //!
-//! Three commands: `run` starts the daemon with a live device table, `devices`
-//! prints the table once and exits, `events` prints the recent event log.
+//! `run` starts the daemon with a live device table; `devices`, `events` and
+//! `people` print one table and exit; `stats` answers whether the installation
+//! is healthy; `maintain` runs the nightly jobs by hand; `update-fingerprints`
+//! refreshes the DHCP fingerprint table.
 //!
 //! Every flag that overrides configuration is expressed as a dotted
 //! [`Override`] rather than as a partial `Config`, so that an absent flag leaves
@@ -19,6 +21,8 @@ use crate::config::{Config, Override};
 use crate::daemon::RunOptions;
 use crate::db::{Db, queries};
 use crate::identity::FingerprintDb;
+use crate::maintenance;
+use crate::runtime;
 
 /// Passive network device monitor. Watches LAN broadcast and multicast traffic
 /// and never transmits.
@@ -51,6 +55,12 @@ pub enum Command {
     Devices(DevicesArgs),
     /// Print recent events and exit.
     Events(EventsArgs),
+    /// Print who is home and where, then exit.
+    People,
+    /// Report whether this installation is healthy, then exit.
+    Stats,
+    /// Run the nightly rollup, prune and vacuum now.
+    Maintain(MaintainArgs),
     /// Download a fresh DHCP fingerprint table.
     UpdateFingerprints(UpdateFingerprintsArgs),
 }
@@ -98,6 +108,14 @@ pub struct EventsArgs {
     /// Show only security events from the analyzer chain.
     #[arg(long)]
     pub security: bool,
+}
+
+/// Arguments to `maintain`.
+#[derive(Debug, Args)]
+pub struct MaintainArgs {
+    /// Report what would be compacted and pruned, without changing anything.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 /// Arguments to `update-fingerprints`.
@@ -206,6 +224,273 @@ pub async fn events(config: &Config, args: &EventsArgs) -> Result<()> {
     }
     print!("{}", table::event_table(&records, Utc::now()));
     Ok(())
+}
+
+/// Runs `people`.
+///
+/// # Errors
+///
+/// Returns an error when the database is unreachable.
+pub async fn people(config: &Config) -> Result<()> {
+    let db = Db::connect(&config.database)?;
+    let client = db.client().await?;
+    let rows = queries::load_people(&client).await?;
+    if rows.is_empty() {
+        println!(
+            "Nobody is tracked yet. Add a [[people]] block to netgrasp.toml, or let the \
+             Trovato plugin fill ng_devices.owner_item_id."
+        );
+        return Ok(());
+    }
+    print!("{}", table::people_table(&rows, Utc::now()));
+    Ok(())
+}
+
+/// Runs `stats`.
+///
+/// The command an operator runs on a Pi three months in to answer "is this thing
+/// healthy". It reads two independent sources and says plainly when one of them
+/// is missing: the runtime status file for facts about the process, and the
+/// database for facts about what it has recorded.
+///
+/// # Errors
+///
+/// Returns an error when the database is unreachable. A missing or stale status
+/// file is reported, not an error: "the daemon is not running" is one of the
+/// answers this command exists to give.
+pub async fn stats(config: &Config) -> Result<()> {
+    let now = Utc::now();
+    println!("netgraspd {}", env!("CARGO_PKG_VERSION"));
+    println!();
+
+    print_runtime_section(config, now);
+
+    let db = Db::connect(&config.database)?;
+    let client = db.client().await?;
+
+    println!("Devices");
+    let states = queries::device_state_counts(&client).await?;
+    if states.is_empty() {
+        println!("  none recorded yet");
+    } else {
+        let total: i64 = states.iter().map(|(_, n)| *n).sum();
+        let breakdown: Vec<String> = states
+            .iter()
+            .map(|(state, n)| format!("{n} {state}"))
+            .collect();
+        println!("  {total} known ({})", breakdown.join(", "));
+    }
+    println!(
+        "  {}, {}",
+        plural(
+            queries::count_open_presence(&client).await?,
+            "open presence session"
+        ),
+        plural(
+            queries::count_open_locations(&client).await?,
+            "open location stay"
+        ),
+    );
+    println!();
+
+    println!("Events");
+    let counts = queries::event_counts(&client).await?;
+    if counts.is_empty() {
+        println!("  none recorded yet");
+    } else {
+        for (event_type, n) in counts.iter().take(EVENT_TYPES_SHOWN) {
+            println!("  {n:>8}  {event_type}");
+        }
+        if counts.len() > EVENT_TYPES_SHOWN {
+            println!("  ...and {} more types", counts.len() - EVENT_TYPES_SHOWN);
+        }
+    }
+    let (oldest, newest) = queries::event_span(&client).await?;
+    if let (Some(oldest), Some(newest)) = (oldest, newest) {
+        println!(
+            "  spanning {} to {} ({} of retention configured)",
+            oldest.format("%Y-%m-%d"),
+            newest.format("%Y-%m-%d"),
+            format_args!("{} days", config.maintenance.event_retention_days)
+        );
+    }
+    println!();
+
+    println!("Rollup");
+    for (table, high_water, summaries) in queries::rollup_high_water(&client).await? {
+        match high_water {
+            Some(mark) => println!(
+                "  {table}: {summaries} summary rows, newest day {}",
+                mark.format("%Y-%m-%d")
+            ),
+            None => println!(
+                "  {table}: nothing summarised yet (rollup starts at {} days)",
+                config.maintenance.rollup_after_days
+            ),
+        }
+    }
+    println!();
+
+    println!("Database");
+    let sizes = queries::table_sizes(&client).await?;
+    let total: i64 = sizes.iter().map(|s| s.bytes).sum();
+    for size in &sizes {
+        let rows = size.rows.map_or_else(
+            || "not analysed yet".to_string(),
+            |rows| format!("~{rows} rows"),
+        );
+        println!(
+            "  {:<22} {:>10}  {rows}",
+            size.table,
+            runtime::human_bytes(size.bytes.max(0).unsigned_abs()),
+        );
+    }
+    println!(
+        "  {:<22} {:>10}",
+        "total",
+        runtime::human_bytes(total.max(0).unsigned_abs())
+    );
+    Ok(())
+}
+
+/// How many event types `stats` lists before it starts counting instead.
+const EVENT_TYPES_SHOWN: usize = 8;
+
+/// Renders a count with an "s" only when one is wanted.
+///
+/// "1 open location stays" is the sort of thing that makes an operator wonder
+/// whether the number is wrong too.
+fn plural(count: i64, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
+}
+
+/// Prints the half of `stats` that comes from the running daemon.
+fn print_runtime_section(config: &Config, now: chrono::DateTime<Utc>) {
+    let path = &config.runtime.status_path;
+    let status = match runtime::Status::read(path) {
+        Ok(status) => status,
+        Err(_) => {
+            println!("Daemon");
+            println!(
+                "  not running, or has never run: no status file at {}",
+                path.display()
+            );
+            println!("  (everything below comes from the database and is still current)");
+            println!();
+            return;
+        }
+    };
+
+    println!("Daemon");
+    if status.is_stale(now, config.runtime.status_interval.get()) {
+        println!(
+            "  STALE: last wrote {} ago, so it is probably not running",
+            runtime::human_duration(now - status.updated_at)
+        );
+    }
+    println!("  pid {}, version {}", status.pid, status.version);
+    println!("  up {}", runtime::human_duration(status.uptime()));
+    if status.learning {
+        println!("  a learning window is in progress");
+    }
+    match status.resident_bytes {
+        Some(bytes) => println!("  resident memory {}", runtime::human_bytes(bytes)),
+        None => println!("  resident memory unavailable on this platform"),
+    }
+    println!(
+        "  {} observations, {} duplicates suppressed, {} events ({} security)",
+        status.observations, status.duplicates, status.events, status.security_events
+    );
+
+    println!("  Capture");
+    if status.sources.is_empty() {
+        println!("    no source has seen a packet yet");
+    } else {
+        for (source, count, rate) in status.source_rates() {
+            println!("    {source:<8} {count:>10} observations  {rate:>8.2}/s");
+        }
+    }
+
+    if !status.enrichers.is_empty() {
+        println!("  Enrichment");
+        for (name, counters) in &status.enrichers {
+            let note = if counters.failures == 0 {
+                String::new()
+            } else {
+                format!("  ({} failed)", counters.failures)
+            };
+            println!("    {name:<8} {} polls{note}", counters.polls);
+        }
+    }
+    println!();
+}
+
+/// Runs `maintain`.
+///
+/// # Errors
+///
+/// Returns an error when the database is unreachable or a job fails.
+pub async fn maintain(config: &Config, args: &MaintainArgs) -> Result<()> {
+    let db = Db::connect(&config.database)?;
+    let client = db.client().await?;
+    let now = Utc::now();
+    let rollup_before = maintenance::cutoff(now, config.maintenance.rollup_after_days);
+    let events_before = maintenance::cutoff(now, config.maintenance.event_retention_days);
+
+    println!(
+        "Rolling up presence and location before {}, pruning events before {}.",
+        rollup_before.format("%Y-%m-%d"),
+        events_before.format("%Y-%m-%d")
+    );
+
+    if args.dry_run {
+        let presence: i64 = db_scalar(
+            &client,
+            "SELECT COUNT(*) FROM ng_presence
+              WHERE is_summary = FALSE AND ended_at IS NOT NULL AND started_at < $1",
+            rollup_before,
+        )
+        .await?;
+        let location: i64 = db_scalar(
+            &client,
+            "SELECT COUNT(*) FROM ng_location_history
+              WHERE is_summary = FALSE AND ended_at IS NOT NULL AND started_at < $1",
+            rollup_before,
+        )
+        .await?;
+        let events: i64 = db_scalar(
+            &client,
+            "SELECT COUNT(*) FROM ng_events WHERE \"timestamp\" < $1",
+            events_before,
+        )
+        .await?;
+        println!(
+            "Dry run: {presence} presence sessions and {location} location stays would be \
+             compacted, {events} events would be deleted. Nothing was changed."
+        );
+        return Ok(());
+    }
+
+    let report = maintenance::run(&client, &config.maintenance, now).await?;
+    println!("{}", report.summary());
+    if report.is_quiet() {
+        println!("Nothing needed doing, which is what a healthy database looks like.");
+    }
+    Ok(())
+}
+
+/// Runs a counting query with one timestamp parameter.
+async fn db_scalar(
+    client: &queries::Client,
+    sql: &str,
+    before: chrono::DateTime<Utc>,
+) -> Result<i64> {
+    let row = client.query_one(sql, &[&before]).await?;
+    Ok(row.try_get(0)?)
 }
 
 /// Runs `update-fingerprints`.

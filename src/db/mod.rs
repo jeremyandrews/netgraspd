@@ -14,6 +14,7 @@
 //! being true, the connection URL is where TLS gets configured, not here.
 
 pub mod queries;
+pub mod schema;
 
 use anyhow::{Context, Result};
 use deadpool_postgres::{Config as PoolConfig, ManagerConfig, Pool, RecyclingMethod, Runtime};
@@ -78,9 +79,16 @@ impl Db {
     /// Runs on a dedicated connection rather than a pooled one, because refinery
     /// takes the client by exclusive reference and holds it for the duration.
     ///
+    /// Before running anything it checks that the daemon, and not the Trovato
+    /// plugin, created whatever `ng_` tables are already there. See
+    /// [`schema::check_daemon_migrated_first`] for why that check is worth a
+    /// round trip on every start.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the database is unreachable or a migration fails.
+    /// Returns an error when the database is unreachable, when the tables were
+    /// created by the plugin rather than by the daemon, or when a migration
+    /// fails.
     pub async fn migrate(url: &str) -> Result<()> {
         let (mut client, connection) = tokio_postgres::connect(url, NoTls)
             .await
@@ -90,6 +98,8 @@ impl Db {
                 tracing::debug!(%err, "migration connection closed");
             }
         });
+
+        schema::check_daemon_migrated_first(&client).await?;
 
         let report = embedded::migrations::runner()
             .run_async(&mut client)
@@ -131,6 +141,16 @@ impl Db {
             .await
             .context("ng_devices is not readable; has the schema been migrated?")?;
         Ok(())
+    }
+
+    /// Verifies every `ng_` table matches what this build expects.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the table and column on any divergence.
+    pub async fn preflight(&self) -> Result<()> {
+        let client = self.client().await?;
+        schema::preflight(&client).await
     }
 }
 

@@ -40,6 +40,19 @@
 //! switch and `--no-notify` mean "deliver nothing", and a master switch with an
 //! exception is not a master switch. `[security.notifications].enabled` is the
 //! finer control.
+//!
+//! ## Person events skip the allowlist and nothing else
+//!
+//! `person_arrived` and `person_departed` are gated by `notify_arrive` and
+//! `notify_depart` in `ng_people`, which is where somebody sets them in the
+//! admin UI. Making them *also* appear in `notify.event_types` would be the same
+//! trap: an operator turns the flag on, nothing arrives, and there is nothing in
+//! the logs to say why. So they skip the allowlist and obey everything else,
+//! because somebody coming home is a lifecycle event and quiet hours mean quiet.
+//!
+//! `person_location_changed` has no flag of its own, and adding one would need a
+//! column the plugin has not seen. It is recorded with `notify` false, so it is
+//! in the event log and never on a phone.
 
 pub mod ntfy;
 
@@ -215,9 +228,13 @@ impl Dispatcher {
             return self.tick(now);
         }
         // The allowlist governs device lifecycle events. Security events are
-        // governed by [security], and requiring them to be listed in both would
-        // make a silent misconfiguration look like a working setup.
+        // governed by [security], and person events by the per-person
+        // notify_arrive and notify_depart flags in ng_people; requiring either
+        // to be listed here as well would make a silent misconfiguration look
+        // like a working setup.
+        let person = event.event.event_type.is_person();
         if !security
+            && !person
             && !self
                 .config
                 .event_types

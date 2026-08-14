@@ -219,3 +219,134 @@ priority = "urgent"
 bypass_quiet_hours = true
 bypass_debounce = true
 bypass_batch_window = true
+
+# ---------------------------------------------------------------------------
+# Enrichment: the facts passive capture cannot see.
+# ---------------------------------------------------------------------------
+#
+# An enricher is the one thing in this daemon that asks a question rather than
+# waiting to be told. What it asks is a controller you already run, never a
+# device on the monitored segment: the standing fence holds, and netgraspd still
+# never sends a packet to anything it is watching.
+#
+# This lives in the daemon rather than in the Trovato plugin for a concrete
+# reason: the controller sits on a private address, and the Trovato kernel's
+# HTTP host function refuses private addresses under its SSRF policy.
+
+[enrichment]
+# Master switch. Every enricher is off by default anyway, so the shipped
+# configuration still reaches nothing.
+enabled = true
+
+[enrichment.unifi]
+enabled = false
+
+# Base URL of the controller. Both shapes are supported and worked out at
+# runtime: a classic self-hosted controller answering /api/login, and a UniFi OS
+# console (UDM, Cloud Key) answering /api/auth/login behind /proxy/network.
+controller_url = "https://192.168.1.1"
+
+# Either an API key, or a local username and password. The key is preferred when
+# both are present, because a key cannot expire in the middle of a poll.
+api_key = ""
+username = ""
+password = ""
+
+# Which site to read. "default" unless your controller manages several.
+site = "default"
+
+# How often the client list is read. Each poll is two small GETs.
+poll_interval = "30s"
+
+# A UniFi controller ships with a self-signed certificate, so if you have not
+# installed your own you have two honest options: put the controller's CA in the
+# system trust store, or set this to false and accept that the connection is
+# encrypted but the controller's identity is not checked. It defaults to true so
+# that turning it off is a decision somebody made.
+verify_tls = true
+
+# The access points that see arrivals and departures first. Crossing one of
+# these is what distinguishes somebody arriving from somebody wandering between
+# rooms: driveway-then-interior reads as arriving, interior-then-driveway
+# followed by silence reads as leaving, and kitchen-then-living-room reads as
+# neither.
+edge_aps = ["Driveway AP", "Garage AP"]
+
+# Access point names to rooms. Matched case-insensitively after trimming.
+#
+# NOTE: this is a TOML table, so it must come after every plain key in
+# [enrichment.unifi]. An access point with no entry here falls back to its own
+# name, so a newly adopted AP shows up as itself rather than disappearing.
+[enrichment.unifi.locations]
+"Driveway AP" = "Driveway"
+"Garage AP" = "Garage"
+"Living Room AP" = "Living Room"
+"Kitchen AP" = "Kitchen"
+
+# ---------------------------------------------------------------------------
+# People, for an installation with no Trovato plugin.
+# ---------------------------------------------------------------------------
+#
+# When the plugin is installed it fills ng_devices.owner_item_id and mirrors
+# person rows into ng_people, and you can leave this out entirely. When it is
+# not, this is the other source of the same two facts. The two are merged rather
+# than chosen between, and a person named here who already exists in ng_people
+# is adopted rather than duplicated, so it is safe to list somebody in both.
+#
+# A person is home when any device they own is online. The first owned device
+# online after all were offline is an arrival; the last one going offline is a
+# departure. notify_arrive and notify_depart gate the notification and default
+# to off.
+
+# [[people]]
+# name = "Jeremy"
+# macs = ["3c:22:fb:00:00:01", "b8:27:eb:00:00:02"]
+# notify_arrive = true
+# notify_depart = false
+
+# [[people]]
+# name = "Jamie"
+# macs = ["3c:22:fb:00:00:03"]
+
+# ---------------------------------------------------------------------------
+# Maintenance: what makes an unattended year on a Pi survivable.
+# ---------------------------------------------------------------------------
+#
+# Without these, ng_presence grows one row per session forever and ng_events
+# never stops. With them the database reaches a steady size a few weeks in and
+# stays there. `netgraspd maintain` runs the same jobs by hand, and
+# `netgraspd maintain --dry-run` reports what they would do.
+
+[maintenance]
+enabled = true
+
+# Local time of day the nightly job runs. Checked once a minute rather than
+# slept until, so a machine suspended over this minute runs the job when it
+# wakes instead of skipping a day.
+run_at = "03:30"
+
+# Presence sessions and location stays older than this compact into one summary
+# row per device per day. The current day and any open session are never
+# touched, whatever this says.
+rollup_after_days = 30
+
+# Events older than this are deleted.
+event_retention_days = 90
+
+# VACUUM ANALYZE after a rollup that actually moved rows. Skipped when nothing
+# moved: a vacuum that reclaims nothing is pure write amplification on a memory
+# card.
+vacuum_after_rollup = true
+
+# ---------------------------------------------------------------------------
+# Runtime status, which is what `netgraspd stats` reads.
+# ---------------------------------------------------------------------------
+#
+# `stats` is a separate process, so uptime, resident memory and the per-source
+# capture rates cannot come from Postgres. The daemon writes them here instead.
+# A path it cannot write is a debug log line, never a reason to stop watching
+# the network, and `stats` says plainly when the file is missing or stale.
+
+[runtime]
+status_path = "/var/lib/netgraspd/status.json"
+status_interval = "30s"

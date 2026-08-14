@@ -65,12 +65,22 @@ pub struct DeviceRecord {
     pub last_seen_at: DateTime<Utc>,
     /// True when the device was learned during a baseline window.
     pub baseline: bool,
+    /// Access point it is associated with.
+    pub current_ap: Option<String>,
+    /// Place that access point is in.
+    pub current_location: Option<String>,
     /// User-owned: hide from the dashboard.
     pub hidden: bool,
     /// User-owned: whether this device is worth a notification.
     pub notify: bool,
     /// User-owned free text.
     pub notes: Option<String>,
+    /// User-owned: the person Item that owns this device, as UUID text.
+    ///
+    /// Read as text rather than as a UUID because the daemon only ever compares
+    /// it and hands it back, and decoding it properly would mean a `uuid` crate
+    /// and a `tokio-postgres` feature for a value nothing here inspects.
+    pub owner_item_id: Option<String>,
 }
 
 /// Columns selected by every device read, in one place so the row decoder and
@@ -78,7 +88,8 @@ pub struct DeviceRecord {
 const DEVICE_COLUMNS: &str = "id, mac, display_name, resolved_name, identity_source, \
      identity_confidence, hostname, mdns_name, vendor, device_type, device_type_confidence, \
      os_family, state, last_ip, last_ipv6, last_interface, first_seen_at, last_seen_at, \
-     baseline, hidden, notify, notes";
+     baseline, current_ap, current_location, hidden, notify, notes, \
+     owner_item_id::text AS owner_item_id";
 
 impl DeviceRecord {
     /// Decodes a row selected with [`DEVICE_COLUMNS`].
@@ -107,9 +118,12 @@ impl DeviceRecord {
             first_seen_at: row.try_get("first_seen_at")?,
             last_seen_at: row.try_get("last_seen_at")?,
             baseline: row.try_get("baseline")?,
+            current_ap: row.try_get("current_ap")?,
+            current_location: row.try_get("current_location")?,
             hidden: row.try_get("hidden")?,
             notify: row.try_get("notify")?,
             notes: row.try_get("notes")?,
+            owner_item_id: row.try_get("owner_item_id")?,
         })
     }
 
@@ -176,6 +190,10 @@ pub struct DeviceUpdate {
     pub device_type_confidence: Option<f32>,
     /// Classified operating system family.
     pub os_family: Option<String>,
+    /// Access point the device is on.
+    pub current_ap: Option<String>,
+    /// Place that access point is in.
+    pub current_location: Option<String>,
 }
 
 /// Fields written when an event is recorded.
@@ -308,6 +326,8 @@ const UPDATE_DEVICE_SQL: &str = "UPDATE ng_devices
             device_type_confidence = $13,
             os_family              = $14,
             last_ipv6              = $15,
+            current_ap             = $16,
+            current_location       = $17,
             sync_state             = 'dirty'
       WHERE id = $1";
 
@@ -338,6 +358,8 @@ pub async fn update_device(client: &Client, update: &DeviceUpdate) -> Result<()>
                 &update.device_type_confidence,
                 &update.os_family,
                 &update.last_ipv6,
+                &update.current_ap,
+                &update.current_location,
             ],
         )
         .await
@@ -645,6 +667,246 @@ pub async fn recent_security_events(client: &Client, limit: i64) -> Result<Vec<E
     rows.iter().map(decode_event).collect()
 }
 
+/// Ends the open location stay for a device and opens a new one.
+///
+/// One statement pair rather than an upsert, because the invariant is "at most
+/// one open stay", enforced by a partial unique index, and the only way to
+/// satisfy it is to close before opening. Both run on the same connection back
+/// to back; a crash between them leaves a device with no open stay, which the
+/// next enrichment poll fixes.
+///
+/// # Errors
+///
+/// Returns an error when either statement fails.
+pub async fn change_location(
+    client: &Client,
+    device_id: i64,
+    ap_name: Option<&str>,
+    location: &str,
+    at: DateTime<Utc>,
+) -> Result<()> {
+    close_location(client, device_id, at).await?;
+    client
+        .execute(
+            "INSERT INTO ng_location_history (device_id, ap_name, location, started_at)
+             VALUES ($1, $2, $3, $4)",
+            &[&device_id, &ap_name, &location, &at],
+        )
+        .await
+        .context("opening a location stay failed")?;
+    Ok(())
+}
+
+/// Ends the open location stay for a device, if there is one.
+///
+/// # Errors
+///
+/// Returns an error when the statement fails.
+pub async fn close_location(
+    client: &Client,
+    device_id: i64,
+    ended_at: DateTime<Utc>,
+) -> Result<u64> {
+    client
+        .execute(
+            "UPDATE ng_location_history
+                SET ended_at = $2
+              WHERE device_id = $1 AND ended_at IS NULL AND is_summary = FALSE",
+            &[&device_id, &ended_at],
+        )
+        .await
+        .context("closing a location stay failed")
+}
+
+/// Ends every open location stay belonging to a device that is offline.
+///
+/// Run once at startup. A crash, or a device that went offline while the daemon
+/// was not running, otherwise leaves a stay open forever and the device
+/// apparently still in the kitchen.
+///
+/// # Errors
+///
+/// Returns an error when the statement fails.
+pub async fn close_stale_location_stays(client: &Client, at: DateTime<Utc>) -> Result<u64> {
+    client
+        .execute(
+            "UPDATE ng_location_history h
+                SET ended_at = $1
+               FROM ng_devices d
+              WHERE d.id = h.device_id
+                AND h.ended_at IS NULL
+                AND h.is_summary = FALSE
+                AND d.state = 'offline'",
+            &[&at],
+        )
+        .await
+        .context("closing stale location stays failed")
+}
+
+/// Counts open location stays. Used by tests and by `netgraspd stats`.
+///
+/// # Errors
+///
+/// Returns an error when the query fails.
+pub async fn count_open_locations(client: &Client) -> Result<i64> {
+    let row = client
+        .query_one(
+            "SELECT COUNT(*) FROM ng_location_history
+              WHERE ended_at IS NULL AND is_summary = FALSE",
+            &[],
+        )
+        .await
+        .context("counting open location stays failed")?;
+    Ok(row.try_get(0)?)
+}
+
+/// One row of `ng_people`, with its UUID rendered as text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersonRecord {
+    /// Primary key, as UUID text.
+    pub item_id: String,
+    /// Display name. Plugin owned.
+    pub name: String,
+    /// Notify on arrival. Plugin owned.
+    pub notify_arrive: bool,
+    /// Notify on departure. Plugin owned.
+    pub notify_depart: bool,
+    /// Whether they are home. Daemon owned.
+    pub state: String,
+    /// Where they are. Daemon owned.
+    pub current_location: Option<String>,
+    /// When they last arrived. Daemon owned.
+    pub last_arrived_at: Option<DateTime<Utc>>,
+    /// When they last left. Daemon owned.
+    pub last_departed_at: Option<DateTime<Utc>>,
+}
+
+/// Loads every person.
+///
+/// # Errors
+///
+/// Returns an error when the query fails.
+pub async fn load_people(client: &Client) -> Result<Vec<PersonRecord>> {
+    let rows = client
+        .query(
+            "SELECT item_id::text AS item_id, name, notify_arrive, notify_depart, state,
+                    current_location, last_arrived_at, last_departed_at
+               FROM ng_people
+              ORDER BY name",
+            &[],
+        )
+        .await
+        .context("loading people failed")?;
+    rows.iter()
+        .map(|row| {
+            Ok(PersonRecord {
+                item_id: row.try_get("item_id")?,
+                name: row.try_get("name")?,
+                notify_arrive: row.try_get("notify_arrive")?,
+                notify_depart: row.try_get("notify_depart")?,
+                state: row.try_get("state")?,
+                current_location: row.try_get("current_location")?,
+                last_arrived_at: row.try_get("last_arrived_at")?,
+                last_departed_at: row.try_get("last_departed_at")?,
+            })
+        })
+        .collect()
+}
+
+/// Adopts an existing person by name, or creates one with a generated UUID.
+///
+/// Returns the person's item id.
+///
+/// This is the only place the daemon writes a plugin-owned column, and it does
+/// so only when creating a row that did not exist. Adopting by name is what
+/// makes it safe to list somebody in `netgrasp.toml` who is also mirrored from
+/// Trovato: the daemon finds them and leaves their identity alone rather than
+/// creating a second Jeremy.
+///
+/// The UUID comes from Postgres's `gen_random_uuid()` rather than from a Rust
+/// crate, which keeps a dependency out of the daemon for a value it never
+/// inspects.
+///
+/// # Errors
+///
+/// Returns an error when the statement fails.
+pub async fn ensure_person(
+    client: &Client,
+    name: &str,
+    notify_arrive: bool,
+    notify_depart: bool,
+) -> Result<String> {
+    if let Some(row) = client
+        .query_opt(
+            "SELECT item_id::text FROM ng_people WHERE lower(name) = lower($1)",
+            &[&name],
+        )
+        .await
+        .context("looking up a person failed")?
+    {
+        return Ok(row.try_get(0)?);
+    }
+    let row = client
+        .query_one(
+            "INSERT INTO ng_people (item_id, name, notify_arrive, notify_depart)
+             VALUES (gen_random_uuid(), $1, $2, $3)
+             RETURNING item_id::text",
+            &[&name, &notify_arrive, &notify_depart],
+        )
+        .await
+        .context("creating a person failed")?;
+    Ok(row.try_get(0)?)
+}
+
+/// The one statement that writes person state.
+///
+/// Held as a constant so the test asserting no plugin-owned column appears in it
+/// inspects the statement itself rather than a copy of it.
+/// The `($1::text)::uuid` spelling is load-bearing. Writing `$1::uuid` makes
+/// Postgres infer the parameter's own type as `uuid`, and tokio-postgres then
+/// refuses to send a Rust `&str` for it. Casting from an explicitly-typed text
+/// parameter keeps the parameter text and still lets the comparison use the
+/// primary key index.
+const UPDATE_PERSON_SQL: &str = "UPDATE ng_people
+        SET state            = $2,
+            current_location = $3,
+            last_arrived_at  = $4,
+            last_departed_at = $5
+      WHERE item_id = ($1::text)::uuid";
+
+/// Writes the daemon-owned columns of one person.
+///
+/// `name`, `notes`, `notify_arrive` and `notify_depart` are absent from the
+/// statement by design: they belong to the plugin and to whoever edits them in
+/// the admin UI.
+///
+/// # Errors
+///
+/// Returns an error when the update fails.
+pub async fn update_person(
+    client: &Client,
+    item_id: &str,
+    state: &str,
+    current_location: Option<&str>,
+    last_arrived_at: Option<DateTime<Utc>>,
+    last_departed_at: Option<DateTime<Utc>>,
+) -> Result<()> {
+    client
+        .execute(
+            UPDATE_PERSON_SQL,
+            &[
+                &item_id,
+                &state,
+                &current_location,
+                &last_arrived_at,
+                &last_departed_at,
+            ],
+        )
+        .await
+        .context("updating a person failed")?;
+    Ok(())
+}
+
 /// Counts events of one type. Used by tests and the learning-mode summary.
 ///
 /// # Errors
@@ -659,6 +921,137 @@ pub async fn count_events_of_type(client: &Client, event_type: EventType) -> Res
         .await
         .context("counting events failed")?;
     Ok(row.try_get(0)?)
+}
+
+/// One table's size on disk and row count, for `netgraspd stats`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableSize {
+    /// Table name.
+    pub table: String,
+    /// Live rows, as the planner's estimate rather than a count, and `None`
+    /// until the table has been analysed at all.
+    ///
+    /// An estimate on purpose: `SELECT COUNT(*)` on `ng_events` after a year is
+    /// a sequential scan, and `stats` is a command an operator runs to check
+    /// whether the machine is healthy, not one that should make it less so.
+    /// Postgres reports `-1` for a table it has never analysed, which is
+    /// reported as unknown rather than rounded up into a confident zero.
+    pub rows: Option<i64>,
+    /// Total bytes including indexes and TOAST.
+    pub bytes: i64,
+}
+
+/// Sizes of every `ng_` table, largest first.
+///
+/// # Errors
+///
+/// Returns an error when the query fails.
+pub async fn table_sizes(client: &Client) -> Result<Vec<TableSize>> {
+    let rows = client
+        .query(
+            "SELECT c.relname AS table_name,
+                    NULLIF(c.reltuples, -1)::bigint AS rows,
+                    pg_total_relation_size(c.oid)::bigint AS bytes
+               FROM pg_class c
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE c.relkind = 'r'
+                AND n.nspname = current_schema()
+                AND c.relname LIKE 'ng\\_%'
+              ORDER BY bytes DESC",
+            &[],
+        )
+        .await
+        .context("reading table sizes failed")?;
+    rows.iter()
+        .map(|row| {
+            Ok(TableSize {
+                table: row.try_get("table_name")?,
+                rows: row.try_get("rows")?,
+                bytes: row.try_get("bytes")?,
+            })
+        })
+        .collect()
+}
+
+/// How far the rollup has compacted, per table.
+///
+/// The high-water mark is the newest summarised day. An operator comparing it to
+/// today minus `rollup_after_days` can see at a glance whether the nightly job
+/// is keeping up.
+///
+/// # Errors
+///
+/// Returns an error when the query fails.
+pub async fn rollup_high_water(
+    client: &Client,
+) -> Result<Vec<(String, Option<DateTime<Utc>>, i64)>> {
+    let mut out = Vec::with_capacity(2);
+    for table in ["ng_presence", "ng_location_history"] {
+        let row = client
+            .query_one(
+                &format!("SELECT MAX(started_at), COUNT(*) FROM {table} WHERE is_summary = TRUE"),
+                &[],
+            )
+            .await
+            .with_context(|| format!("reading the rollup high-water mark for {table} failed"))?;
+        out.push((table.to_string(), row.try_get(0)?, row.try_get(1)?));
+    }
+    Ok(out)
+}
+
+/// Counts rows in `ng_events` grouped by type, newest activity first.
+///
+/// # Errors
+///
+/// Returns an error when the query fails.
+pub async fn event_counts(client: &Client) -> Result<Vec<(String, i64)>> {
+    let rows = client
+        .query(
+            "SELECT event_type, COUNT(*) AS n
+               FROM ng_events
+              GROUP BY event_type
+              ORDER BY n DESC, event_type",
+            &[],
+        )
+        .await
+        .context("counting events by type failed")?;
+    rows.iter()
+        .map(|row| Ok((row.try_get("event_type")?, row.try_get("n")?)))
+        .collect()
+}
+
+/// Counts devices in each lifecycle state.
+///
+/// # Errors
+///
+/// Returns an error when the query fails.
+pub async fn device_state_counts(client: &Client) -> Result<Vec<(String, i64)>> {
+    let rows = client
+        .query(
+            "SELECT state, COUNT(*) AS n FROM ng_devices GROUP BY state ORDER BY state",
+            &[],
+        )
+        .await
+        .context("counting devices by state failed")?;
+    rows.iter()
+        .map(|row| Ok((row.try_get("state")?, row.try_get("n")?)))
+        .collect()
+}
+
+/// The oldest and newest event timestamps, which bound the retention window.
+///
+/// # Errors
+///
+/// Returns an error when the query fails.
+pub async fn event_span(client: &Client) -> Result<(Option<DateTime<Utc>>, Option<DateTime<Utc>>)> {
+    let row = client
+        .query_one(
+            "SELECT MIN(\"timestamp\"), MAX(\"timestamp\") FROM ng_events",
+            &[],
+        )
+        .await
+        .context("reading the event span failed")?;
+    Ok((row.try_get(0)?, row.try_get(1)?))
 }
 
 #[cfg(test)]
@@ -689,6 +1082,9 @@ mod tests {
             hidden: false,
             notify: true,
             notes: None,
+            current_ap: None,
+            current_location: None,
+            owner_item_id: None,
         }
     }
 
@@ -726,7 +1122,16 @@ mod tests {
     fn the_device_update_never_writes_a_user_owned_column() {
         // A guard against the most likely future regression: somebody adding a
         // column to the update statement without noticing whose it is.
-        for column in ["display_name", "notes", "hidden", "notify"] {
+        // owner_item_id and trovato_item_id joined the list in V3; both are
+        // written by the Trovato plugin and only ever read here.
+        for column in [
+            "display_name",
+            "notes",
+            "hidden",
+            "notify",
+            "owner_item_id",
+            "trovato_item_id",
+        ] {
             assert!(
                 !UPDATE_DEVICE_SQL.contains(&format!("{column} ")),
                 "the device update writes the user-owned column {column}"
@@ -736,7 +1141,25 @@ mod tests {
         // were renamed out from under it.
         assert!(UPDATE_DEVICE_SQL.contains("resolved_name"));
         assert!(UPDATE_DEVICE_SQL.contains("device_type_confidence"));
+        assert!(UPDATE_DEVICE_SQL.contains("current_location"));
         assert!(UPDATE_DEVICE_SQL.contains("sync_state             = 'dirty'"));
+    }
+
+    #[test]
+    fn the_people_update_never_writes_a_plugin_owned_column() {
+        // ng_people is split the other way round from ng_devices: the plugin
+        // owns the identity and the notification flags, the daemon owns the
+        // state. A daemon write that touched notify_arrive would silently undo
+        // somebody's choice in the admin UI.
+        for column in ["name", "notes", "notify_arrive", "notify_depart"] {
+            assert!(
+                !UPDATE_PERSON_SQL.contains(&format!("{column} ")),
+                "the person update writes the plugin-owned column {column}"
+            );
+        }
+        assert!(UPDATE_PERSON_SQL.contains("last_arrived_at"));
+        assert!(UPDATE_PERSON_SQL.contains("last_departed_at"));
+        assert!(UPDATE_PERSON_SQL.contains("current_location"));
     }
 
     #[test]

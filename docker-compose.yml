@@ -1,0 +1,103 @@
+# netgraspd, Postgres, and optionally Trovato.
+#
+# Copy .env.example to .env before bringing this up.
+#
+# Two things here are load-bearing rather than stylistic:
+#
+#   1. `network_mode: host` on the daemon. A container on the default bridge
+#      sees the bridge, not your LAN, and every frame netgraspd exists to read
+#      is on the host's segment. Without it the daemon starts and captures
+#      nothing, which looks exactly like working.
+#
+#   2. The `migrate` service. **The daemon owns the schema and must run its
+#      migrations before anything else touches the database.** If the Trovato
+#      plugin creates the ng_ tables first, the daemon refuses to start with a
+#      message telling you to reconcile, because adopting tables whose types
+#      nobody checked is worse than stopping. Running the migration as its own
+#      one-shot service is what makes the ordering a fact rather than a hope.
+#
+# Because the daemon uses host networking it reaches Postgres on the host's
+# published port rather than by service name, which is why DATABASE_URL points
+# at ${POSTGRES_HOST}.
+
+services:
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # Applies the schema and exits. Everything else waits for it to succeed.
+  migrate:
+    image: ${NETGRASPD_IMAGE}
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NETGRASP_DATABASE__URL: ${DATABASE_URL}
+    # `maintain --dry-run` connects, migrates, runs the schema preflight and
+    # changes nothing. It is the smallest command that proves the schema is
+    # right before the daemon or the plugin touches it.
+    command: ["maintain", "--dry-run"]
+    restart: "no"
+
+  netgraspd:
+    image: ${NETGRASPD_IMAGE}
+    build: .
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    # The whole point: see the LAN, not a bridge.
+    network_mode: host
+    # Docker can add a capability to the bounding set but cannot put it in a
+    # non-root process's permitted set without file capabilities, and a
+    # setcap-ed binary cannot be exec'd at all without the capability. So the
+    # capture command runs as root with everything except NET_RAW dropped, which
+    # leaves it no more privileged than the file-capability arrangement would.
+    # Every other command in this image runs as the unprivileged user.
+    user: root
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_RAW
+    environment:
+      NETGRASP_DATABASE__URL: ${DATABASE_URL}
+      NETGRASP_RUNTIME__STATUS_PATH: /var/lib/netgraspd/status.json
+      RUST_LOG: ${RUST_LOG}
+    volumes:
+      - ./netgrasp.toml:/etc/netgrasp.toml:ro
+      - netgraspd-state:/var/lib/netgraspd
+    command: ["run", "--config", "/etc/netgrasp.toml", "--no-table"]
+
+  # Optional, and parameterised rather than pinned: this repository does not
+  # know which Trovato build you run. Bring it up with
+  #     docker compose --profile trovato up -d
+  # and only after netgraspd has migrated at least once.
+  trovato:
+    image: ${TROVATO_IMAGE}
+    profiles: ["trovato"]
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: ${TROVATO_DATABASE_URL}
+    ports:
+      - "${TROVATO_PORT}:8080"
+
+volumes:
+  postgres-data:
+  netgraspd-state:

@@ -176,6 +176,18 @@ pub struct Config {
     pub notify: NotifyConfig,
     /// The security analyzer chain.
     pub security: SecurityConfig,
+    /// Enrichment sources that add facts passive capture cannot see.
+    pub enrichment: EnrichmentConfig,
+    /// The nightly rollup, prune and vacuum jobs.
+    pub maintenance: MaintenanceConfig,
+    /// Where the running daemon publishes what `netgraspd stats` reads.
+    pub runtime: RuntimeConfig,
+    /// People and the devices they own, for installs with no Trovato plugin.
+    ///
+    /// An array of tables, so it is written `[[people]]` once per person. When
+    /// the plugin is present it fills `ng_devices.owner_item_id` instead and this
+    /// can stay empty; the two sources are merged rather than exclusive.
+    pub people: Vec<PersonConfig>,
 }
 
 /// Postgres connection settings.
@@ -798,6 +810,310 @@ impl Default for SecurityNotifyConfig {
     }
 }
 
+/// Enrichment sources.
+///
+/// An enricher adds facts about a device that passive capture cannot see: which
+/// access point it is associated with, and therefore where in the house it is.
+/// That work lives in the daemon rather than in the Trovato plugin for a
+/// concrete reason: the controller sits on a private address, and the kernel's
+/// HTTP host function refuses private addresses under its SSRF policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EnrichmentConfig {
+    /// Master switch for every enricher. On by default, but every enricher is
+    /// off by default, so the shipped configuration still reaches nothing.
+    pub enabled: bool,
+    /// The UniFi controller enricher.
+    pub unifi: UnifiConfig,
+}
+
+impl Default for EnrichmentConfig {
+    fn default() -> Self {
+        EnrichmentConfig {
+            enabled: true,
+            unifi: UnifiConfig::default(),
+        }
+    }
+}
+
+/// The UniFi controller enricher.
+///
+/// Authenticates with either local credentials or an API key, then reads the
+/// connected-client list and matches it to devices by MAC.
+///
+/// Note the TOML ordering constraint: `locations` is a table, so in a config
+/// file every scalar key here must appear **before** the
+/// `[enrichment.unifi.locations]` header.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UnifiConfig {
+    /// Whether this enricher runs.
+    pub enabled: bool,
+    /// Base URL of the controller, for example `https://192.168.1.1`.
+    pub controller_url: String,
+    /// Local account name. Ignored when `api_key` is set.
+    pub username: String,
+    /// Local account password. Ignored when `api_key` is set.
+    pub password: String,
+    /// API key, which is preferred over a username and password when both are
+    /// present because it cannot expire mid-poll.
+    pub api_key: String,
+    /// Which site to read. `default` unless the controller manages several.
+    pub site: String,
+    /// How often the client list is read.
+    pub poll_interval: HumanDuration,
+    /// Verify the controller's TLS certificate.
+    ///
+    /// A UniFi controller ships with a self-signed certificate, so an operator
+    /// who has not installed their own has exactly two honest options: put the
+    /// controller's CA in the system trust store, or set this to false and
+    /// accept that the connection is encrypted but unauthenticated. It defaults
+    /// to true so that turning it off is a decision somebody made.
+    pub verify_tls: bool,
+    /// Access points that see arrivals and departures first, for example a
+    /// driveway or garage AP.
+    ///
+    /// Crossing one of these is what distinguishes somebody arriving from
+    /// somebody wandering between rooms.
+    pub edge_aps: Vec<String>,
+    /// Maps AP names to human-readable locations. An AP with no entry here
+    /// falls back to its own name, so a new AP is never invisible.
+    pub locations: BTreeMap<String, String>,
+}
+
+impl Default for UnifiConfig {
+    fn default() -> Self {
+        UnifiConfig {
+            enabled: false,
+            controller_url: String::new(),
+            username: String::new(),
+            password: String::new(),
+            api_key: String::new(),
+            site: "default".into(),
+            poll_interval: HumanDuration::from_secs(30),
+            verify_tls: true,
+            edge_aps: Vec::new(),
+            locations: BTreeMap::new(),
+        }
+    }
+}
+
+impl UnifiConfig {
+    /// True when the AP is one that sees arrivals and departures first.
+    ///
+    /// Compared case-insensitively after trimming, because an AP name is typed
+    /// into the controller by a human and typed into this file by the same human
+    /// on a different day.
+    #[must_use]
+    pub fn is_edge_ap(&self, ap: &str) -> bool {
+        self.edge_aps
+            .iter()
+            .any(|e| e.trim().eq_ignore_ascii_case(ap.trim()))
+    }
+
+    /// The human-readable location for an AP, falling back to the AP's own name.
+    #[must_use]
+    pub fn location_of(&self, ap: &str) -> String {
+        let ap = ap.trim();
+        self.locations
+            .iter()
+            .find(|(name, _)| name.trim().eq_ignore_ascii_case(ap))
+            .map(|(_, location)| location.trim().to_string())
+            .filter(|location| !location.is_empty())
+            .unwrap_or_else(|| ap.to_string())
+    }
+
+    /// Rejects unusable combinations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the enricher is on but cannot possibly connect.
+    pub fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.controller_url.trim().is_empty() {
+            bail!("enrichment.unifi.controller_url is empty but the enricher is enabled");
+        }
+        if !self.controller_url.starts_with("http://")
+            && !self.controller_url.starts_with("https://")
+        {
+            bail!(
+                "enrichment.unifi.controller_url must start with http:// or https://, not {:?}",
+                self.controller_url
+            );
+        }
+        if self.site.trim().is_empty() {
+            bail!("enrichment.unifi.site is empty");
+        }
+        if self.api_key.trim().is_empty()
+            && (self.username.trim().is_empty() || self.password.trim().is_empty())
+        {
+            bail!("enrichment.unifi needs either api_key, or both username and password");
+        }
+        if self.poll_interval.as_secs() == 0 {
+            bail!("enrichment.unifi.poll_interval must be at least 1s");
+        }
+        for (ap, location) in &self.locations {
+            if location.trim().is_empty() {
+                bail!("enrichment.unifi.locations[{ap:?}] maps to an empty location");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The nightly maintenance jobs.
+///
+/// These are what let the daemon run unattended for months on a Pi: without
+/// them `ng_presence` grows one row per session forever and `ng_events` never
+/// stops.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MaintenanceConfig {
+    /// Whether the nightly job runs at all. `netgraspd maintain` runs it by hand
+    /// either way.
+    pub enabled: bool,
+    /// Local time of day the nightly job runs.
+    pub run_at: ClockTime,
+    /// Presence sessions and location stays older than this compact into one
+    /// summary row per device per day.
+    pub rollup_after_days: u32,
+    /// Events older than this are deleted.
+    pub event_retention_days: u32,
+    /// Run `VACUUM ANALYZE` over the `ng_` tables after a rollup that actually
+    /// moved rows. Skipped when nothing moved, because a vacuum that reclaims
+    /// nothing is pure I/O on a memory card.
+    pub vacuum_after_rollup: bool,
+}
+
+impl Default for MaintenanceConfig {
+    fn default() -> Self {
+        MaintenanceConfig {
+            enabled: true,
+            run_at: ClockTime {
+                hour: 3,
+                minute: 30,
+            },
+            rollup_after_days: 30,
+            event_retention_days: 90,
+            vacuum_after_rollup: true,
+        }
+    }
+}
+
+impl MaintenanceConfig {
+    /// Rejects retentions that would delete today's data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either retention is zero.
+    pub fn validate(&self) -> Result<()> {
+        if self.rollup_after_days == 0 {
+            bail!(
+                "maintenance.rollup_after_days must be at least 1; zero would compact \
+                 sessions that are still being written"
+            );
+        }
+        if self.event_retention_days == 0 {
+            bail!("maintenance.event_retention_days must be at least 1");
+        }
+        Ok(())
+    }
+}
+
+/// Where the running daemon publishes its runtime counters.
+///
+/// `netgraspd stats` is a separate process, so uptime, resident memory and the
+/// per-source capture rates cannot be read from the database. The daemon writes
+/// them to a small file instead; `stats` reads it, says so when it is missing or
+/// stale, and answers the database half regardless.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RuntimeConfig {
+    /// File the daemon rewrites with its counters. An unwritable path is a
+    /// warning, never a reason to stop watching the network.
+    pub status_path: PathBuf,
+    /// How often it is rewritten.
+    pub status_interval: HumanDuration,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        RuntimeConfig {
+            status_path: PathBuf::from("/var/lib/netgraspd/status.json"),
+            status_interval: HumanDuration::from_secs(30),
+        }
+    }
+}
+
+/// One person and the devices they own, for an install with no Trovato plugin.
+///
+/// The plugin, when present, fills `ng_devices.owner_item_id` and mirrors person
+/// rows into `ng_people`. Standalone has to work too, so this is the other
+/// source of the same two facts. A person named here who already exists in
+/// `ng_people` is adopted rather than duplicated, which is what makes it safe to
+/// list somebody in both places.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PersonConfig {
+    /// Display name. Also the key used to adopt an existing `ng_people` row.
+    pub name: String,
+    /// Hardware addresses this person owns.
+    pub macs: Vec<String>,
+    /// Notify when they arrive.
+    pub notify_arrive: bool,
+    /// Notify when they leave.
+    pub notify_depart: bool,
+}
+
+impl PersonConfig {
+    /// The owned addresses, as parsed MACs.
+    #[must_use]
+    pub fn macs(&self) -> Vec<crate::types::MacAddr> {
+        self.macs
+            .iter()
+            .filter_map(|m| m.trim().parse().ok())
+            .collect()
+    }
+}
+
+/// Rejects a people list that cannot be turned into an unambiguous ownership
+/// map.
+///
+/// # Errors
+///
+/// Returns an error for a blank name, a duplicate name, an unparseable MAC, or
+/// one device owned by two people.
+fn validate_people(people: &[PersonConfig]) -> Result<()> {
+    let mut seen_names: BTreeMap<String, usize> = BTreeMap::new();
+    let mut owners: BTreeMap<crate::types::MacAddr, String> = BTreeMap::new();
+    for (i, person) in people.iter().enumerate() {
+        let name = person.name.trim();
+        if name.is_empty() {
+            bail!("people[{i}].name is empty");
+        }
+        if let Some(first) = seen_names.insert(name.to_lowercase(), i) {
+            bail!("people[{i}].name {name:?} repeats people[{first}]");
+        }
+        for (j, mac) in person.macs.iter().enumerate() {
+            let parsed: crate::types::MacAddr = mac
+                .trim()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("people[{i}].macs[{j}] is not a MAC: {mac:?}"))?;
+            if let Some(other) = owners.insert(parsed, name.to_string())
+                && other != name
+            {
+                bail!(
+                    "people[{i}].macs[{j}] ({mac}) is owned by both {other:?} and {name:?}; \
+                     a device has one owner"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A single CLI override, expressed as a dotted config path and a value.
 ///
 /// The CLI layer builds these instead of a partial `Config`, because a partial
@@ -900,6 +1216,12 @@ impl Config {
             }
         }
         self.security.validate()?;
+        self.enrichment.unifi.validate()?;
+        self.maintenance.validate()?;
+        validate_people(&self.people)?;
+        if self.runtime.status_interval.as_secs() == 0 {
+            bail!("runtime.status_interval must be at least 1s");
+        }
         Ok(())
     }
 }
@@ -1056,6 +1378,48 @@ mod tests {
             assert_eq!(c.capture.snaplen, 1600, "default survives untouched");
             assert_eq!(c.capture.sources, vec!["arp", "mdns"], "env beats file");
             assert_eq!(c.learning.duration.as_secs(), 60, "cli beats file");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn the_shipped_example_configuration_parses_and_validates() {
+        // Every key in the file is checked by deny_unknown_fields, so this
+        // catches an example that documents an option that was renamed, and an
+        // example whose TOML tables are in an order TOML does not allow.
+        let example = include_str!("../netgrasp.toml.example");
+        Jail::expect_with(|jail| {
+            jail.create_file("netgrasp.toml", example)?;
+            let config = Config::load(None, &[]).expect("the shipped example must load");
+            config.validate().expect("and validate");
+            // Spot-check that the new blocks are actually reaching the struct
+            // rather than being silently absent.
+            assert!(config.maintenance.enabled);
+            assert_eq!(config.maintenance.rollup_after_days, 30);
+            assert!(config.enrichment.enabled);
+            assert_eq!(config.enrichment.unifi.location_of("Kitchen AP"), "Kitchen");
+            assert!(config.enrichment.unifi.is_edge_ap("Driveway AP"));
+            assert_eq!(
+                config.runtime.status_path.to_string_lossy(),
+                "/var/lib/netgraspd/status.json"
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn an_unknown_environment_variable_under_the_prefix_is_rejected_like_a_typo() {
+        // Documented behaviour, and a footgun worth naming: *every*
+        // NETGRASP_-prefixed variable in the environment is read as
+        // configuration, so one that is not a config key stops the daemon
+        // starting. This repository's own test harness used to define
+        // NETGRASP_TEST_DATABASE_URL, which made every test in this module fail
+        // whenever the integration suite was run in the same command. The
+        // harness variable is now NETGRASPD_, outside the prefix.
+        Jail::expect_with(|jail| {
+            jail.set_env("NETGRASP_NOT_A_REAL_KEY", "anything");
+            let err = Config::load(None, &[]).expect_err("must be rejected");
+            assert!(err.to_string().contains("assemble configuration"), "{err}");
             Ok(())
         });
     }

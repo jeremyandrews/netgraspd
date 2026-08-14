@@ -7,7 +7,7 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::db::queries::{DeviceRecord, EventRecord};
+use crate::db::queries::{DeviceRecord, EventRecord, PersonRecord};
 use crate::device::DeviceSnapshot;
 
 /// Longest any single cell is allowed to be before it is truncated. Wide enough
@@ -159,13 +159,44 @@ pub fn event_table(events: &[EventRecord], now: DateTime<Utc>) -> String {
     render(&["WHEN", "EVENT", "DEVICE", "NOTIFIED", "DETAIL"], &rows)
 }
 
+/// Renders the table shown by `netgraspd people`.
+///
+/// Ordered home first, then by name, because the question somebody types this to
+/// answer is "who is in".
+#[must_use]
+pub fn people_table(people: &[PersonRecord], now: DateTime<Utc>) -> String {
+    let mut sorted: Vec<&PersonRecord> = people.iter().collect();
+    sorted.sort_by(|a, b| {
+        (a.state != "home")
+            .cmp(&(b.state != "home"))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    let rows: Vec<Vec<String>> = sorted
+        .iter()
+        .map(|p| {
+            let since = if p.state == "home" {
+                p.last_arrived_at
+            } else {
+                p.last_departed_at
+            };
+            vec![
+                p.name.clone(),
+                p.state.clone(),
+                p.current_location.clone().unwrap_or_else(|| "-".into()),
+                since.map_or_else(|| "never".into(), |when| ago(when, now)),
+            ]
+        })
+        .collect();
+    render(&["PERSON", "STATE", "LOCATION", "SINCE"], &rows)
+}
+
 /// Detail keys worth showing, in the order they read best.
 ///
 /// One list rather than one per event type: a security event and a lifecycle
 /// event never carry the same keys, so a single pass over this picks out
 /// whichever apply. A key that is absent, null or blank contributes nothing,
 /// which is what keeps the column narrow.
-const DETAIL_KEYS: [&str; 17] = [
+const DETAIL_KEYS: [&str; 22] = [
     // Device lifecycle.
     "previous_ip",
     "new_ip",
@@ -185,6 +216,13 @@ const DETAIL_KEYS: [&str; 17] = [
     "previous_device_type",
     "device_type",
     "category_change",
+    // Location and people. "via" is the edge access point somebody came in
+    // through, which is the one detail that makes an arrival readable.
+    "location",
+    "previous_location",
+    "movement",
+    "person",
+    "via",
     "interface",
 ];
 
@@ -243,6 +281,8 @@ mod tests {
             device_type: None,
             device_type_confidence: None,
             os_family: None,
+            current_ap: None,
+            current_location: None,
             observations_since_flush: 0,
         }
     }
