@@ -31,9 +31,17 @@ use crate::types::Observation;
 
 pub use dedup::ObservationDedup;
 
-/// How long a capture handle waits for a packet before returning control, so
-/// that shutdown is noticed promptly on a quiet network.
+/// How long a capture handle waits for a packet before returning control.
+///
+/// Belt and braces alongside non-blocking mode: libpcap does not honour this
+/// consistently in immediate mode, which is why [`IDLE_POLL`] exists.
 const POLL_TIMEOUT_MS: i32 = 250;
+
+/// How long a capture thread sleeps when no packet is waiting.
+///
+/// This is the upper bound on how long one capture thread takes to notice that
+/// the daemon is stopping, so it is also the floor on a clean shutdown.
+const IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Turns one captured frame into an observation, or discards it.
 pub type FrameParser = fn(&[u8], &str, DateTime<Utc>) -> Option<Observation>;
@@ -167,7 +175,7 @@ fn capture_loop(
     tx: &mpsc::Sender<Observation>,
     shutdown: &watch::Receiver<bool>,
 ) -> Result<()> {
-    let mut cap = pcap::Capture::from_device(interface)
+    let cap = pcap::Capture::from_device(interface)
         .with_context(|| format!("interface {interface} is not usable for capture"))?
         .snaplen(snaplen)
         .promisc(false)
@@ -176,6 +184,23 @@ fn capture_loop(
         .timeout(POLL_TIMEOUT_MS)
         .open()
         .map_err(|err| permission_error(interface, &err))?;
+
+    // Non-blocking, which is what makes this loop stoppable.
+    //
+    // The read timeout above is not enough on its own. In immediate mode
+    // libpcap delivers packets as they arrive and the timeout does not
+    // reliably bound a read, so on a quiet interface `next_packet` blocks
+    // until a packet turns up: possibly minutes, possibly never. The shutdown
+    // flag at the top of the loop is then never reached, the blocking task
+    // never finishes, and the process has to be killed. That is exactly what
+    // happened: `docker stop` and `systemctl stop` both sat out their whole
+    // grace period and ended in SIGKILL.
+    //
+    // In non-blocking mode a read with nothing waiting returns `TimeoutExpired`
+    // immediately, so the loop sleeps briefly and comes back round to the flag.
+    let mut cap = cap
+        .setnonblock()
+        .with_context(|| format!("could not set non-blocking mode on {interface}"))?;
 
     cap.filter(filter, true)
         .with_context(|| format!("BPF filter {filter:?} was rejected"))?;
@@ -198,7 +223,10 @@ fn capture_loop(
                     return Ok(());
                 }
             }
-            Err(pcap::Error::TimeoutExpired) => {}
+            // Nothing waiting. Sleeping rather than spinning is the whole cost
+            // of being stoppable: it bounds shutdown at one IDLE_POLL per
+            // handle, and costs ten wakeups a second on an idle interface.
+            Err(pcap::Error::TimeoutExpired) => std::thread::sleep(IDLE_POLL),
             Err(pcap::Error::NoMorePackets) => return Ok(()),
             Err(err) => {
                 return Err(anyhow!("capture on {interface} failed: {err}"));

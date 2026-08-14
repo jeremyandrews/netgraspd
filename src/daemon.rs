@@ -188,9 +188,10 @@ pub async fn run(
         None
     };
 
-    let mut enrichers = Orchestrator::from_config(&config.enrichment)?;
+    let enrichers = Orchestrator::from_config(&config.enrichment)?;
     let location_map = LocationMap::from_unifi(&config.enrichment.unifi);
-    if enrichers.is_active() {
+    let enrichment_active = enrichers.is_active();
+    if enrichment_active {
         tracing::info!(
             enrichers = ?enrichers.names(),
             mapped_aps = location_map.len(),
@@ -200,6 +201,28 @@ pub async fn run(
     } else {
         tracing::info!("no enrichers are configured; devices will have no location");
     }
+    // Enrichment runs in a task of its own rather than inline in the select
+    // loop below. An unreachable controller takes the full request timeout twice
+    // over, and awaiting that in the loop stops observations being processed for
+    // half a minute at a time. Worse, the loop is `biased`: an arm that is
+    // always ready and slow starves every arm after it, which is how a
+    // misconfigured controller once stopped the maintenance and status ticks
+    // firing at all.
+    //
+    // The shape is the one reverse DNS already uses: hand the work to a task,
+    // take the answer back through a channel.
+    let (snapshot_tx, snapshot_rx) = mpsc::channel::<Vec<crate::device::DeviceSnapshot>>(1);
+    let (enriched_tx, mut enriched_rx) = mpsc::channel::<Enriched>(4);
+    // Seeded before the orchestrator moves into the task, so that a configured
+    // enricher appears in `netgraspd stats` from the first second with zero
+    // polls. The first poll against an unreachable controller takes half a
+    // minute to fail, and an empty list until then reads as "none configured".
+    let mut enricher_counters: Vec<(String, u64, u64)> = enrichers
+        .counters()
+        .into_iter()
+        .map(|(name, polls, failures)| (name.to_string(), polls, failures))
+        .collect();
+    let enrich_handle = spawn_enricher(enrichers, snapshot_rx, enriched_tx);
 
     let mut dedup = ObservationDedup::new(
         config.capture.dedup_capacity,
@@ -313,23 +336,32 @@ pub async fn run(
                 flush_devices(&db, &persister, &mut manager).await;
             }
 
-            _ = enrich_tick.tick(), if enrichers.is_active() => {
-                let devices = manager.snapshot();
-                let enrichments = enrichers.poll_due(Instant::now(), &devices).await;
-                if !enrichments.is_empty() {
-                    let mut sinks = Sinks {
-                        db: &db,
-                        persister: &mut persister,
-                        bus: &bus,
-                        manager: &mut manager,
-                        registry: &mut registry,
-                    };
-                    let applied = apply_enrichments(
-                        &mut sinks, &location_map, &enrichments, Utc::now(),
-                    ).await;
-                    summary.location_changes += applied.locations;
-                    summary.events += applied.events;
-                    summary.person_events += applied.person_events;
+            // Offer the enrichment task a fresh device list. A bounded channel
+            // of one plus try_send is the backpressure: while the task is busy
+            // with a slow controller the offer is simply dropped, and the loop
+            // carries on processing packets.
+            _ = enrich_tick.tick(), if enrichment_active => {
+                let _ = snapshot_tx.try_send(manager.snapshot());
+            }
+
+            enriched = enriched_rx.recv() => {
+                if let Some(enriched) = enriched {
+                    enricher_counters = enriched.counters;
+                    if !enriched.enrichments.is_empty() {
+                        let mut sinks = Sinks {
+                            db: &db,
+                            persister: &mut persister,
+                            bus: &bus,
+                            manager: &mut manager,
+                            registry: &mut registry,
+                        };
+                        let applied = apply_enrichments(
+                            &mut sinks, &location_map, &enriched.enrichments, Utc::now(),
+                        ).await;
+                        summary.location_changes += applied.locations;
+                        summary.events += applied.events;
+                        summary.person_events += applied.person_events;
+                    }
                 }
             }
 
@@ -344,7 +376,7 @@ pub async fn run(
 
             _ = status_tick.tick() => {
                 write_status(
-                    config, started_at, &summary, &manager, &dedup, &enrichers,
+                    config, started_at, &summary, &manager, &dedup, &enricher_counters,
                 );
             }
 
@@ -369,6 +401,13 @@ pub async fn run(
     flush_devices(&db, &persister, &mut manager).await;
     summary.devices = manager.len();
     summary.duplicates = dedup.duplicates_suppressed();
+
+    // Dropping the sender is what tells the enrichment task to stop. It is not
+    // awaited: a poll against an unreachable controller has up to a request
+    // timeout left to run, and shutdown should not wait for a machine that is
+    // not answering. Nothing it could still produce is worth blocking on.
+    drop(snapshot_tx);
+    enrich_handle.abort();
 
     for (name, handle) in source_handles {
         match handle.await {
@@ -586,6 +625,50 @@ async fn apply_enrichments(
     applied
 }
 
+/// One round of enrichment, as the enrichment task hands it back.
+#[derive(Debug)]
+struct Enriched {
+    /// What the enrichers found.
+    enrichments: Vec<crate::enrich::Enrichment>,
+    /// Poll and failure counts per enricher, carried along because the
+    /// orchestrator lives in the task and `netgraspd stats` needs them here.
+    counters: Vec<(String, u64, u64)>,
+}
+
+/// Owns the orchestrator and polls it off the main loop.
+///
+/// Takes device lists in and hands results back, so that a controller which
+/// takes half a minute to time out cannot stop the daemon processing packets.
+/// The task ends when the main loop drops its sender, which is shutdown.
+fn spawn_enricher(
+    mut enrichers: Orchestrator,
+    mut snapshots: mpsc::Receiver<Vec<crate::device::DeviceSnapshot>>,
+    results: mpsc::Sender<Enriched>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(devices) = snapshots.recv().await {
+            let enrichments = enrichers.poll_due(Instant::now(), &devices).await;
+            let counters = enrichers
+                .counters()
+                .into_iter()
+                .map(|(name, polls, failures)| (name.to_string(), polls, failures))
+                .collect();
+            // Nothing found is still worth sending: the counters are how
+            // `netgraspd stats` shows an enricher that is failing every time.
+            if results
+                .send(Enriched {
+                    enrichments,
+                    counters,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    })
+}
+
 /// Runs the nightly maintenance job, logging rather than propagating a failure.
 ///
 /// A rollup that fails is a database that grows for another day. Stopping the
@@ -616,7 +699,7 @@ fn write_status(
     summary: &RunSummary,
     manager: &Manager,
     dedup: &ObservationDedup,
-    enrichers: &Orchestrator,
+    enricher_counters: &[(String, u64, u64)],
 ) {
     let (online, idle, offline) = manager.state_counts();
     let mut status = Status::new(started_at);
@@ -631,13 +714,15 @@ fn write_status(
     status.idle = idle;
     status.offline = offline;
     status.sources = summary.sources.clone();
-    status.enrichers = enrichers
-        .counters()
-        .into_iter()
+    status.enrichers = enricher_counters
+        .iter()
         .map(|(name, polls, failures)| {
             (
-                name.to_string(),
-                crate::runtime::EnricherCounters { polls, failures },
+                name.clone(),
+                crate::runtime::EnricherCounters {
+                    polls: *polls,
+                    failures: *failures,
+                },
             )
         })
         .collect();

@@ -532,8 +532,10 @@ than one that has none.
 **Exercised against a live network:** capture on Linux, in a container with
 `--network=host` and `--cap-add=NET_RAW`. All six sources start, the permission
 path works end to end, and devices, presence sessions, events and a security
-event were produced from real traffic. That was a container host's own segment
-over a few minutes, not a home LAN over weeks.
+event were produced from real traffic. Clean shutdown on SIGTERM was verified
+there too, which is what the systemd unit's `TimeoutStopSec` depends on. That
+was a container host's own segment over a few minutes, not a home LAN over
+weeks.
 
 **Exercised against a real database:** the schema, every migration, the rollup,
 the retention, the location history invariants, the people state machine and the

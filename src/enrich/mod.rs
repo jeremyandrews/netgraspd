@@ -234,9 +234,21 @@ impl Orchestrator {
             if now < scheduled.next_due {
                 continue;
             }
-            scheduled.next_due = now + scheduled.interval;
             scheduled.polls += 1;
-            match scheduled.enricher.enrich(devices).await {
+            let started = Instant::now();
+            let result = scheduled.enricher.enrich(devices).await;
+            // Scheduled from when the poll *finished*, not from when it started.
+            // An unreachable controller takes the full request timeout twice
+            // over while the client works out which API shape it is talking to,
+            // which is comfortably longer than the poll interval; measuring from
+            // the start would leave the next attempt already overdue and run
+            // failing polls back to back forever.
+            //
+            // The elapsed time is measured against the real clock and added to
+            // the caller's, so the caller's clock stays the authority on when
+            // "now" is and a test can still drive this with a synthetic one.
+            scheduled.next_due = now + started.elapsed() + scheduled.interval;
+            match result {
                 Ok(enrichments) => {
                     tracing::debug!(
                         enricher = scheduled.enricher.name(),
@@ -373,7 +385,11 @@ mod tests {
         let _ = o.poll_due(start + Duration::from_secs(29), &[]).await;
         assert_eq!(scripted.calls.load(Ordering::SeqCst), 1, "not due yet");
 
-        let _ = o.poll_due(start + Duration::from_secs(30), &[]).await;
+        // A second past the interval rather than exactly on it: the next
+        // deadline is the interval plus however long the poll itself took, and
+        // asserting to the microsecond would be asserting the speed of the test
+        // machine.
+        let _ = o.poll_due(start + Duration::from_secs(31), &[]).await;
         assert_eq!(scripted.calls.load(Ordering::SeqCst), 2, "due now");
     }
 
@@ -414,8 +430,44 @@ mod tests {
         let mut o = Orchestrator::with_enrichers(true, vec![Box::new(scripted)]);
         let start = Instant::now();
         assert!(o.poll_due(start, &[]).await.is_empty());
-        let out = o.poll_due(start + Duration::from_secs(30), &[]).await;
+        let out = o.poll_due(start + Duration::from_secs(31), &[]).await;
         assert_eq!(out.len(), 1, "it recovers on the next interval");
+    }
+
+    #[tokio::test]
+    async fn a_poll_that_takes_longer_than_the_interval_does_not_run_back_to_back() {
+        // Regression, found by running the daemon against an unreachable
+        // controller. A poll that outlasts its own interval left the next
+        // attempt already overdue, so failing polls ran continuously; combined
+        // with a biased select loop that starved the arms after it, the
+        // maintenance and status ticks stopped firing entirely.
+        struct Slow;
+        #[async_trait]
+        impl Enricher for Slow {
+            fn name(&self) -> &str {
+                "slow"
+            }
+            fn poll_interval(&self) -> Option<Duration> {
+                Some(Duration::from_secs(5))
+            }
+            async fn enrich(&self, _devices: &[DeviceSnapshot]) -> Result<Vec<Enrichment>> {
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                Ok(Vec::new())
+            }
+        }
+
+        let mut o = Orchestrator::with_enrichers(true, vec![Box::new(Slow)]);
+        let start = Instant::now();
+        let _ = o.poll_due(start, &[]).await;
+        assert_eq!(o.counters()[0].1, 1);
+
+        // The poll took 120ms, so the next one is due 5s after it finished and
+        // not 5s after it started.
+        let _ = o.poll_due(start + Duration::from_millis(5_100), &[]).await;
+        assert_eq!(o.counters()[0].1, 1, "still inside the interval");
+
+        let _ = o.poll_due(start + Duration::from_millis(5_300), &[]).await;
+        assert_eq!(o.counters()[0].1, 2);
     }
 
     #[tokio::test]
