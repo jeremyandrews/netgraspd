@@ -27,6 +27,21 @@ mod embedded {
     refinery::embed_migrations!("migrations");
 }
 
+/// The highest migration version this build ships.
+///
+/// The read-only commands compare it against what a database records as applied,
+/// so that "migrated by an older daemon" is a sentence rather than a missing
+/// relation.
+#[must_use]
+pub fn embedded_max_version() -> i32 {
+    embedded::migrations::runner()
+        .get_migrations()
+        .iter()
+        .map(refinery::Migration::version)
+        .max()
+        .unwrap_or(0)
+}
+
 /// A connection pool plus the operations the daemon performs against it.
 #[derive(Clone)]
 pub struct Db {
@@ -151,6 +166,22 @@ impl Db {
     pub async fn preflight(&self) -> Result<()> {
         let client = self.client().await?;
         schema::preflight(&client).await
+    }
+
+    /// Refuses to read from a database this build cannot read honestly.
+    ///
+    /// What [`migrate`](Self::migrate) and [`preflight`](Self::preflight) do for
+    /// the daemon, in one call, for the commands that only read. They never
+    /// migrate, so nothing else has checked anything for them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the database is unreachable, has no netgrasp
+    /// schema, has one the plugin built, is migrated short of this build, or
+    /// diverges from the expected columns.
+    pub async fn require_schema(&self) -> Result<()> {
+        let client = self.client().await?;
+        schema::check_readable(&client, embedded_max_version()).await
     }
 }
 

@@ -16,6 +16,9 @@ mod common;
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, TimeZone, Utc};
+use netgraspd::cli::DevicesArgs;
+use netgraspd::config::Config;
+use netgraspd::db::Db;
 use netgraspd::db::schema::{self, EXPECTED};
 
 /// The server's message for a database error.
@@ -202,6 +205,280 @@ async fn a_plugin_first_database_gets_a_message_an_operator_can_act_on() {
     common::rebuild_schema(&db).await;
 }
 
+/// Pulls the table list out of the `DROP TABLE` the reconcile message suggests.
+fn drop_list(message: &str) -> Vec<String> {
+    let (_, after) = message
+        .split_once("DROP TABLE IF EXISTS ")
+        .unwrap_or_else(|| panic!("the message suggests no DROP:\n{message}"));
+    after
+        .split_once(" CASCADE;")
+        .unwrap_or_else(|| panic!("the DROP is not terminated:\n{message}"))
+        .0
+        .split(", ")
+        .map(str::to_string)
+        .collect()
+}
+
+#[tokio::test]
+async fn the_existence_check_does_not_depend_on_the_connecting_role() {
+    let Some(db) = common::test_db().await else {
+        return;
+    };
+    // The bug in one sentence: `information_schema.tables` lists only what the
+    // *connecting role* holds a privilege on, so when the plugin creates the
+    // ng_ tables as one role and the daemon connects as another, the daemon is
+    // told they are not there, waves its own migration through, and refinery
+    // dies with `relation "ng_devices" already exists` — the exact error the
+    // guard exists to prevent.
+    //
+    // The plugin-first test above cannot catch this: it drops the history table
+    // from a database the daemon itself built, so both share one owner and the
+    // role-visibility path is never walked.
+    const PROBE: &str = "ng_probe_daemon";
+    const PROBE_PASSWORD: &str = "probe";
+    // A schema of its own, standing in for the plugin's database: tables one
+    // role created, no privileges on them for the other, and no refinery
+    // history because the plugin never writes one.
+    const PLUGIN_SCHEMA: &str = "ng_plugin_first";
+
+    {
+        let owner = db.client().await;
+        if let Err(err) = owner
+            .batch_execute(&format!(
+                "{}
+                 CREATE ROLE {PROBE} LOGIN PASSWORD '{PROBE_PASSWORD}';
+                 CREATE SCHEMA {PLUGIN_SCHEMA};
+                 -- USAGE and nothing else: the daemon's role can reach into the
+                 -- schema and cannot touch a single table in it, which is what
+                 -- makes information_schema deny they are there.
+                 GRANT USAGE ON SCHEMA {PLUGIN_SCHEMA} TO {PROBE};
+                 CREATE TABLE {PLUGIN_SCHEMA}.ng_devices (
+                     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                     mac TEXT NOT NULL,
+                     vendor TEXT);
+                 CREATE TABLE {PLUGIN_SCHEMA}.ng_state (
+                     key TEXT PRIMARY KEY,
+                     value TEXT)",
+                teardown_probe_sql(PROBE, PLUGIN_SCHEMA)
+            ))
+            .await
+        {
+            // Not a silent pass: the reason is printed, and CI's guard treats a
+            // skip as a failure, so the coverage cannot be quietly lost there.
+            eprintln!(
+                "skipping: this test's Postgres role cannot create a role and a schema, so \
+                 the cross-role visibility path cannot be exercised ({})",
+                db_message(&err)
+            );
+            return;
+        }
+    }
+
+    let probe_cfg = netgraspd::config::DatabaseConfig {
+        url: common::test_url_as_role(PROBE, PROBE_PASSWORD),
+        pool_size: 1,
+    };
+    let probe_db = Db::connect(&probe_cfg).expect("a valid probe connection URL");
+    let probe = match probe_db.client().await {
+        Ok(client) => client,
+        Err(err) => {
+            eprintln!(
+                "skipping: the daemon's role cannot connect to {}, so the cross-role \
+                 visibility path cannot be exercised ({err})",
+                probe_cfg.url
+            );
+            drop(probe_db);
+            cleanup_probe(&db, PROBE, PLUGIN_SCHEMA).await;
+            return;
+        }
+    };
+    probe
+        .batch_execute(&format!("SET search_path = {PLUGIN_SCHEMA}"))
+        .await
+        .expect("pointing the daemon's role at the plugin's schema");
+
+    // The premise, asserted rather than assumed: to this role information_schema
+    // really does deny the table is there. If that ever stops holding, every
+    // assertion below stops proving anything.
+    let hidden: bool = probe
+        .query_one(
+            "SELECT NOT EXISTS (
+                 SELECT 1 FROM information_schema.tables
+                  WHERE table_schema = current_schema() AND table_name = 'ng_devices')",
+            &[],
+        )
+        .await
+        .expect("querying information_schema")
+        .get(0);
+    assert!(
+        hidden,
+        "the daemon's role can see ng_devices in information_schema, so it holds a \
+         privilege somewhere and this test proves nothing"
+    );
+
+    // What the daemon asks instead, and the true answer.
+    assert!(
+        schema::table_exists(&probe, "ng_devices")
+            .await
+            .expect("the existence check"),
+        "a table another role owns is still a table"
+    );
+    assert!(
+        !schema::table_exists(&probe, "ng_not_a_table_anybody_made")
+            .await
+            .expect("the existence check"),
+        "and one that is not there is still not there"
+    );
+
+    // The column reader has the same disease and the same cure: it used to read
+    // information_schema.columns, which would report every column of this table
+    // missing and make the preflight lie about which divergence it found.
+    let columns = schema::columns_of(&probe, "ng_devices")
+        .await
+        .expect("reading the columns");
+    assert_eq!(
+        columns
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<&str>>(),
+        BTreeSet::from(["id", "mac", "vendor"]),
+        "a column's type is a property of the table, not of the reader"
+    );
+    assert!(!columns["mac"].nullable, "NOT NULL survived the round trip");
+
+    // And the consequence the whole guard exists for: this is refused, loudly,
+    // instead of being waved through into `relation "ng_devices" already exists`.
+    let err = schema::check_daemon_migrated_first(&probe)
+        .await
+        .expect_err("a schema another role built must be refused");
+    let text = err.to_string();
+    assert!(text.contains("netgraspd did not create them"), "{text}");
+    let named: BTreeSet<String> = drop_list(&text).into_iter().collect();
+    assert!(named.contains("ng_devices"), "{named:?}");
+    assert!(named.contains("ng_state"), "{named:?}");
+    println!("--- operator sees ---\n{text}\n---");
+
+    drop(probe);
+    drop(probe_db);
+    cleanup_probe(&db, PROBE, PLUGIN_SCHEMA).await;
+}
+
+/// Removes the second role and its schema, whatever state a previous run left.
+///
+/// Order matters and cost a run once: a role cannot be dropped while a schema
+/// still grants to it, and `DROP OWNED BY` is what clears the grants. Getting it
+/// wrong does not fail the test, it makes the test *skip* on every run after the
+/// first, which is a green tick that proves nothing.
+fn teardown_probe_sql(role: &str, schema_name: &str) -> String {
+    format!(
+        "DROP SCHEMA IF EXISTS {schema_name} CASCADE;
+         DO $$ BEGIN
+             IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN
+                 BEGIN
+                     EXECUTE 'DROP OWNED BY {role}';
+                 EXCEPTION WHEN insufficient_privilege THEN
+                     -- Dropping the schema above already removed the only grant
+                     -- this role is ever given. This is belt and braces for a
+                     -- run that died half way through, and a role with
+                     -- CREATEROLE but no membership cannot do it.
+                     NULL;
+                 END;
+             END IF;
+         END $$;
+         DROP ROLE IF EXISTS {role};"
+    )
+}
+
+/// Removes the second role and its schema.
+async fn cleanup_probe(db: &common::TestDb, role: &str, schema_name: &str) {
+    let owner = db.client().await;
+    owner
+        .batch_execute(&teardown_probe_sql(role, schema_name))
+        .await
+        .unwrap_or_else(|err| panic!("cleaning up the probe role: {}", db_message(&err)));
+}
+
+#[tokio::test]
+async fn an_empty_migration_history_is_still_a_plugin_first_database() {
+    let Some(db) = common::test_db().await else {
+        return;
+    };
+    // What a failed first attempt leaves behind. refinery creates its history
+    // table before it runs V1, and V1 is exactly what fails when the plugin got
+    // there first, so the table survives with nothing in it. Treating its mere
+    // existence as "the daemon has migrated before" turns a first-contact fault
+    // into a permanent one: the guard never fires again on that installation.
+    db.execute("DELETE FROM refinery_schema_history").await;
+
+    {
+        let client = db.client().await;
+        assert!(
+            schema::applied_migration_versions(&client)
+                .await
+                .expect("reading the history")
+                .is_empty(),
+            "the fixture is wrong: the history is not empty"
+        );
+
+        let err = schema::check_daemon_migrated_first(&client)
+            .await
+            .expect_err("an empty history is not an ordinary restart");
+        let text = err.to_string();
+        assert!(text.contains("no applied migration recorded"), "{text}");
+        assert!(text.contains("must migrate first"), "{text}");
+        assert!(
+            text.contains("Nothing was dropped and nothing was changed."),
+            "{text}"
+        );
+        println!("--- operator sees ---\n{text}\n---");
+    }
+
+    common::rebuild_schema(&db).await;
+}
+
+#[tokio::test]
+async fn the_reconcile_message_names_every_ng_table_that_is_really_there() {
+    let Some(db) = common::test_db().await else {
+        return;
+    };
+    // ng_state is the plugin's own scratch table and no version of this daemon
+    // has heard of it, which is precisely why a hand-typed DROP list left it
+    // behind. The list is now read from the database, so it cannot.
+    db.execute("CREATE TABLE IF NOT EXISTS ng_state (key TEXT PRIMARY KEY, value TEXT)")
+        .await;
+    db.execute("DELETE FROM refinery_schema_history").await;
+
+    {
+        let client = db.client().await;
+        let err = schema::check_daemon_migrated_first(&client)
+            .await
+            .expect_err("a plugin-first database must be refused");
+        let text = err.to_string();
+        println!("--- operator sees ---\n{text}\n---");
+
+        let named: BTreeSet<String> = drop_list(&text).into_iter().collect();
+        let present: BTreeSet<String> = schema::present_ng_tables(&client)
+            .await
+            .expect("listing ng_ tables")
+            .into_iter()
+            .collect();
+        assert_eq!(
+            named, present,
+            "the message must name exactly the ng_ tables that are there"
+        );
+        for (table, _) in EXPECTED {
+            assert!(named.contains(*table), "{table} is missing from {named:?}");
+        }
+        assert!(
+            named.contains("ng_state"),
+            "a table only the plugin creates is still one the operator has to drop: {named:?}"
+        );
+    }
+
+    db.execute("DROP TABLE IF EXISTS ng_state").await;
+    common::rebuild_schema(&db).await;
+}
+
 #[tokio::test]
 async fn an_ordinary_restart_is_not_mistaken_for_a_plugin_first_database() {
     let Some(db) = common::test_db().await else {
@@ -234,6 +511,139 @@ async fn an_empty_database_passes_the_plugin_first_check() {
 
     // Put the schema back for whatever runs next in this binary.
     common::rebuild_schema(&db).await;
+}
+
+/// A configuration pointed at the test database and nothing else.
+fn test_config() -> Config {
+    Config {
+        database: netgraspd::config::DatabaseConfig {
+            url: common::test_url(),
+            pool_size: 2,
+        },
+        ..Config::default()
+    }
+}
+
+#[tokio::test]
+async fn a_read_command_against_an_under_migrated_database_names_the_version() {
+    let Some(db) = common::test_db().await else {
+        return;
+    };
+    // Exactly what a machine looked like on the test drive: the daemon that
+    // built this database shipped V2, this build ships V3, and `stats` answered
+    // with `relation "ng_location_history" does not exist`. A read command runs
+    // no migration, so nothing had ever checked.
+    db.execute("DROP TABLE IF EXISTS ng_location_history, ng_people CASCADE")
+        .await;
+    db.execute("DELETE FROM refinery_schema_history WHERE version >= 3")
+        .await;
+
+    let config = test_config();
+    for (name, result) in [
+        ("stats", netgraspd::cli::stats(&config).await),
+        (
+            "devices",
+            netgraspd::cli::devices(&config, &DevicesArgs { state: None }).await,
+        ),
+        ("people", netgraspd::cli::people(&config).await),
+    ] {
+        let err = result.expect_err("an under-migrated database must be refused");
+        let text = format!("{err:#}");
+        assert!(text.contains("migrated to V2"), "{name}: {text}");
+        assert!(text.contains("through V3"), "{name}: {text}");
+        assert!(
+            !text.contains("does not exist"),
+            "{name} still leaked the raw catalog error: {text}"
+        );
+        println!("--- {name} operator sees ---\n{text}\n---");
+    }
+
+    common::rebuild_schema(&db).await;
+}
+
+#[tokio::test]
+async fn a_read_command_against_a_diverged_schema_names_the_table_not_the_relation() {
+    let Some(db) = common::test_db().await else {
+        return;
+    };
+    // Migrated to the current version, but a table this build reads is gone:
+    // the version check cannot catch this one, the preflight has to.
+    db.execute("DROP TABLE IF EXISTS ng_location_history CASCADE")
+        .await;
+
+    let config = test_config();
+    let err = netgraspd::cli::stats(&config)
+        .await
+        .expect_err("a missing table must be refused");
+    let text = format!("{err:#}");
+    assert!(text.contains("ng_location_history"), "{text}");
+    assert!(text.contains("the table is missing"), "{text}");
+    assert!(
+        text.contains("The daemon owns this schema"),
+        "the message has to say what to do about it: {text}"
+    );
+    assert!(!text.contains("does not exist"), "{text}");
+    println!("--- operator sees ---\n{text}\n---");
+
+    common::rebuild_schema(&db).await;
+}
+
+#[tokio::test]
+async fn a_read_command_against_an_empty_database_says_to_run_the_daemon_first() {
+    let Some(db) = common::test_db().await else {
+        return;
+    };
+    db.execute(
+        "DROP TABLE IF EXISTS ng_people, ng_location_history, ng_ip_history, ng_events,
+                              ng_presence, ng_device_signals, ng_devices,
+                              refinery_schema_history CASCADE",
+    )
+    .await;
+
+    let err = netgraspd::cli::devices(&test_config(), &DevicesArgs { state: None })
+        .await
+        .expect_err("an empty database must be refused");
+    let text = format!("{err:#}");
+    assert!(text.contains("no netgrasp schema"), "{text}");
+    assert!(text.contains("netgraspd run"), "{text}");
+    assert!(!text.contains("does not exist"), "{text}");
+    println!("--- operator sees ---\n{text}\n---");
+
+    common::rebuild_schema(&db).await;
+}
+
+#[tokio::test]
+async fn a_read_command_against_a_plugin_first_database_gets_the_reconcile_message() {
+    let Some(db) = common::test_db().await else {
+        return;
+    };
+    db.execute("DELETE FROM refinery_schema_history").await;
+
+    let err = netgraspd::cli::devices(&test_config(), &DevicesArgs { state: None })
+        .await
+        .expect_err("a plugin-first database must be refused on the read path too");
+    let text = format!("{err:#}");
+    assert!(text.contains("netgraspd did not create them"), "{text}");
+    assert!(text.contains("DROP TABLE IF EXISTS"), "{text}");
+
+    common::rebuild_schema(&db).await;
+}
+
+#[tokio::test]
+async fn a_read_command_against_a_healthy_database_is_not_refused() {
+    let Some(db) = common::test_db().await else {
+        return;
+    };
+    // The other half of the guard: it must not stand between an operator and a
+    // database that is fine. `devices` on an empty-but-migrated table prints
+    // "No devices recorded yet" and returns Ok.
+    assert_eq!(db.count("ng_devices").await, 0);
+    netgraspd::cli::devices(&test_config(), &DevicesArgs { state: None })
+        .await
+        .expect("a migrated database must be readable");
+    netgraspd::cli::stats(&test_config())
+        .await
+        .expect("and so must stats");
 }
 
 #[tokio::test]

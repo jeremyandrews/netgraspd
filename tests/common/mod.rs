@@ -117,6 +117,27 @@ pub fn test_url() -> String {
     std::env::var("NETGRASPD_TEST_DATABASE_URL").unwrap_or_else(|_| DEFAULT_URL.to_string())
 }
 
+/// The same database, connected to as somebody else.
+///
+/// For the one test that has to prove a catalog lookup is indifferent to the
+/// connecting role, which is the whole shape of the bug: the plugin creates the
+/// `ng_` tables as one role and the daemon connects as another.
+pub fn test_url_as_role(user: &str, password: &str) -> String {
+    let url = test_url();
+    let Some(scheme_end) = url.find("://").map(|i| i + 3) else {
+        // Not a URL. The caller will fail to connect and skip, saying so.
+        return url;
+    };
+    let rest = &url[scheme_end..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let host_start = rest[..authority_end].rfind('@').map_or(0, |at| at + 1);
+    format!(
+        "{}{user}:{password}@{}",
+        &url[..scheme_end],
+        &rest[host_start..]
+    )
+}
+
 /// Drops every table and migrates from nothing.
 ///
 /// Two tests deliberately wreck the schema, because the failures worth proving

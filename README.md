@@ -129,16 +129,29 @@ naming the table and the column.
 
 The plugin declares the same tables with `CREATE TABLE IF NOT EXISTS`, which
 means it will happily accept tables that already exist with the wrong types and
-fail much later as a broken device page. Two checks close that:
+fail much later as a broken device page. Three checks close that:
 
 - **Before migrating**, the daemon looks for `ng_` tables it did not create. If
-  the plugin got there first there is no `refinery_schema_history` table, and
-  the daemon stops with a message telling you how to reconcile rather than
-  failing with `relation "ng_devices" already exists`. Nothing is adopted and
-  nothing is dropped: adopting types nobody checked is worse than stopping, and
-  dropping somebody's data to fix a startup message is worse than either.
+  the plugin got there first, `refinery_schema_history` records no applied
+  migration, and the daemon stops with a message telling you how to reconcile
+  rather than failing with `relation "ng_devices" already exists`. Nothing is
+  adopted and nothing is dropped: adopting types nobody checked is worse than
+  stopping, and dropping somebody's data to fix a startup message is worse than
+  either. The `DROP TABLE` the message suggests is read out of the database, so
+  it names the `ng_` tables that are really there, including the ones only the
+  plugin creates.
 - **After migrating**, a preflight compares every `ng_` table against what this
   build expects and refuses to start on a divergence.
+- **Before reading**, `devices`, `events`, `people`, `stats` and `maintain` run
+  both of those plus a migration-version check. None of them migrate, so an
+  empty, an under-migrated or a plugin-built database used to answer them with a
+  bare `relation "ng_location_history" does not exist`.
+
+Every one of those checks reads `pg_catalog` and never `information_schema`,
+because `information_schema` lists only what the *connecting role* holds a
+privilege on. Where the plugin creates the tables as one role and the daemon
+connects as another, asking `information_schema` is asking a different question
+and getting a confidently wrong answer to it.
 
 So the order is: **run `netgraspd` once against an empty database, then point
 the plugin at it.** `docker-compose.yml` encodes that as a one-shot `migrate`
@@ -220,6 +233,21 @@ Precedence, highest first:
 
 Durations are written as `30m`, `2h`, `1d`, `90s`, or a bare integer meaning
 seconds.
+
+Every subcommand logs which file it read and which database that resolved to,
+with the password redacted, before it connects to anything. When no file is
+found it says so as a **warning**, because falling back to the compiled
+`database.url` is how `netgraspd stats` reports confidently on a database the
+daemon is not writing to:
+
+```
+ INFO configuration read from file path=netgrasp.toml
+ INFO effective database url=postgres://netgrasp:***@localhost:5432/netgrasp
+```
+
+```
+ WARN no configuration file found; every setting not given as a flag or a NETGRASP_ variable is a compiled default, database.url included looked_for=netgrasp.toml
+```
 
 Unknown keys are rejected rather than ignored, so a typo is an error rather than
 a setting that silently does nothing. **That applies to the environment too**:
