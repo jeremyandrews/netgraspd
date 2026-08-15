@@ -20,6 +20,110 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// Default file consulted when `--config` is not given.
 pub const DEFAULT_CONFIG_FILE: &str = "netgrasp.toml";
 
+/// What a redacted password is replaced with.
+const REDACTED: &str = "***";
+
+/// Where the file layer of the effective configuration came from.
+///
+/// Reported at startup by every subcommand. Without it, a `netgraspd stats` run
+/// from a directory with no `netgrasp.toml` in it silently falls back to the
+/// compiled `database.url`, reads a different database than the daemon is
+/// writing to, and reports stale numbers with nothing to suggest it has done
+/// anything unusual. That happened, on a real machine, and cost five minutes
+/// nobody would have spent on one log line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigSource {
+    /// Read from this file.
+    File(PathBuf),
+    /// No file was found at this path, so every value is a compiled default or
+    /// comes from the environment or a flag.
+    Defaults {
+        /// The path that was looked for and was not there.
+        looked_for: PathBuf,
+    },
+}
+
+impl ConfigSource {
+    /// True when no configuration file was found.
+    #[must_use]
+    pub const fn is_defaults(&self) -> bool {
+        matches!(self, ConfigSource::Defaults { .. })
+    }
+}
+
+/// A connection string with any password replaced by `***`.
+///
+/// Handles both forms Postgres accepts: a URL with `user:password@` userinfo,
+/// and a libpq keyword string with a `password=` field. A URL with no password
+/// comes back unchanged, so the operator still sees the user, host, port and
+/// database, which is the whole reason for logging it.
+#[must_use]
+pub fn redact_database_url(url: &str) -> String {
+    redact_password_keyword(&redact_url_userinfo(url))
+}
+
+/// Replaces the password in `scheme://user:password@host/...`.
+fn redact_url_userinfo(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let rest_start = scheme_end + 3;
+    let rest = &url[rest_start..];
+    // The authority ends at the path, the query or the fragment.
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    // The last '@', not the first: a percent-encoded password cannot contain one
+    // but a badly encoded one might, and the host is what follows the last.
+    let Some(at) = authority.rfind('@') else {
+        return url.to_string();
+    };
+    let userinfo = &authority[..at];
+    let Some(colon) = userinfo.find(':') else {
+        return url.to_string();
+    };
+    format!(
+        "{}{}{REDACTED}{}",
+        &url[..rest_start],
+        &userinfo[..=colon],
+        &url[rest_start + at..]
+    )
+}
+
+/// Replaces the value of any `password=` field.
+///
+/// Covers the libpq keyword form (`host=db password=secret`) and a URL query
+/// parameter (`?password=secret`). Only at a field boundary, so a database
+/// actually named `password=` in some pathological URL path is left alone.
+fn redact_password_keyword(s: &str) -> String {
+    const KEY: &str = "password=";
+    // to_ascii_lowercase preserves byte length, so every index below is an index
+    // into `s` as well.
+    let lower = s.to_ascii_lowercase();
+    let mut out = String::with_capacity(s.len());
+    let mut cursor = 0;
+    while let Some(rel) = lower[cursor..].find(KEY) {
+        let start = cursor + rel;
+        let value_start = start + KEY.len();
+        let at_boundary =
+            start == 0 || matches!(s.as_bytes()[start - 1], b' ' | b'\t' | b'?' | b'&');
+        out.push_str(&s[cursor..value_start]);
+        cursor = value_start;
+        if !at_boundary {
+            continue;
+        }
+        let value = &s[value_start..];
+        let value_len = if let Some(quoted) = value.strip_prefix('\'') {
+            // A quoted value ends at the closing quote, spaces and all.
+            quoted.find('\'').map_or(value.len(), |end| end + 2)
+        } else {
+            value.find([' ', '\t', '&']).unwrap_or(value.len())
+        };
+        out.push_str(REDACTED);
+        cursor = value_start + value_len;
+    }
+    out.push_str(&s[cursor..]);
+    out
+}
+
 /// A duration written as a human string in every configuration layer.
 ///
 /// Accepts `s`, `m`, `h` and `d` suffixes, or a bare integer meaning seconds.
@@ -1149,12 +1253,31 @@ impl Config {
     /// environment variable holds an unusable value, or when the merged result
     /// fails validation.
     pub fn load(config_path: Option<&Path>, overrides: &[Override]) -> Result<Self> {
+        Self::load_with_source(config_path, overrides).map(|(config, _)| config)
+    }
+
+    /// Assembles the configuration and reports where its file layer came from.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Config::load`].
+    pub fn load_with_source(
+        config_path: Option<&Path>,
+        overrides: &[Override],
+    ) -> Result<(Self, ConfigSource)> {
         let path =
             config_path.map_or_else(|| PathBuf::from(DEFAULT_CONFIG_FILE), Path::to_path_buf);
         let explicit = config_path.is_some();
         if explicit && !path.exists() {
             bail!("config file {} does not exist", path.display());
         }
+        let source = if path.exists() {
+            ConfigSource::File(path.clone())
+        } else {
+            ConfigSource::Defaults {
+                looked_for: path.clone(),
+            }
+        };
 
         let mut figment = Figment::from(Serialized::defaults(Config::default()))
             .merge(Toml::file(&path))
@@ -1167,7 +1290,7 @@ impl Config {
             .extract()
             .context("failed to assemble configuration")?;
         config.validate()?;
-        Ok(config)
+        Ok((config, source))
     }
 
     /// Rejects combinations that would misbehave silently at runtime.
@@ -1269,6 +1392,109 @@ mod tests {
         Config::default()
             .validate()
             .expect("defaults must validate");
+    }
+
+    #[test]
+    fn a_password_is_redacted_in_every_form_postgres_accepts() {
+        for (raw, expected) in [
+            (
+                "postgres://netgrasp:netgrasp@localhost:5432/netgrasp",
+                "postgres://netgrasp:***@localhost:5432/netgrasp",
+            ),
+            (
+                "postgresql://user:p%40ssw0rd@db.example:5432/netgrasp?sslmode=require",
+                "postgresql://user:***@db.example:5432/netgrasp?sslmode=require",
+            ),
+            (
+                "postgres://user@localhost/netgrasp?password=secret",
+                "postgres://user@localhost/netgrasp?password=***",
+            ),
+            (
+                "host=localhost port=5432 password=secret dbname=netgrasp",
+                "host=localhost port=5432 password=*** dbname=netgrasp",
+            ),
+            (
+                "host=localhost password='two words' dbname=netgrasp",
+                "host=localhost password=*** dbname=netgrasp",
+            ),
+        ] {
+            assert_eq!(redact_database_url(raw), expected, "redacting {raw:?}");
+        }
+    }
+
+    #[test]
+    fn a_url_with_no_password_survives_intact() {
+        // The point of logging the URL is that an operator can tell one database
+        // from another, so redaction must not eat the parts that do that.
+        for raw in [
+            "postgres://netgrasp@localhost:5432/netgrasp",
+            "postgres://localhost/netgrasp",
+            "host=localhost dbname=netgrasp user=netgrasp",
+            "",
+        ] {
+            assert_eq!(redact_database_url(raw), raw, "{raw:?} should be untouched");
+        }
+    }
+
+    #[test]
+    fn redaction_leaves_no_password_behind() {
+        // A property rather than a table: whatever the shape, the secret is gone.
+        for raw in [
+            "postgres://u:hunter2@h/d",
+            "postgres://u:hunter2@h:5432/d?application_name=x",
+            "password=hunter2",
+            "host=h password=hunter2",
+            "host=h password='hunter2' dbname=d",
+            "postgres://u@h/d?sslmode=require&password=hunter2",
+        ] {
+            let redacted = redact_database_url(raw);
+            assert!(
+                !redacted.contains("hunter2"),
+                "{raw:?} redacted to {redacted:?}"
+            );
+            assert!(redacted.contains(REDACTED), "{redacted:?}");
+        }
+    }
+
+    #[test]
+    fn the_config_source_says_which_file_it_read() {
+        Jail::expect_with(|jail| {
+            jail.create_file("netgrasp.toml", "[database]\nurl = \"postgres://f/db\"\n")?;
+            let (config, source) = Config::load_with_source(None, &[]).expect("load");
+            assert_eq!(config.database.url, "postgres://f/db");
+            assert_eq!(source, ConfigSource::File(PathBuf::from("netgrasp.toml")));
+            assert!(!source.is_defaults());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn the_config_source_says_when_it_found_no_file_at_all() {
+        // The silent fallback this exists to make audible: no file, so
+        // database.url is whatever this binary was compiled with.
+        Jail::expect_with(|_| {
+            let (config, source) = Config::load_with_source(None, &[]).expect("load");
+            assert_eq!(config.database.url, DatabaseConfig::default().url);
+            assert_eq!(
+                source,
+                ConfigSource::Defaults {
+                    looked_for: PathBuf::from(DEFAULT_CONFIG_FILE)
+                }
+            );
+            assert!(source.is_defaults());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn an_explicit_config_file_is_reported_by_its_own_path() {
+        Jail::expect_with(|jail| {
+            jail.create_file("elsewhere.toml", "[database]\nurl = \"postgres://e/db\"\n")?;
+            let path = PathBuf::from("elsewhere.toml");
+            let (_, source) = Config::load_with_source(Some(&path), &[]).expect("load");
+            assert_eq!(source, ConfigSource::File(path));
+            Ok(())
+        });
     }
 
     #[test]

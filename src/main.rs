@@ -18,7 +18,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(&cli.log);
 
-    let config = cli.load_config()?;
+    // Which file, and which database. Every subcommand, before anything
+    // connects: a command that quietly answered from the compiled default URL
+    // was indistinguishable from one answering from the daemon's own database.
+    let (config, source) = cli.load_config_with_source()?;
+    cli::log_config_provenance(&source, &config);
 
     match &cli.command {
         Command::Run(args) => {

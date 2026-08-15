@@ -8,6 +8,12 @@
 //! Every flag that overrides configuration is expressed as a dotted
 //! [`Override`] rather than as a partial `Config`, so that an absent flag leaves
 //! the layer beneath it alone instead of overwriting it with a null.
+//!
+//! Every command that touches the database calls [`Db::require_schema`] straight
+//! after connecting. None of them migrate, so without it a database that is
+//! empty, under-migrated or built by the Trovato plugin answers with whatever
+//! Postgres says: `relation "ng_location_history" does not exist` names a table
+//! the operator has never heard of and suggests nothing to do about it.
 
 pub mod table;
 
@@ -17,7 +23,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 
-use crate::config::{Config, Override};
+use crate::config::{self, Config, ConfigSource, Override};
 use crate::daemon::RunOptions;
 use crate::db::{Db, queries};
 use crate::identity::FingerprintDb;
@@ -168,14 +174,48 @@ impl Cli {
     pub fn load_config(&self) -> Result<Config> {
         Config::load(self.config.as_deref(), &self.overrides())
     }
+
+    /// Loads configuration and reports which file layer produced it.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Cli::load_config`].
+    pub fn load_config_with_source(&self) -> Result<(Config, ConfigSource)> {
+        Config::load_with_source(self.config.as_deref(), &self.overrides())
+    }
+}
+
+/// Logs where the configuration came from and which database it names.
+///
+/// Runs for every subcommand, before anything connects. A read command that
+/// silently fell back to the compiled `database.url` used to report on a
+/// different database than the running daemon with nothing to say that it had,
+/// and the numbers it printed looked like an answer rather than a mistake.
+pub fn log_config_provenance(source: &ConfigSource, config: &Config) {
+    match source {
+        ConfigSource::File(path) => {
+            tracing::info!(path = %path.display(), "configuration read from file");
+        }
+        ConfigSource::Defaults { looked_for } => {
+            tracing::warn!(
+                looked_for = %looked_for.display(),
+                "no configuration file found; every setting not given as a flag or a \
+                 NETGRASP_ variable is a compiled default, database.url included"
+            );
+        }
+    }
+    tracing::info!(
+        url = %config::redact_database_url(&config.database.url),
+        "effective database"
+    );
 }
 
 /// Runs `devices`.
 ///
 /// # Errors
 ///
-/// Returns an error when the database is unreachable or the state filter is not
-/// a state.
+/// Returns an error when the database is unreachable, its schema is not one this
+/// build can read, or the state filter is not a state.
 pub async fn devices(config: &Config, args: &DevicesArgs) -> Result<()> {
     if let Some(state) = &args.state
         && !["online", "idle", "offline"].contains(&state.as_str())
@@ -184,6 +224,7 @@ pub async fn devices(config: &Config, args: &DevicesArgs) -> Result<()> {
     }
 
     let db = Db::connect(&config.database)?;
+    db.require_schema().await?;
     let client = db.client().await?;
     let mut records = queries::load_devices(&client).await?;
     if let Some(state) = &args.state {
@@ -201,13 +242,14 @@ pub async fn devices(config: &Config, args: &DevicesArgs) -> Result<()> {
 ///
 /// # Errors
 ///
-/// Returns an error when the database is unreachable or the limit is not
-/// positive.
+/// Returns an error when the database is unreachable, its schema is not one this
+/// build can read, or the limit is not positive.
 pub async fn events(config: &Config, args: &EventsArgs) -> Result<()> {
     if args.limit <= 0 {
         anyhow::bail!("--limit must be at least 1");
     }
     let db = Db::connect(&config.database)?;
+    db.require_schema().await?;
     let client = db.client().await?;
     let records = if args.security {
         queries::recent_security_events(&client, args.limit).await?
@@ -230,9 +272,11 @@ pub async fn events(config: &Config, args: &EventsArgs) -> Result<()> {
 ///
 /// # Errors
 ///
-/// Returns an error when the database is unreachable.
+/// Returns an error when the database is unreachable or its schema is not one
+/// this build can read.
 pub async fn people(config: &Config) -> Result<()> {
     let db = Db::connect(&config.database)?;
+    db.require_schema().await?;
     let client = db.client().await?;
     let rows = queries::load_people(&client).await?;
     if rows.is_empty() {
@@ -255,9 +299,10 @@ pub async fn people(config: &Config) -> Result<()> {
 ///
 /// # Errors
 ///
-/// Returns an error when the database is unreachable. A missing or stale status
-/// file is reported, not an error: "the daemon is not running" is one of the
-/// answers this command exists to give.
+/// Returns an error when the database is unreachable or its schema is not one
+/// this build can read. A missing or stale status file is reported, not an
+/// error: "the daemon is not running" is one of the answers this command exists
+/// to give.
 pub async fn stats(config: &Config) -> Result<()> {
     let now = Utc::now();
     println!("netgraspd {}", env!("CARGO_PKG_VERSION"));
@@ -266,6 +311,7 @@ pub async fn stats(config: &Config) -> Result<()> {
     print_runtime_section(config, now);
 
     let db = Db::connect(&config.database)?;
+    db.require_schema().await?;
     let client = db.client().await?;
 
     println!("Devices");
@@ -433,9 +479,11 @@ fn print_runtime_section(config: &Config, now: chrono::DateTime<Utc>) {
 ///
 /// # Errors
 ///
-/// Returns an error when the database is unreachable or a job fails.
+/// Returns an error when the database is unreachable, its schema is not one this
+/// build can read, or a job fails.
 pub async fn maintain(config: &Config, args: &MaintainArgs) -> Result<()> {
     let db = Db::connect(&config.database)?;
+    db.require_schema().await?;
     let client = db.client().await?;
     let now = Utc::now();
     let rollup_before = maintenance::cutoff(now, config.maintenance.rollup_after_days);
