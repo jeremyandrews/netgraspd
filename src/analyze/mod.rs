@@ -210,7 +210,8 @@ impl Chain {
         Chain {
             analyzers,
             context: Context {
-                gateway: GatewayTracker::new(config.gateway_ip(), config.gateway_mac()),
+                gateway: GatewayTracker::new(config.gateway_ip(), config.gateway_mac())
+                    .with_proxy_arp(config.proxy_arp_gateway),
                 exempt: config.exempt_macs(),
                 priority: config.notifications.priority,
                 max_tracked: config.max_tracked,

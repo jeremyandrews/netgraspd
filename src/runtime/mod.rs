@@ -60,6 +60,19 @@ pub struct Status {
     pub events: u64,
     /// Security events recorded, a subset of `events`.
     pub security_events: u64,
+    /// Naming evidence that named an address no known device holds, and so
+    /// became nobody's name. A responder answering for hosts on a segment this
+    /// daemon cannot see drives this up; a large number beside a small device
+    /// count means the daemon is watching less of the network than it thinks.
+    ///
+    /// Defaulted on read so that a status file written by an older build still
+    /// parses rather than making `stats` report a dead daemon.
+    #[serde(default)]
+    pub unattributed_names: u64,
+    /// Addresses the gateway has been seen proxy-ARPing for. Zero on a network
+    /// whose router does not proxy; see `security.proxy_arp_gateway`.
+    #[serde(default)]
+    pub proxy_arp_addresses: usize,
     /// Devices in the in-memory table.
     pub devices: usize,
     /// How many of them are online, idle and offline.
@@ -93,6 +106,8 @@ impl Status {
             duplicates: 0,
             events: 0,
             security_events: 0,
+            unattributed_names: 0,
+            proxy_arp_addresses: 0,
             devices: 0,
             online: 0,
             idle: 0,

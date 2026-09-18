@@ -386,6 +386,7 @@ pub async fn run(
             _ = status_tick.tick() => {
                 write_status(
                     config, started_at, &summary, &manager, &dedup, &enricher_counters,
+                    analyzers.gateway().proxied().len(),
                 );
             }
 
@@ -709,6 +710,7 @@ fn write_status(
     manager: &Manager,
     dedup: &ObservationDedup,
     enricher_counters: &[(String, u64, u64)],
+    proxy_arp_addresses: usize,
 ) {
     let (online, idle, offline) = manager.state_counts();
     let mut status = Status::new(started_at);
@@ -718,6 +720,8 @@ fn write_status(
     status.duplicates = dedup.duplicates_suppressed();
     status.events = summary.events;
     status.security_events = summary.security_events;
+    status.unattributed_names = manager.unattributed_claims();
+    status.proxy_arp_addresses = proxy_arp_addresses;
     status.devices = manager.len();
     status.online = online;
     status.idle = idle;

@@ -281,6 +281,114 @@ async fn mixed_multi_protocol_traffic_identifies_devices_and_classifies_them() {
 }
 
 #[tokio::test]
+async fn a_router_proxy_arping_across_vlans_trips_nothing() {
+    // The 2026-09-17 run, end to end. The Routerboard gateway was the MAC or
+    // the conflicting holder in all 34 `ip_conflict` and `arp_spoof` alerts
+    // across several VLANs, and every one of them was proxy ARP.
+    //
+    // The gateway address is configured here rather than learned, because that
+    // is what an operator on such a network does and because it makes the test
+    // about the proxy rule rather than about inference.
+    let Some(db) = common::test_db().await else {
+        return;
+    };
+    let mut pipeline = Pipeline::new(SecurityConfig {
+        gateway_ip: "192.168.1.1".into(),
+        gateway_mac: "18:fd:74:39:e5:23".into(),
+        ..SecurityConfig::default()
+    });
+
+    // Two hosts on two other segments, both plainly active, and the router
+    // answering ARP for both of them with its own MAC. Ten minutes of it, which
+    // is past every cooldown in the chain.
+    for second in 0..600i64 {
+        for (host, address) in [
+            ("00:11:32:aa:bb:cc", [192, 168, 20, 55]),
+            ("b0:a7:37:0a:0b:0c", [192, 168, 30, 12]),
+        ] {
+            pipeline
+                .observe(&db, &arp_claim(host, address, at(second)))
+                .await;
+            pipeline
+                .observe(&db, &arp_claim("18:fd:74:39:e5:23", address, at(second)))
+                .await;
+        }
+    }
+    pipeline.flush(&db).await;
+
+    for wire in [EventType::IpConflict, EventType::ArpSpoof] {
+        assert_eq!(
+            pipeline.alert_count(wire),
+            0,
+            "{wire} fired on proxy ARP: {:?}",
+            pipeline.alerts
+        );
+    }
+
+    // And the attack is still caught on the very same address.
+    pipeline
+        .observe(
+            &db,
+            &arp_claim("02:de:ad:be:ef:01", [192, 168, 20, 55], at(601)),
+        )
+        .await;
+    assert_eq!(
+        pipeline.alert_count(EventType::ArpSpoof),
+        1,
+        "a stranger taking a proxied address must still alert"
+    );
+}
+
+#[tokio::test]
+async fn a_sleep_proxy_names_the_sleeper_and_not_itself() {
+    // The identity half of 2026-09-17, through the real parser, the real
+    // scorer and the real persister. One frame, three hosts.
+    let Some(db) = common::test_db().await else {
+        return;
+    };
+    let mut pipeline = Pipeline::new(SecurityConfig::default());
+
+    // The NAS holds 192.168.1.60 and says so over ARP, which is how the daemon
+    // learns who is asleep behind that address.
+    pipeline
+        .observe(
+            &db,
+            &arp_claim("00:11:32:aa:bb:cc", [192, 168, 1, 60], at(0)),
+        )
+        .await;
+    // Now the phone answers on its behalf, and for itself, in one frame.
+    pipeline
+        .frame(&db, &fixtures::mdns_sleep_proxy(), "eth0", at(1))
+        .await;
+    pipeline.flush(&db).await;
+
+    let client = db.client().await;
+    let devices = queries::load_devices(&client).await.expect("devices load");
+    let name_of = |who: &str| {
+        devices
+            .iter()
+            .find(|d| d.mac == mac(who))
+            .map(|d| d.display())
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        name_of("3c:22:fb:9a:1b:2c"),
+        "Jeremy's iPhone",
+        "the responder keeps its own name and only its own"
+    );
+    assert_eq!(
+        name_of("00:11:32:aa:bb:cc"),
+        "Jeremy's iMac",
+        "the sleeping host is named by the answer given for it"
+    );
+    assert_eq!(
+        devices.len(),
+        2,
+        "answering for a host this daemon has never seen does not invent it: {devices:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_healthy_network_never_trips_a_wire_analyzer() {
     // The most important negative in the suite. A detector that alerts on
     // ordinary traffic is worse than no detector, because it trains its operator
