@@ -85,6 +85,17 @@ impl Analyzer for ArpSpoof {
         if claimed.is_unspecified() || claimed.is_broadcast() || claimed.is_multicast() {
             return Vec::new();
         }
+        // Proxy ARP by the gateway is an answer on somebody's behalf, not a
+        // claim on their address. It returns before the holder table is written,
+        // so the real owner stays the recorded holder and a genuine spoof of
+        // that address is still caught. The predicate requires the *gateway's*
+        // MAC and a non-gateway address, so neither attack this analyzer exists
+        // for can reach this line: a stranger claiming the gateway's address is
+        // not the gateway, and the gateway claiming its own address is not
+        // proxying. See `GatewayTracker::proxy_arp_for`.
+        if context.gateway.proxy_arp_for(observation).is_some() {
+            return Vec::new();
+        }
 
         let mac = observation.mac;
         let now = observation.observed_at;
@@ -211,6 +222,103 @@ mod tests {
             enabled: true,
             grace_period: HumanDuration::from_secs(60),
         }
+    }
+
+    /// A context whose gateway is the Routerboard from the 2026-09-17 run.
+    fn proxying_context() -> Context {
+        Context {
+            gateway: GatewayTracker::new(
+                Some(Ipv4Addr::new(192, 168, 1, 1)),
+                Some(mac("18:fd:74:39:e5:23")),
+            ),
+            ..context()
+        }
+    }
+
+    #[test]
+    fn the_gateway_proxy_arping_across_vlans_never_fires() {
+        // The 2026-09-17 pattern: the router answers for hosts on two other
+        // segments while those hosts are plainly still talking, which is exactly
+        // the shape the grace period reads as a spoof.
+        let mut analyzer = ArpSpoof::new(&config(), 1024);
+        let context = proxying_context();
+        let mut alerts = Vec::new();
+        for second in 0..600i64 {
+            for host in [[192, 168, 20, 55], [192, 168, 30, 12]] {
+                alerts.extend(analyzer.analyze(
+                    &Stimulus::Observed(&claim("00:11:32:aa:bb:cc", host, at(second))),
+                    &context,
+                ));
+                alerts.extend(analyzer.analyze(
+                    &Stimulus::Observed(&claim("18:fd:74:39:e5:23", host, at(second))),
+                    &context,
+                ));
+            }
+        }
+        assert!(alerts.is_empty(), "proxy ARP is not a spoof: {alerts:?}");
+    }
+
+    #[test]
+    fn a_stranger_claiming_the_gateway_address_still_fires() {
+        // The first of the two attacks this analyzer exists for. The exemption
+        // requires the gateway's own MAC, so an impersonator cannot reach it.
+        let mut analyzer = ArpSpoof::new(&config(), 1024);
+        let alerts = analyzer.analyze(
+            &Stimulus::Observed(&claim("02:de:ad:be:ef:01", [192, 168, 1, 1], at(0))),
+            &proxying_context(),
+        );
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].details["gateway_impersonation"], true);
+    }
+
+    #[test]
+    fn a_second_mac_taking_an_address_the_gateway_did_not_proxy_still_fires() {
+        // The second attack. An ordinary address, an ordinary still-active
+        // holder, a stranger taking it.
+        let mut analyzer = ArpSpoof::new(&config(), 1024);
+        let context = proxying_context();
+        let _ = analyzer.analyze(
+            &Stimulus::Observed(&claim("3c:22:fb:00:00:01", [192, 168, 1, 40], at(0))),
+            &context,
+        );
+        let alerts = analyzer.analyze(
+            &Stimulus::Observed(&claim("02:de:ad:be:ef:01", [192, 168, 1, 40], at(5))),
+            &context,
+        );
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].details["previous_holder"], "3c:22:fb:00:00:01");
+    }
+
+    #[test]
+    fn proxying_an_address_does_not_hand_it_to_the_router() {
+        // The holder table is the load-bearing part: if the router's answer were
+        // recorded as a claim, the real owner's next packet would look like it
+        // was taking the address back and would alert on the way past.
+        let mut analyzer = ArpSpoof::new(&config(), 1024);
+        let context = proxying_context();
+        let _ = analyzer.analyze(
+            &Stimulus::Observed(&claim("00:11:32:aa:bb:cc", [192, 168, 20, 55], at(0))),
+            &context,
+        );
+        let _ = analyzer.analyze(
+            &Stimulus::Observed(&claim("18:fd:74:39:e5:23", [192, 168, 20, 55], at(1))),
+            &context,
+        );
+        assert!(
+            analyzer
+                .analyze(
+                    &Stimulus::Observed(&claim("00:11:32:aa:bb:cc", [192, 168, 20, 55], at(2))),
+                    &context
+                )
+                .is_empty(),
+            "the real owner never lost the address"
+        );
+        // And a stranger taking it is still caught.
+        let alerts = analyzer.analyze(
+            &Stimulus::Observed(&claim("02:de:ad:be:ef:01", [192, 168, 20, 55], at(3))),
+            &context,
+        );
+        assert_eq!(alerts.len(), 1);
     }
 
     #[test]

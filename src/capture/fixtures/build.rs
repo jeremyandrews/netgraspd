@@ -17,6 +17,7 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+use crate::capture::dns::{TYPE_A, TYPE_SRV};
 use crate::capture::ethernet::{ETHERTYPE_IPV4, ETHERTYPE_IPV6, IPPROTO_UDP};
 use crate::capture::nbns::encode_name;
 use crate::capture::ndp::IPPROTO_ICMPV6;
@@ -54,7 +55,133 @@ pub fn all() -> Vec<(&'static str, Vec<u8>)> {
         ("nbns_registration", nbns_registration()),
         ("nbns_query", nbns_query()),
         ("nbns_datagram", nbns_datagram()),
+        ("mdns_sleep_proxy", mdns_sleep_proxy()),
     ]
+}
+
+// ------------------------------------------------------------------- mDNS ---
+
+/// The IPv4 mDNS group address.
+const MDNS_GROUP_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
+/// The Ethernet destination for the IPv4 mDNS group.
+const MDNS_GROUP_MAC: [u8; 6] = [0x01, 0x00, 0x5e, 0x00, 0x00, 0xfb];
+/// The mDNS port, for both source and destination.
+const MDNS_PORT: u16 = 5353;
+
+/// Encodes a DNS name as length-prefixed labels.
+///
+/// Labels are passed separately rather than as a dotted string because an mDNS
+/// instance name legitimately contains dots, spaces and apostrophes, and
+/// splitting `Jeremy's iMac._rfb._tcp.local` on `.` gets it wrong.
+#[must_use]
+pub fn dns_name(labels: &[&str]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for label in labels {
+        out.push(u8::try_from(label.len()).expect("a fixture label fits in a byte"));
+        out.extend_from_slice(label.as_bytes());
+    }
+    out.push(0);
+    out
+}
+
+/// Builds an mDNS response frame carrying the given answer records.
+///
+/// No name compression: every name is written out in full. Compression is
+/// exercised by the hand-assembled `mdns_response_ipv4` fixture, and leaving it
+/// out here keeps the offsets independent of the record order.
+#[must_use]
+pub fn mdns_response(
+    src_mac: [u8; 6],
+    src_ip: Ipv4Addr,
+    answers: &[(Vec<&str>, u16, Vec<u8>)],
+) -> Vec<u8> {
+    let mut msg = vec![0x00, 0x00, 0x84, 0x00]; // response, authoritative
+    msg.extend_from_slice(&0u16.to_be_bytes()); // questions
+    msg.extend_from_slice(
+        &u16::try_from(answers.len())
+            .expect("a fixture has few records")
+            .to_be_bytes(),
+    );
+    msg.extend_from_slice(&0u16.to_be_bytes()); // authority
+    msg.extend_from_slice(&0u16.to_be_bytes()); // additional
+    for (name, rtype, rdata) in answers {
+        msg.extend_from_slice(&dns_name(name));
+        msg.extend_from_slice(&rtype.to_be_bytes());
+        // Cache-flush bit set, as a real responder sets it on records it is
+        // authoritative for.
+        msg.extend_from_slice(&0x8001u16.to_be_bytes());
+        msg.extend_from_slice(&120u32.to_be_bytes());
+        msg.extend_from_slice(
+            &u16::try_from(rdata.len())
+                .expect("fixture rdata fits")
+                .to_be_bytes(),
+        );
+        msg.extend_from_slice(rdata);
+    }
+    let datagram = udp(MDNS_PORT, MDNS_PORT, &msg);
+    let packet = ipv4(src_ip, MDNS_GROUP_V4, IPPROTO_UDP, &datagram);
+    ethernet(MDNS_GROUP_MAC, src_mac, ETHERTYPE_IPV4, &packet)
+}
+
+/// SRV rdata pointing at a target host, with the fixed fields zeroed except the
+/// port.
+#[must_use]
+fn srv_rdata(port: u16, target: &[&str]) -> Vec<u8> {
+    let mut rdata = vec![0x00, 0x00, 0x00, 0x00]; // priority, weight
+    rdata.extend_from_slice(&port.to_be_bytes());
+    rdata.extend_from_slice(&dns_name(target));
+    rdata
+}
+
+/// **A Bonjour Sleep Proxy answering for two sleeping Macs as well as itself.**
+///
+/// This is the shape that broke identity attribution on a real network on
+/// 2026-09-17: one phone's frames carried the names of six other hosts, and the
+/// walker handed all of them to the phone. Three hosts are named here, each with
+/// an SRV record reaching an A record that gives it an address:
+///
+/// | Host | Address | Whose |
+/// |---|---|---|
+/// | `Jeremy's iPhone` | 192.168.1.40 | the sender's own |
+/// | `Jeremy's iMac` | 192.168.1.60 | asleep, proxied |
+/// | `Ospiti` | 192.168.1.61 | asleep, proxied |
+///
+/// The frame is sourced from 192.168.1.40, so exactly one of the three names is
+/// the sender's and the correct reading of the other two is that they are
+/// evidence about whoever holds .60 and .61.
+#[must_use]
+pub fn mdns_sleep_proxy() -> Vec<u8> {
+    let iphone = vec!["Jeremy's iPhone", "_companion-link", "_tcp", "local"];
+    let imac = vec!["Jeremy's iMac", "_rfb", "_tcp", "local"];
+    let ospiti = vec!["Ospiti", "_smb", "_tcp", "local"];
+    mdns_response(
+        PHONE,
+        Ipv4Addr::new(192, 168, 1, 40),
+        &[
+            (
+                iphone,
+                TYPE_SRV,
+                srv_rdata(62078, &["jeremys-iphone", "local"]),
+            ),
+            (
+                vec!["jeremys-iphone", "local"],
+                TYPE_A,
+                Ipv4Addr::new(192, 168, 1, 40).octets().to_vec(),
+            ),
+            (imac, TYPE_SRV, srv_rdata(5900, &["jeremys-imac", "local"])),
+            (
+                vec!["jeremys-imac", "local"],
+                TYPE_A,
+                Ipv4Addr::new(192, 168, 1, 60).octets().to_vec(),
+            ),
+            (ospiti, TYPE_SRV, srv_rdata(445, &["ospiti", "local"])),
+            (
+                vec!["ospiti", "local"],
+                TYPE_A,
+                Ipv4Addr::new(192, 168, 1, 61).octets().to_vec(),
+            ),
+        ],
+    )
 }
 
 // ---------------------------------------------------------------- framing ---

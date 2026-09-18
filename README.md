@@ -483,6 +483,46 @@ picks the highest-weighted one available:
 | vendor plus device type | 0.3 | the IEEE registry plus the classifier |
 | bare MAC | 0.1 | always available |
 
+### Whose name is it
+
+A name arriving in an mDNS response is evidence about **whoever holds the
+address the record names**, not about whoever transmitted the frame. The two are
+routinely different: a Bonjour Sleep Proxy answers on behalf of machines that are
+asleep, so one phone's frames carry the names and services of every host it is
+covering. Reading them as the phone's gave one iPhone six other machines' names
+on a real network, and made one name the answer for six different MACs.
+
+So each name is resolved to an address before it is attributed. An A or AAAA
+record names its address directly; an instance name reaches one through its SRV
+target. Then:
+
+- the address is the sender's, whether from ARP, from DHCP or from the frame's
+  own source address, and the name is the sender's;
+- the address belongs to another known device, and the name is *that* device's,
+  which is how a sleep proxy's answer ends up naming the sleeper;
+- the address belongs to nobody known, and the name is kept as a count rather
+  than guessed at. `netgraspd stats` reports the running total.
+
+A record the message tied to no address at all still falls back to the sender,
+because announcing a service without repeating your own address record is
+ordinary and nothing contradicts it. The exception is a frame that has already
+proved it answers for somebody else, which forfeits that assumption for all of
+its unqualified records.
+
+### Renaming, and why it waits
+
+A name that wins on **rank** is adopted immediately: mDNS arriving on a device
+known only by its vendor is a straight promotion.
+
+A name of **equal** rank is held for five minutes before it is adopted. Two mDNS
+names of the same weight take turns winning the scorer's same-kind tie-break as
+consecutive frames reorder the signal list, and adopting each turn produced 385
+`name_updated` events in thirty minutes on a real network. A candidate that
+loses even once starts the clock again, so an alternating pair never settles and
+never emits. A device somebody genuinely renamed settles once and emits one
+event. Nothing is lost by waiting: the name is stored as a signal the moment it
+arrives, and only the display identity and its event are held back.
+
 The SSDP friendly name deserves its footnote. The UPnP `friendlyName` lives in
 the device description XML at the `LOCATION` URL, and fetching it means an HTTP
 GET **to the monitored device**. That is not passive, so it does not happen.
@@ -583,6 +623,17 @@ most *distinct* MACs ARP for is the gateway. Once known, it is not given up to
 evidence that is no stronger, which is what stops an attacker forging one ARP
 reply to become the gateway and silence the detector that was watching for
 exactly that.
+
+**Proxy ARP by the gateway is not an attack**, and `security.proxy_arp_gateway`
+(on by default) says so. A router that routes between VLANs answers ARP for the
+far side with its own hardware address, which makes the same address appear at
+the router's MAC and at its real owner's. On one real network that accounted for
+every single `ip_conflict` and `arp_spoof` alert, across several VLANs. Those
+replies are now ignored by both analyzers and the router is never recorded as
+holding the address, so the real owner stays the holder and a genuine spoof of
+it is still caught. The exemption needs all three of: a reply, from the learned
+gateway MAC, for an address that is not the gateway's own. A stranger claiming
+the gateway's address is not the gateway and still alerts immediately.
 
 ## What has and has not been exercised
 

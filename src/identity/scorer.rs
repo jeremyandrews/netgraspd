@@ -109,21 +109,80 @@ fn first_usable(signals: &[Signal], kind: SignalKind) -> Option<&str> {
         .find(|v| !v.is_empty())
 }
 
+/// How a candidate identity compares with the one a device already has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Nothing changed.
+    Same,
+    /// The candidate wins on rank, so it is adopted at once.
+    Better,
+    /// The candidate is a different name of exactly the same rank.
+    ///
+    /// **This is the flapping case and it is not adopted at once.** Two mDNS
+    /// names of equal weight take turns winning the same-kind tie-break as
+    /// consecutive frames reorder the signal list, and adopting each turn
+    /// produced 385 `name_updated` events in thirty minutes on a real network.
+    /// See [`settled`].
+    Rival,
+    /// The candidate is worse and is ignored.
+    Worse,
+}
+
+/// Compares a candidate identity with the current one.
+///
+/// Rank is the whole of the comparison, and rank alone can promote a name
+/// immediately: a device that was `Apple, Inc. device` and has just announced
+/// over mDNS should be renamed on the spot. An equal-rank rival is a different
+/// question, answered by [`settled`] rather than here.
+#[must_use]
+pub fn compare(candidate: &Identity, current: &Identity) -> Verdict {
+    if candidate.confidence > current.confidence {
+        Verdict::Better
+    } else if candidate.confidence < current.confidence {
+        Verdict::Worse
+    } else if candidate.display_name == current.display_name {
+        Verdict::Same
+    } else {
+        Verdict::Rival
+    }
+}
+
+/// How long an equal-rank rival must stay the winner before it is adopted.
+///
+/// Five minutes. The number is a compromise between the two ways of being
+/// wrong. Shorter, and a pair of alternating mDNS names still gets through:
+/// responders re-announce on the order of a minute, so a window under a couple
+/// of announcement intervals does not prove anything settled. Longer, and a
+/// person who genuinely renames their laptop waits too long to see it. Nothing
+/// is lost by waiting either way, because the name itself is already stored as a
+/// signal the moment it arrives; only the display identity and its event are
+/// held back.
+///
+/// A rival that wins on *rank* is never delayed by this.
+pub const SETTLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Whether an equal-rank rival has been the winner for long enough to adopt.
+///
+/// `since` is when this same rival first won. A rival that loses even once
+/// resets it, so alternating candidates never settle and never produce an event.
+#[must_use]
+pub fn settled(since: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::Utc>) -> bool {
+    now.signed_duration_since(since)
+        .to_std()
+        .is_ok_and(|elapsed| elapsed >= SETTLE_WINDOW)
+}
+
 /// True when `candidate` is a strictly better identity than `current`.
 ///
-/// Used by the device manager to decide whether a newly arrived signal is worth
-/// a `name_updated` event. Equal-confidence changes count as improvements only
-/// when the text actually differs, which is what lets a renamed device emit an
-/// event without a rescoring storm.
+/// Kept as the rank-only question, which is what callers outside the device
+/// manager mean when they ask. The manager itself uses [`compare`] and
+/// [`settled`], because it is the only caller that can hold a rival pending.
 #[must_use]
 pub fn improves_on(candidate: &Identity, current: &Identity) -> bool {
-    if candidate.confidence > current.confidence {
-        true
-    } else if candidate.confidence < current.confidence {
-        false
-    } else {
-        candidate.display_name != current.display_name
-    }
+    matches!(
+        compare(candidate, current),
+        Verdict::Better | Verdict::Rival
+    )
 }
 
 #[cfg(test)]
