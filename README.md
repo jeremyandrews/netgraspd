@@ -158,9 +158,11 @@ privilege on. Where the plugin creates the tables as one role and the daemon
 connects as another, asking `information_schema` is asking a different question
 and getting a confidently wrong answer to it.
 
-So the order is: **run `netgraspd` once against an empty database, then point
-the plugin at it.** `docker-compose.yml` encodes that as a one-shot `migrate`
-service everything else depends on.
+So the order is: **migrate with `netgraspd` against an empty database, then
+point the plugin at it.** `netgraspd migrate` is the command for it; starting
+the daemon does the same thing on its way up. `docker-compose.yml` runs
+`migrate` as a one-shot service everything else waits on, which is what makes
+the ordering a fact rather than a hope.
 
 Who owns which column:
 
@@ -226,6 +228,7 @@ netgraspd events --limit 50        # recent events
 netgraspd events --security        # ...only what the analyzers found
 netgraspd people                   # who is home, and where
 netgraspd stats                    # is this installation healthy
+netgraspd migrate                  # apply pending migrations, check, exit
 netgraspd maintain                 # run the nightly jobs now
 netgraspd maintain --dry-run       # ...and report what they would do
 netgraspd update-fingerprints URL  # refresh the DHCP fingerprint table

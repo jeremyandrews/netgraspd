@@ -14,6 +14,11 @@
 //! empty, under-migrated or built by the Trovato plugin answers with whatever
 //! Postgres says: `relation "ng_location_history" does not exist` names a table
 //! the operator has never heard of and suggests nothing to do about it.
+//!
+//! `migrate` is the one exception, and it exists because of that rule rather
+//! than in spite of it. Something has to apply the schema before the daemon or
+//! the plugin touches the database, and until 0.4.1 the only thing that did was
+//! `run`, as a side effect of starting up.
 
 pub mod table;
 
@@ -65,6 +70,8 @@ pub enum Command {
     People,
     /// Report whether this installation is healthy, then exit.
     Stats,
+    /// Apply any pending migrations, check the schema, and exit.
+    Migrate,
     /// Run the nightly rollup, prune and vacuum now.
     Maintain(MaintainArgs),
     /// Download a fresh DHCP fingerprint table.
@@ -287,6 +294,48 @@ pub async fn people(config: &Config) -> Result<()> {
         return Ok(());
     }
     print!("{}", table::people_table(&rows, Utc::now()));
+    Ok(())
+}
+
+/// Applies pending migrations, verifies the schema, and exits.
+///
+/// **This is what a deployment runs before anything else touches the
+/// database.** The daemon owns the schema: if the Trovato plugin creates the
+/// `ng_` tables first, the daemon refuses to start, because adopting tables
+/// whose types nobody checked is worse than stopping. Making that ordering a
+/// fact rather than a hope needs a command whose whole job is to migrate.
+///
+/// Until 0.4.1 there was no such command and `docker-compose.yml` used
+/// `maintain --dry-run` in its place, on the strength of a comment claiming it
+/// migrated. It does not: like every other read-only command it calls
+/// [`Db::require_schema`], which *refuses* an under-migrated database rather
+/// than fixing one. On an empty database it therefore exited 1, the one-shot
+/// migrate service never completed, and every service waiting on it waited
+/// forever. It only ever looked like it worked because `run` migrates on
+/// startup, so a stack that got as far as starting the daemon was migrated by
+/// the daemon.
+///
+/// Exits zero when the schema is in place, whether or not it had to do
+/// anything: applying no migrations to an already-current database is success,
+/// which is what makes the command safe to run on every boot.
+///
+/// # Errors
+///
+/// Returns an error when the database is unreachable, when the plugin built the
+/// tables first, when a migration fails, or when the resulting schema diverges
+/// from the columns this build expects.
+pub async fn migrate(config: &Config) -> Result<()> {
+    // Same order as `daemon::run`, and for the same reasons: migrate on a
+    // direct connection, then check out a pooled one and hold the result to the
+    // column-level contract the plugin shares.
+    Db::migrate(&config.database.url).await?;
+    let db = Db::connect(&config.database)?;
+    db.health_check().await?;
+    db.preflight().await?;
+    println!(
+        "Schema is at migration version {} and matches this build.",
+        crate::db::embedded_max_version()
+    );
     Ok(())
 }
 
