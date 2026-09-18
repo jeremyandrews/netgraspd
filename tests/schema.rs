@@ -589,7 +589,57 @@ async fn a_read_command_against_a_diverged_schema_names_the_table_not_the_relati
 }
 
 #[tokio::test]
-async fn a_read_command_against_an_empty_database_says_to_run_the_daemon_first() {
+async fn migrate_builds_the_schema_on_an_empty_database_and_maintain_does_not() {
+    // The compose `migrate` service ran `maintain --dry-run` and a comment said
+    // it migrated. It does not: like every read-only command it calls
+    // `require_schema`, which refuses an under-migrated database rather than
+    // fixing one. On a fresh install it exited 1, the one-shot service never
+    // completed, and everything that waited on it waited forever. The whole
+    // stack only ever worked because `run` migrates on its way up.
+    //
+    // Both halves are asserted together, because the fix is only a fix if the
+    // command the compose file now runs is the one that succeeds.
+    let Some(db) = common::test_db().await else {
+        return;
+    };
+    db.execute(
+        "DROP TABLE IF EXISTS ng_people, ng_location_history, ng_ip_history, ng_events,
+                              ng_presence, ng_device_signals, ng_devices,
+                              refinery_schema_history CASCADE",
+    )
+    .await;
+
+    let err = netgraspd::cli::maintain(
+        &test_config(),
+        &netgraspd::cli::MaintainArgs { dry_run: true },
+    )
+    .await
+    .expect_err("maintain --dry-run must refuse an empty database, not migrate it");
+    assert!(format!("{err:#}").contains("no netgrasp schema"), "{err:#}");
+
+    netgraspd::cli::migrate(&test_config())
+        .await
+        .expect("migrate must build the schema on an empty database");
+
+    // Idempotent: this is a one-shot service that runs on every boot.
+    netgraspd::cli::migrate(&test_config())
+        .await
+        .expect("migrate must succeed against an already-current database");
+
+    // And the command that used to stand in for it now works, which is the
+    // proof that the schema really is in place rather than merely claimed.
+    netgraspd::cli::maintain(
+        &test_config(),
+        &netgraspd::cli::MaintainArgs { dry_run: true },
+    )
+    .await
+    .expect("maintain --dry-run must succeed once the schema exists");
+
+    common::rebuild_schema(&db).await;
+}
+
+#[tokio::test]
+async fn a_read_command_against_an_empty_database_names_the_command_that_fixes_it() {
     let Some(db) = common::test_db().await else {
         return;
     };
@@ -605,7 +655,10 @@ async fn a_read_command_against_an_empty_database_says_to_run_the_daemon_first()
         .expect_err("an empty database must be refused");
     let text = format!("{err:#}");
     assert!(text.contains("no netgrasp schema"), "{text}");
-    assert!(text.contains("netgraspd run"), "{text}");
+    // The advice must name a command whose whole job is to fix this. It used to
+    // say `netgraspd run`, which meant "start the daemon and hope", and which
+    // was the only migrating command there was until 0.4.1.
+    assert!(text.contains("netgraspd migrate"), "{text}");
     assert!(!text.contains("does not exist"), "{text}");
     println!("--- operator sees ---\n{text}\n---");
 

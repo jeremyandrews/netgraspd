@@ -6,6 +6,22 @@
 //!
 //! There is no rate limiting here. Debounce, batching and quiet hours are the
 //! dispatcher's job; see the module documentation in `notify/mod.rs` for why.
+//!
+//! ## Why the title is encoded and the body is not
+//!
+//! The **body** is the HTTP request body, sent as UTF-8 and read as UTF-8.
+//! Nothing needs doing to it.
+//!
+//! The **title** is an HTTP header, and a header is not a place where UTF-8
+//! means UTF-8. A name like `Jeremy's iPhone`, whose apostrophe is the U+2019
+//! that macOS substitutes, arrived on the phone as `Jeremyâs`: the two
+//! continuation bytes of the three-byte sequence were each read as a separate
+//! Latin-1 character. ntfy documents RFC 2047 encoded words as the way to put
+//! non-ASCII in one, so that is what goes on the wire.
+//!
+//! Pure ASCII is left exactly as it was. Encoding everything would work, but it
+//! would make every header unreadable in a packet capture and in ntfy's own
+//! logs for the sake of the minority of titles that need it.
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -65,13 +81,18 @@ impl NtfyNotifier {
     }
 
     /// Posts one message.
+    ///
+    /// Every header carrying free text goes through [`encode_header`]. The
+    /// title is the one that needed it, but tags are configurable emoji
+    /// shortcodes and a self-hosted ntfy accepts any string, so encoding both
+    /// costs nothing and removes the question. `X-Priority` is a number.
     async fn post(&self, title: &str, body: &str, tags: &str, priority: u8) -> Result<()> {
         let mut request = self
             .client
             .post(&self.url)
-            .header("X-Title", title)
+            .header("X-Title", encode_header(title))
             .header("X-Priority", priority.to_string())
-            .header("X-Tags", tags)
+            .header("X-Tags", encode_header(tags))
             .body(body.to_string());
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
@@ -131,6 +152,98 @@ impl Notifier for NtfyNotifier {
     fn supports_priority(&self) -> bool {
         true
     }
+}
+
+/// The longest an RFC 2047 encoded word may be, including its delimiters.
+const MAX_ENCODED_WORD: usize = 75;
+
+/// The fixed cost of one encoded word: `=?UTF-8?B?` and the closing `?=`.
+const ENCODED_WORD_OVERHEAD: usize = 12;
+
+/// How many bytes of input one encoded word can carry.
+///
+/// Base64 emits four characters per three input bytes and only in whole groups,
+/// so the budget is rounded down to a multiple of three. 45 bytes in, 60
+/// characters out, 72 with the delimiters, inside the 75 the RFC allows.
+const MAX_CHUNK: usize = ((MAX_ENCODED_WORD - ENCODED_WORD_OVERHEAD) / 4) * 3;
+
+/// Encodes a header value as RFC 2047 encoded words when it is not plain ASCII.
+///
+/// ASCII is returned untouched, so `New device: Aurora's iPad` stays readable on
+/// the wire. Anything else is base64 in UTF-8 encoded words, which is what ntfy
+/// documents for non-ASCII headers and what every mail-derived header parser has
+/// understood since 1996.
+///
+/// A value that already contains `=?` is encoded even when it is ASCII.
+/// Otherwise a device whose name happened to contain that sequence would be
+/// decoded as an encoded word by the receiver, and the one place device names
+/// come from is the network.
+///
+/// Long values become several encoded words separated by a space. RFC 2047
+/// requires the whitespace between adjacent encoded words to be dropped when
+/// they are decoded, so the value reassembles exactly.
+#[must_use]
+pub fn encode_header(value: &str) -> String {
+    if value.is_ascii() && !value.contains("=?") && !value.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return value.to_string();
+    }
+
+    let mut words: Vec<String> = Vec::new();
+    let mut rest = value;
+    while !rest.is_empty() {
+        // Never split a character in half: an encoded word holds whole UTF-8,
+        // and half a sequence decodes to a replacement character at best.
+        let mut take = MAX_CHUNK.min(rest.len());
+        while take > 0 && !rest.is_char_boundary(take) {
+            take -= 1;
+        }
+        // One character longer than the budget. Take it whole rather than
+        // looping forever on a chunk of zero.
+        if take == 0 {
+            take = rest
+                .char_indices()
+                .nth(1)
+                .map_or(rest.len(), |(index, _)| index);
+        }
+        let (chunk, remainder) = rest.split_at(take);
+        words.push(format!("=?UTF-8?B?{}?=", base64(chunk.as_bytes())));
+        rest = remainder;
+    }
+    words.join(" ")
+}
+
+/// Encodes bytes as standard-alphabet base64, with padding.
+///
+/// Hand-rolled, for the same reason `capture::ssdp::base64_text` decodes by
+/// hand: it is a dozen lines against a table, and a dependency for it would have
+/// to be justified to everybody who ever audits this tree. The two are
+/// deliberately not shared, because one belongs to a packet parser and the other
+/// to an HTTP client, and giving them a common home would couple them.
+fn base64(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for group in input.chunks(3) {
+        let b = [
+            group[0],
+            group.get(1).copied().unwrap_or(0),
+            group.get(2).copied().unwrap_or(0),
+        ];
+        let bits = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        let index = |shift: u32| usize::try_from((bits >> shift) & 0x3f).unwrap_or(0);
+        out.push(char::from(ALPHABET[index(18)]));
+        out.push(char::from(ALPHABET[index(12)]));
+        out.push(if group.len() > 1 {
+            char::from(ALPHABET[index(6)])
+        } else {
+            '='
+        });
+        out.push(if group.len() > 2 {
+            char::from(ALPHABET[index(0)])
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 /// Notification title for one event.
@@ -397,5 +510,144 @@ mod tests {
         let mut e = event(EventType::NewDevice);
         e.ip = None;
         assert!(summary_body(&[e]).contains("(no address)"));
+    }
+
+    /// Decodes an RFC 2047 encoded-word header back to the text it carries,
+    /// which is what a receiver does.
+    fn decode_header(value: &str) -> String {
+        value
+            .split(' ')
+            .map(|word| {
+                word.strip_prefix("=?UTF-8?B?")
+                    .and_then(|rest| rest.strip_suffix("?="))
+                    .map_or_else(
+                        || word.to_string(),
+                        |payload| {
+                            crate::capture::ssdp::base64_text(payload)
+                                .unwrap_or_else(|| panic!("{payload} should decode"))
+                        },
+                    )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_plain_ascii_title_is_left_exactly_as_it_was() {
+        // Encoding everything would work and would make every header
+        // unreadable in a packet capture for no gain.
+        let title = title_for(&event(EventType::NewDevice));
+        assert_eq!(title, "New device: Aurora's iPad");
+        assert_eq!(encode_header(&title), "New device: Aurora's iPad");
+    }
+
+    #[test]
+    fn the_curly_apostrophe_that_arrived_as_jeremy_a_s_survives() {
+        // The 2026-09-17 report, as a test. U+2019 is what macOS substitutes
+        // for a typed apostrophe, and its three bytes were being read one at a
+        // time as Latin-1.
+        let mut e = event(EventType::NewDevice);
+        e.display_name = "Jeremy\u{2019}s iPhone".into();
+        let encoded = encode_header(&title_for(&e));
+        assert!(
+            encoded.starts_with("=?UTF-8?B?"),
+            "a non-ASCII title must be an encoded word: {encoded}"
+        );
+        assert!(
+            !encoded.contains('\u{2019}'),
+            "no raw UTF-8 may reach the header: {encoded}"
+        );
+        assert_eq!(
+            decode_header(&encoded),
+            "New device: Jeremy\u{2019}s iPhone"
+        );
+    }
+
+    #[test]
+    fn an_accented_name_and_an_emoji_both_survive() {
+        for name in [
+            "Chambre d\u{2019}Aurore",
+            "Caffè",
+            "Ospiti 🏠",
+            "日本語のデバイス",
+        ] {
+            let mut e = event(EventType::PersonArrived);
+            e.display_name = name.into();
+            let title = title_for(&e);
+            let encoded = encode_header(&title);
+            assert!(encoded.is_ascii(), "{name} left non-ASCII bytes: {encoded}");
+            assert_eq!(decode_header(&encoded), title, "{name} did not round-trip");
+        }
+    }
+
+    #[test]
+    fn every_encoded_word_stays_inside_the_rfc_2047_length_limit() {
+        // A long device name must not become one enormous encoded word, which
+        // a strict parser is entitled to reject.
+        let mut e = event(EventType::NewDevice);
+        e.display_name = "Aurora\u{2019}s ".repeat(40);
+        let title = title_for(&e);
+        let encoded = encode_header(&title);
+        for word in encoded.split(' ') {
+            assert!(
+                word.len() <= MAX_ENCODED_WORD,
+                "{} chars is over the limit: {word}",
+                word.len()
+            );
+        }
+        assert!(encoded.split(' ').count() > 1, "it should have been split");
+        assert_eq!(decode_header(&encoded), title);
+    }
+
+    #[test]
+    fn a_character_is_never_split_across_two_encoded_words() {
+        // Each word must hold whole UTF-8. Half a sequence decodes to a
+        // replacement character, so a name whose multi-byte characters land on
+        // the chunk boundary is the case that catches it.
+        for count in 1..80usize {
+            let title = "é".repeat(count);
+            let encoded = encode_header(&title);
+            assert_eq!(decode_header(&encoded), title, "{count} characters");
+        }
+    }
+
+    #[test]
+    fn an_ascii_value_that_looks_like_an_encoded_word_is_encoded() {
+        // Device names come off the network, so one containing `=?` is
+        // somebody else's choice. Passing it through would have the receiver
+        // decode it as an encoded word.
+        let encoded = encode_header("=?UTF-8?B?bm90IG1pbmU=?=");
+        assert_eq!(decode_header(&encoded), "=?UTF-8?B?bm90IG1pbmU=?=");
+    }
+
+    #[test]
+    fn tags_are_encoded_on_the_same_rule_as_titles() {
+        // Every tag this build emits is an ASCII shortcode and must stay one.
+        for kind in EventType::ALL {
+            let tags = tags_for(kind);
+            assert_eq!(encode_header(tags), tags, "{kind} tags must pass through");
+        }
+    }
+
+    #[test]
+    fn base64_matches_the_decoder_this_repository_already_has() {
+        // The encoder is hand-rolled, so it is pinned against the hand-rolled
+        // decoder in the SSDP parser rather than against itself.
+        for text in ["", "a", "ab", "abc", "abcd", "Jeremy\u{2019}s iPhone", "🏠"] {
+            let encoded = base64(text.as_bytes());
+            if text.is_empty() {
+                assert_eq!(encoded, "");
+                continue;
+            }
+            assert_eq!(
+                crate::capture::ssdp::base64_text(&encoded).as_deref(),
+                Some(text),
+                "{text} did not round-trip through {encoded}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_value_encodes_to_nothing_rather_than_an_empty_word() {
+        assert_eq!(encode_header(""), "");
     }
 }

@@ -16,8 +16,9 @@ shipped rather than a release that was tagged at the time.
 ## [0.4.1] - 2026-09-18
 
 Four defects found in a live run on 2026-09-17, the first extended one on a
-real home network with VLANs. A patch rather than a minor because no milestone
-shipped: every entry is an existing feature that was wrong.
+real home network with VLANs, plus the fresh-install failure that run's
+deployment exposed. A patch rather than a minor because no milestone shipped:
+every entry is an existing feature that was wrong.
 
 ### Fixed
 
@@ -79,14 +80,67 @@ shipped: every entry is an existing feature that was wrong.
   router never becomes the recorded holder, a stranger taking a proxied address
   is still caught. Tests pin all three.
 
+- **Notification titles carrying an apostrophe or an accent are readable
+  again.** `X-Title` is an HTTP header, and a header is not a place where UTF-8
+  means UTF-8: the value was written as raw UTF-8 and read back as Latin-1, so
+  `Jeremy’s` arrived as `Jeremyâs`, each continuation byte of the three-byte
+  U+2019 sequence read as its own character. ntfy documents RFC 2047 encoded
+  words for non-ASCII headers, so a header value that is not plain ASCII is now
+  sent as `=?UTF-8?B?...?=`, split into several encoded words when it would
+  otherwise exceed the RFC's 75-character limit and never splitting a character
+  across two of them.
+
+  Pure ASCII is left exactly as it was, so an ordinary title stays readable in a
+  packet capture and in ntfy's own logs. A value that is ASCII but contains `=?`
+  is encoded anyway, because device names come off the network and one shaped
+  like an encoded word would otherwise be decoded as one. `X-Tags` goes through
+  the same function; `X-Priority` is a number. The body was never affected: it
+  is the request body, sent and read as UTF-8. ntfy is the only notification
+  backend in the tree.
+
+- **A fresh `docker compose up` no longer hangs on the `migrate` service.** The
+  compose file ran `netgraspd maintain --dry-run` as its one-shot migrate step,
+  on the strength of a comment saying that command "connects, migrates, runs the
+  schema preflight". It does not migrate. Like every other read-only command it
+  calls `Db::require_schema`, which *refuses* an under-migrated database rather
+  than building one, so on an empty database it exited 1, the migrate service
+  never completed, and both services that depend on it waited forever. The stack
+  only ever came up because `netgraspd run` migrates on startup, so anything
+  that got as far as the daemon had been migrated by the daemon.
+
+  There is now a `netgraspd migrate` subcommand that applies pending migrations,
+  runs the schema preflight, and exits zero whether or not it had anything to
+  apply, which is what makes it safe on every boot. The compose service runs it.
+  `maintain --dry-run` is left as what it always was.
+
+- **The compose `migrate` service was also pointed at an unreachable
+  database.** Found by actually running `docker compose up` on a fresh Postgres
+  rather than reasoning about it, and separate from the defect above: the
+  service was given `${DATABASE_URL}`, which says `localhost`. That is correct
+  only for the daemon, which is the one service using `network_mode: host`. The
+  migrate service is on the default bridge, where `localhost` is the container
+  itself, so it could not have connected on any platform even with the right
+  command. It now takes `${MIGRATE_DATABASE_URL}`, which reaches Postgres by
+  service name exactly as the optional `trovato` service already did, and
+  `.env.example` says why the two differ.
+
 ### Added
 
 - `security.proxy_arp_gateway`, default true, which is the switch for the rule
   above. Documented in `netgrasp.toml.example` and the README.
+- `netgraspd migrate`. The schema error an empty database produces now names it
+  rather than saying to start the daemon, which was advice that worked only as a
+  side effect.
 - `unattributed_names` and `proxy_arp_addresses` in the runtime status file, both
   `#[serde(default)]` so a file written by an older build still parses.
 - `mdns_sleep_proxy`, a built fixture: one source MAC carrying three hosts'
   records, two of them proxied. It is the 2026-09-17 shape reduced to one frame.
+
+### Changed
+
+- The compose file's note on ordering says plainly what it means: the daemon
+  migrates first and the plugin second, and running the plugin's migrations
+  first is still fatal to the daemon's V1.
 
 ### Notes
 
