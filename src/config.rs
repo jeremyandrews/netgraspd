@@ -367,6 +367,9 @@ pub struct StateConfig {
     pub flush_interval: HumanDuration,
     /// How often the sweep looks for devices that have timed out.
     pub sweep_interval: HumanDuration,
+    /// How often the user-owned columns are read back from Postgres, which is
+    /// what makes a change made in Trovato reach a running daemon.
+    pub reconcile_interval: HumanDuration,
     /// Per-device-type overrides, keyed by `device_type`.
     pub device_type_overrides: BTreeMap<String, TimeoutOverride>,
 }
@@ -393,6 +396,12 @@ impl Default for StateConfig {
             offline_timeout: HumanDuration::from_secs(180 * 60),
             flush_interval: HumanDuration::from_secs(60),
             sweep_interval: HumanDuration::from_secs(30),
+            // Ten seconds, because this is the latency of "I muted that device"
+            // and anything slower feels broken to somebody watching the page
+            // they just saved. The read costs well under a millisecond of server
+            // time for a couple of thousand devices, so the interval is set by
+            // what a person will wait rather than by what the database minds.
+            reconcile_interval: HumanDuration::from_secs(10),
             device_type_overrides: overrides,
         }
     }
@@ -1326,6 +1335,9 @@ impl Config {
         }
         if self.state.sweep_interval.as_secs() == 0 {
             bail!("state.sweep_interval must be at least 1s");
+        }
+        if self.state.reconcile_interval.as_secs() == 0 {
+            bail!("state.reconcile_interval must be at least 1s");
         }
         if self.learning.duration.as_secs() == 0 {
             bail!("learning.duration must be at least 1s");

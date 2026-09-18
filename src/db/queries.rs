@@ -5,7 +5,10 @@
 //! 1. **The daemon never writes `ng_devices.display_name`, `notes`, `hidden` or
 //!    `notify`.** Those four columns belong to the user, through the Trovato
 //!    admin UI, and every UPDATE in this file names its columns explicitly so
-//!    that a careless `SELECT *`-shaped write cannot clobber them.
+//!    that a careless `SELECT *`-shaped write cannot clobber them. It does
+//!    *read* them, and not only at startup: [`load_user_settings`] is what the
+//!    daemon's reconcile tick uses to notice a change made from the web without
+//!    being restarted.
 //! 2. **Every daemon write sets `sync_state = 'dirty'`.** That is the contract
 //!    stub the Trovato plugin's cron sweep consumes. Nothing here reads it.
 //!
@@ -270,6 +273,86 @@ pub async fn find_device_by_mac(client: &Client, mac: MacAddr) -> Result<Option<
         .await
         .context("device lookup failed")?;
     row.as_ref().map(DeviceRecord::from_row).transpose()
+}
+
+/// Every user-owned column of `ng_devices`, named once so the reconcile read
+/// and the guards over it cannot drift apart.
+///
+/// `trovato_item_id` is the plugin's own join key rather than something a person
+/// edits, so it is not here: nothing in the daemon reads it and the write guards
+/// name it separately.
+pub const USER_OWNED_DEVICE_COLUMNS: [&str; 5] =
+    ["display_name", "notes", "hidden", "notify", "owner_item_id"];
+
+/// The user-owned columns of one device, as the reconcile read returns them.
+///
+/// This is the whole of what a person can change from the Trovato admin UI or
+/// through the assistant. The daemon reads it and never writes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserSettings {
+    /// Hardware address, the join key with the in-memory table.
+    pub mac: MacAddr,
+    /// User-assigned name.
+    pub display_name: Option<String>,
+    /// Free text.
+    ///
+    /// Read for completeness and applied nowhere: nothing in the daemon has an
+    /// opinion about a note.
+    pub notes: Option<String>,
+    /// Hide the device from the web listings.
+    ///
+    /// Presentation only, and deliberately so. It hides a row in Trovato and
+    /// does nothing else: a hidden device is still captured, still recorded,
+    /// still produces presence and still alerts. `notify` is the flag that
+    /// silences alerts. Anything stronger would mean a checkbox labelled "hide"
+    /// quietly creating a blind spot in a security tool.
+    pub hidden: bool,
+    /// Whether this device is worth a notification.
+    pub notify: bool,
+    /// The person Item that owns this device, as UUID text.
+    pub owner_item_id: Option<String>,
+}
+
+/// The one statement that reads the user-owned columns back.
+///
+/// Held as a constant so that the test asserting it names no daemon-owned column
+/// inspects the statement itself rather than a copy of it. It is the mirror of
+/// [`UPDATE_DEVICE_SQL`]: that one may not write these columns, this one may not
+/// read any other.
+const LOAD_USER_SETTINGS_SQL: &str = "SELECT mac, display_name, notes, hidden, notify,
+                owner_item_id::text AS owner_item_id
+           FROM ng_devices";
+
+/// Loads the user-owned columns of every device.
+///
+/// Deliberately not [`load_devices`]: the reconcile tick must not re-read state,
+/// timestamps or identity, because the in-memory copies of those are newer than
+/// the database's between flushes and reading them back would walk the daemon's
+/// own state backwards.
+///
+/// # Errors
+///
+/// Returns an error when the query fails or a stored MAC is unparseable.
+pub async fn load_user_settings(client: &Client) -> Result<Vec<UserSettings>> {
+    let rows = client
+        .query(LOAD_USER_SETTINGS_SQL, &[])
+        .await
+        .context("loading user-owned device settings failed")?;
+    rows.iter()
+        .map(|row| {
+            let mac: String = row.try_get("mac")?;
+            Ok(UserSettings {
+                mac: mac
+                    .parse()
+                    .with_context(|| format!("ng_devices holds an unparseable MAC: {mac:?}"))?,
+                display_name: row.try_get("display_name")?,
+                notes: row.try_get("notes")?,
+                hidden: row.try_get("hidden")?,
+                notify: row.try_get("notify")?,
+                owner_item_id: row.try_get("owner_item_id")?,
+            })
+        })
+        .collect()
 }
 
 /// Creates a device, or returns the existing row's id if the MAC is already
@@ -1160,6 +1243,44 @@ mod tests {
         assert!(UPDATE_PERSON_SQL.contains("last_arrived_at"));
         assert!(UPDATE_PERSON_SQL.contains("last_departed_at"));
         assert!(UPDATE_PERSON_SQL.contains("current_location"));
+    }
+
+    #[test]
+    fn the_reconcile_read_reads_the_user_owned_columns_and_nothing_else() {
+        // The mirror of the write guards above. A daemon-owned column creeping
+        // into this statement would have the reconcile tick overwrite live
+        // in-memory state with whatever was last flushed, which is a device
+        // going quietly stale rather than an obvious failure.
+        for column in USER_OWNED_DEVICE_COLUMNS {
+            assert!(
+                LOAD_USER_SETTINGS_SQL.contains(column),
+                "the reconcile read is missing the user-owned column {column}"
+            );
+        }
+        for column in [
+            "state",
+            "last_seen_at",
+            "first_seen_at",
+            "resolved_name",
+            "identity_source",
+            "device_type",
+            "os_family",
+            "last_ip",
+            "current_ap",
+            "current_location",
+            "baseline",
+            "sync_state",
+        ] {
+            assert!(
+                !LOAD_USER_SETTINGS_SQL.contains(column),
+                "the reconcile read names the daemon-owned column {column}"
+            );
+        }
+        // And it reads. A statement that writes has no business here whatever
+        // it names.
+        for verb in ["UPDATE", "INSERT", "DELETE"] {
+            assert!(!LOAD_USER_SETTINGS_SQL.contains(verb), "{verb}");
+        }
     }
 
     #[test]

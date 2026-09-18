@@ -24,7 +24,7 @@ use serde_json::json;
 
 use crate::analyze::SecurityAlert;
 use crate::config::StateConfig;
-use crate::db::queries::DeviceRecord;
+use crate::db::queries::{DeviceRecord, UserSettings};
 use crate::identity::classify::{ALWAYS_ON_HOURS, Classification, ClassifyInput};
 use crate::identity::{self, Identity};
 use crate::types::{
@@ -406,6 +406,74 @@ impl Entry {
     }
 }
 
+/// One user-owned column the daemon keeps a copy of in memory, and how to fold
+/// the stored value into an entry.
+///
+/// A list rather than a hand-written block of assignments, for the same reason
+/// the plugin keeps a `USER_OWNED` list on its side: the merge then names every
+/// column it touches, and a column that is not on the list cannot be reached by
+/// accident. `apply` returns the old and new value when it changed something and
+/// `None` when it did not, which is what makes the tick quiet on the usual pass
+/// where nobody has edited anything.
+struct UserOwnedColumn {
+    /// The column's name in `ng_devices`.
+    name: &'static str,
+    /// Folds one column in, reporting a change as `(from, to)`.
+    apply: fn(&mut Entry, &UserSettings) -> Option<(String, String)>,
+}
+
+/// The user-owned columns the in-memory table holds.
+///
+/// The other three are elsewhere by design: `owner_item_id` belongs to the
+/// people registry, and `hidden` and `notes` have no daemon-side consumer at all
+/// (see [`UserSettings`]). `USER_OWNED_COLUMNS_NOT_STORED` below names those
+/// three so a test can assert the two lists together still account for every
+/// user-owned column.
+const USER_OWNED_COLUMNS: &[UserOwnedColumn] = &[
+    UserOwnedColumn {
+        name: "display_name",
+        apply: |entry, settings| {
+            if entry.display_name == settings.display_name {
+                return None;
+            }
+            let from = entry.display_name.clone().unwrap_or_default();
+            entry.display_name.clone_from(&settings.display_name);
+            Some((from, settings.display_name.clone().unwrap_or_default()))
+        },
+    },
+    UserOwnedColumn {
+        name: "notify",
+        apply: |entry, settings| {
+            if entry.notify == settings.notify {
+                return None;
+            }
+            let from = entry.notify;
+            entry.notify = settings.notify;
+            Some((from.to_string(), settings.notify.to_string()))
+        },
+    },
+];
+
+/// The user-owned columns the in-memory device table does not hold.
+///
+/// Only the drift guard reads it: its whole job is to fail when somebody adds a
+/// user-owned column and puts it in neither list.
+#[cfg(test)]
+const USER_OWNED_COLUMNS_NOT_STORED: [&str; 3] = ["notes", "hidden", "owner_item_id"];
+
+/// One user-owned value a reconcile changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserChange {
+    /// Which device.
+    pub mac: MacAddr,
+    /// Which column, named as `ng_devices` names it.
+    pub column: &'static str,
+    /// What the daemon held.
+    pub from: String,
+    /// What the database says.
+    pub to: String,
+}
+
 /// The MAC-keyed device table and the transitions over it.
 pub struct Manager {
     devices: HashMap<MacAddr, Entry>,
@@ -529,6 +597,59 @@ impl Manager {
                 },
             );
         }
+    }
+
+    /// Folds the user-owned columns back in, without disturbing anything else.
+    ///
+    /// [`restore`](Self::restore) reads them once at startup; this is how a
+    /// change made from the web or by the assistant reaches a running daemon.
+    /// Only the columns in `USER_OWNED_COLUMNS` are touched, and only in the
+    /// direction database to memory: state, timestamps, signals, identity and
+    /// location are the daemon's and the in-memory copy of them is newer than
+    /// the database's between flushes.
+    ///
+    /// A changed device is deliberately **not** marked dirty. Dirty means "the
+    /// daemon has something to write", and it has not: these columns are absent
+    /// from its update statement by design, so flushing them back would be a
+    /// round trip that writes nothing and a `sync_state = 'dirty'` the plugin's
+    /// cron sweep then has to pick up for no reason.
+    ///
+    /// A MAC in the database that the table has never seen is skipped rather
+    /// than inserted: discovery is the capture path's job, and a row the plugin
+    /// created for a device that has not been on the network yet has no state
+    /// machine to join.
+    #[must_use]
+    pub fn apply_user_settings(&mut self, settings: &[UserSettings]) -> Vec<UserChange> {
+        let mut changes = Vec::new();
+        for setting in settings {
+            let Some(entry) = self.devices.get_mut(&setting.mac) else {
+                continue;
+            };
+            for column in USER_OWNED_COLUMNS {
+                if let Some((from, to)) = (column.apply)(entry, setting) {
+                    changes.push(UserChange {
+                        mac: setting.mac,
+                        column: column.name,
+                        from,
+                        to,
+                    });
+                }
+            }
+        }
+        changes
+    }
+
+    /// One device's lifecycle state and last sighting, when it is known.
+    ///
+    /// Enough to seed the people registry for a device that has just acquired an
+    /// owner, and deliberately not a whole snapshot: the caller needs to know
+    /// whether the device is online and when it was last heard from, and
+    /// handing it anything more invites a second source of truth.
+    #[must_use]
+    pub fn state_of(&self, mac: MacAddr) -> Option<(DeviceState, DateTime<Utc>)> {
+        self.devices
+            .get(&mac)
+            .map(|entry| (entry.state, entry.last_seen_at))
     }
 
     /// Folds one observation into the table.
@@ -1603,6 +1724,142 @@ mod tests {
     }
 
     /// A device row as it would come back from Postgres.
+    fn settings(m: &str) -> UserSettings {
+        UserSettings {
+            mac: mac(m),
+            display_name: None,
+            notes: None,
+            hidden: false,
+            notify: true,
+            owner_item_id: None,
+        }
+    }
+
+    #[test]
+    fn the_two_column_lists_together_account_for_every_user_owned_column() {
+        // The drift guard. A new user-owned column added to ng_devices has to be
+        // either merged or consciously not merged, and this fails until it is
+        // one or the other.
+        let mut named: Vec<&str> = USER_OWNED_COLUMNS
+            .iter()
+            .map(|column| column.name)
+            .chain(USER_OWNED_COLUMNS_NOT_STORED)
+            .collect();
+        named.sort_unstable();
+        let mut expected: Vec<&str> = crate::db::queries::USER_OWNED_DEVICE_COLUMNS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(named, expected);
+    }
+
+    #[test]
+    fn a_reconcile_merges_the_user_owned_columns_and_touches_nothing_else() {
+        let mut m = Manager::new(config(), false);
+        m.restore(
+            vec![restored_record("3c:22:fb:00:00:01", DeviceState::Online)],
+            HashMap::new(),
+        );
+        // Give the device some daemon-owned state worth protecting.
+        let _ = m.observe(&obs_at("3c:22:fb:00:00:01", Some("192.168.1.40"), at(10)));
+        let before = m.snapshot()[0].clone();
+
+        let mut incoming = settings("3c:22:fb:00:00:01");
+        incoming.display_name = Some("Jamie's telly".into());
+        incoming.notify = false;
+        // Set by the plugin and merged elsewhere or nowhere; neither may leak
+        // into the device table.
+        incoming.hidden = true;
+        incoming.notes = Some("in the loft".into());
+        incoming.owner_item_id = Some("person-1".into());
+
+        let changes = m.apply_user_settings(&[incoming]);
+        let columns: Vec<&str> = changes.iter().map(|c| c.column).collect();
+        assert_eq!(columns, vec!["display_name", "notify"], "{changes:?}");
+
+        let after = m.snapshot()[0].clone();
+        assert_eq!(after.display_name.as_deref(), Some("Jamie's telly"));
+        assert_eq!(after.display(), "Jamie's telly");
+        // Everything the daemon owns is byte for byte what it was.
+        assert_eq!(after.state, before.state);
+        assert_eq!(after.last_ip, before.last_ip);
+        assert_eq!(after.last_seen_at, before.last_seen_at);
+        assert_eq!(after.first_seen_at, before.first_seen_at);
+        assert_eq!(after.identity, before.identity);
+        assert_eq!(after.device_type, before.device_type);
+        assert_eq!(after.current_ap, before.current_ap);
+        assert_eq!(after.baseline, before.baseline);
+        assert_eq!(
+            after.observations_since_flush,
+            before.observations_since_flush
+        );
+    }
+
+    #[test]
+    fn a_reconcile_that_changes_nothing_reports_nothing_and_leaves_the_row_clean() {
+        let mut m = Manager::new(config(), false);
+        m.restore(
+            vec![restored_record("3c:22:fb:00:00:01", DeviceState::Online)],
+            HashMap::new(),
+        );
+        // Drain the discovery flush so `take_dirty` below starts from nothing.
+        let _ = m.take_dirty();
+        assert!(
+            m.apply_user_settings(&[settings("3c:22:fb:00:00:01")])
+                .is_empty()
+        );
+        // A merge is not a reason to write: these columns are absent from the
+        // daemon's update statement, so a dirty row here would be a round trip
+        // that writes nothing and work for the plugin's cron sweep.
+        assert!(
+            m.take_dirty().is_empty(),
+            "a reconcile must not dirty a row"
+        );
+    }
+
+    #[test]
+    fn a_reconcile_ignores_a_mac_the_daemon_has_never_seen() {
+        let mut m = Manager::new(config(), false);
+        assert!(
+            m.apply_user_settings(&[settings("3c:22:fb:99:99:99")])
+                .is_empty()
+        );
+        assert_eq!(m.len(), 0, "discovery is the capture path's job");
+    }
+
+    #[test]
+    fn muting_a_device_while_running_silences_the_next_alert_without_a_restart() {
+        // The regression this whole change exists to prevent: 33 of 35 presence
+        // deliveries ignored a notify toggle set from the web because nothing
+        // re-read the column between restarts.
+        let mut m = Manager::new(config(), false);
+        m.restore(
+            vec![restored_record("3c:22:fb:00:00:01", DeviceState::Offline)],
+            HashMap::new(),
+        );
+        let mut muted = settings("3c:22:fb:00:00:01");
+        muted.notify = false;
+        assert_eq!(m.apply_user_settings(&[muted]).len(), 1);
+
+        let effects = m.observe(&obs_at("3c:22:fb:00:00:01", None, at(100)));
+        let ev = event(&effects, EventType::Returned);
+        assert!(!ev.deliverable(), "the mute must apply to the next event");
+        // And the record survives, which is the security-relevant half.
+        assert!(events(&effects).contains(&EventType::Returned));
+    }
+
+    #[test]
+    fn unmuting_a_device_while_running_lets_the_next_alert_through() {
+        let mut m = Manager::new(config(), false);
+        let mut record = restored_record("3c:22:fb:00:00:01", DeviceState::Offline);
+        record.notify = false;
+        m.restore(vec![record], HashMap::new());
+        let changes = m.apply_user_settings(&[settings("3c:22:fb:00:00:01")]);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].from, "false");
+        assert_eq!(changes[0].to, "true");
+        let effects = m.observe(&obs_at("3c:22:fb:00:00:01", None, at(100)));
+        assert!(event(&effects, EventType::Returned).deliverable());
+    }
+
     fn restored_record(m: &str, state: DeviceState) -> DeviceRecord {
         DeviceRecord {
             id: i64::from(mac(m).octets()[5]),

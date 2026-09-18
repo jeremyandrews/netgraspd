@@ -25,7 +25,12 @@ suite asserts it.
 
 ## Status
 
-Milestone 3, which closes v1. On top of milestones 1 and 2:
+Version 0.4.0: milestone 3, which closes v1, plus the reconcile tick that makes
+an edit in Trovato reach a running daemon. `CHANGELOG.md` has the history; the
+version is one minor per shipped milestone, so 0.1.0 was milestone 1 and a
+feature landing on top of milestone 3 is 0.4.0.
+
+On top of milestones 1 and 2:
 
 - **Enrichment.** A UniFi enricher that reads which access point each device is
   associated with, behind a trait so another controller can be added without
@@ -164,6 +169,22 @@ Who owns which column:
 | `ng_devices` | identity, state, addresses, location | `display_name`, `notes`, `hidden`, `notify`, `owner_item_id`, `trovato_item_id` |
 | `ng_people` | `state`, `current_location`, `last_arrived_at`, `last_departed_at` | `item_id`, `name`, `notes`, `notify_arrive`, `notify_depart` |
 | everything else | all of it | nothing |
+
+Ownership runs in both directions, on two different clocks. The daemon writes
+its columns as things happen and sets `sync_state = 'dirty'` for the plugin's
+cron sweep to collect. The plugin writes the user's columns whenever somebody
+saves a page, and the daemon reads them back every `state.reconcile_interval`
+(ten seconds by default), so renaming a device, muting it or assigning it to
+somebody takes effect on a running daemon rather than at the next restart. The
+read is one statement over `ng_devices` and one over `ng_people`, it names only
+the columns above, and it never writes.
+
+**What `hidden` does, exactly:** it hides the device from the Trovato listings
+and nothing else. A hidden device is still captured, still recorded, still
+produces presence sessions, and still notifies. `notify` is the flag that
+silences alerts. The two are separate on purpose: a checkbox labelled "hide"
+that also stopped alerts would be a blind spot in a security tool created by
+somebody tidying up a dashboard.
 
 Every `timestamptz` the plugin reads has a generated `bigint` twin named
 `<column>_epoch`, because the Trovato kernel's database host function decodes a
