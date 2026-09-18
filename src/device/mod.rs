@@ -249,6 +249,9 @@ struct Entry {
     /// the scorer breaks ties in.
     signals: Vec<Signal>,
     identity: Identity,
+    /// An equal-rank candidate waiting out the settle window, and when it first
+    /// won. See `rescore`.
+    pending_identity: Option<(Identity, DateTime<Utc>)>,
     classification: Classification,
     display_name: Option<String>,
     current_ap: Option<String>,
@@ -343,6 +346,26 @@ impl Entry {
         }
     }
 
+    /// True when this device is currently using the given address.
+    ///
+    /// Only the two current addresses count, not the whole history in
+    /// `ng_ip_history`. An address a device gave up last month is not evidence
+    /// about what it is called today.
+    fn holds(&self, address: IpAddr) -> bool {
+        let text = address.to_string();
+        self.last_ip.as_deref() == Some(text.as_str())
+            || self.last_ipv6.as_deref() == Some(text.as_str())
+    }
+
+    /// The addresses this device is currently known to be using.
+    fn current_addresses(&self) -> Vec<IpAddr> {
+        [self.last_ip.as_deref(), self.last_ipv6.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|text| text.parse().ok())
+            .collect()
+    }
+
     /// Most recently confirmed value of one signal kind.
     fn best(&self, kind: SignalKind) -> Option<String> {
         self.signals
@@ -391,17 +414,48 @@ impl Entry {
         any_new
     }
 
-    fn rescore(&mut self) -> Option<Identity> {
+    /// Recomputes the display identity, returning the previous one when it
+    /// actually changed.
+    ///
+    /// A candidate that wins on rank is adopted at once. A candidate of *equal*
+    /// rank is held pending until it has been the winner continuously for
+    /// [`identity::SETTLE_WINDOW`], because two equal-rank mDNS names take turns
+    /// winning the scorer's same-kind tie-break as consecutive frames reorder
+    /// the signal list. Adopting each turn is what produced 385 `name_updated`
+    /// events in thirty minutes; a rival that alternates never settles, and a
+    /// device somebody genuinely renamed settles once and emits one event.
+    fn rescore(&mut self, now: DateTime<Utc>) -> Option<Identity> {
         let candidate = identity::resolve(&identity::IdentityInput {
             mac: self.mac,
             signals: &self.signals,
             device_type: self.classification.device_type.as_deref(),
         });
-        if identity::improves_on(&candidate, &self.identity) {
-            let previous = std::mem::replace(&mut self.identity, candidate);
-            Some(previous)
-        } else {
-            None
+        match identity::compare(&candidate, &self.identity) {
+            identity::Verdict::Worse | identity::Verdict::Same => {
+                self.pending_identity = None;
+                None
+            }
+            identity::Verdict::Better => {
+                self.pending_identity = None;
+                Some(std::mem::replace(&mut self.identity, candidate))
+            }
+            identity::Verdict::Rival => {
+                // Only an unbroken run counts. A different rival, or the
+                // incumbent winning back even once, starts the clock again.
+                let since = match &self.pending_identity {
+                    Some((pending, since)) if pending.display_name == candidate.display_name => {
+                        *since
+                    }
+                    _ => now,
+                };
+                if identity::settled(since, now) {
+                    self.pending_identity = None;
+                    Some(std::mem::replace(&mut self.identity, candidate))
+                } else {
+                    self.pending_identity = Some((candidate, since));
+                    None
+                }
+            }
         }
     }
 }
@@ -474,13 +528,35 @@ pub struct UserChange {
     pub to: String,
 }
 
+/// What one observation's address-qualified evidence turned out to be about.
+#[derive(Debug, Default)]
+struct Attributed {
+    /// Evidence about the device that sent the frame.
+    mine: Vec<Signal>,
+    /// Evidence about some other device this daemon already knows, which is how
+    /// a sleep proxy's answer reaches the host it is covering.
+    others: Vec<(MacAddr, Signal)>,
+    /// Evidence naming an address no known device holds. Counted rather than
+    /// guessed at.
+    unattributed: u64,
+}
+
 /// The MAC-keyed device table and the transitions over it.
 pub struct Manager {
     devices: HashMap<MacAddr, Entry>,
+    /// Which device last held each address, so that naming evidence carrying an
+    /// address can be attributed to whoever holds it rather than to whoever
+    /// transmitted it. Built from ARP, DHCP and every other source that reveals
+    /// an address; see [`Manager::holder_of`].
+    addresses: HashMap<IpAddr, MacAddr>,
     config: StateConfig,
     learning: bool,
     /// Classification changes waiting to be handed to the analyzer chain.
     reclassifications: Vec<Reclassification>,
+    /// Naming evidence that named an address no known device holds, counted
+    /// rather than guessed at. Published in the runtime status so that an
+    /// operator can see a responder answering for hosts this daemon cannot see.
+    unattributed_claims: u64,
 }
 
 impl Manager {
@@ -489,10 +565,98 @@ impl Manager {
     pub fn new(config: StateConfig, learning: bool) -> Self {
         Manager {
             devices: HashMap::new(),
+            addresses: HashMap::new(),
             config,
             learning,
             reclassifications: Vec::new(),
+            unattributed_claims: 0,
         }
+    }
+
+    /// How much naming evidence has been kept as an observation rather than
+    /// turned into somebody's name.
+    #[must_use]
+    pub const fn unattributed_claims(&self) -> u64 {
+        self.unattributed_claims
+    }
+
+    /// Which device holds an address, when one does.
+    ///
+    /// The index can outlive the fact it records: a device that moves from one
+    /// address to another leaves the old entry pointing at it. So the answer is
+    /// confirmed against the device's own current addresses before it is
+    /// believed, which makes a stale entry harmless rather than wrong.
+    fn holder_of(&self, address: IpAddr) -> Option<MacAddr> {
+        let mac = *self.addresses.get(&address)?;
+        let entry = self.devices.get(&mac)?;
+        entry.holds(address).then_some(mac)
+    }
+
+    /// Works out whose name each piece of address-qualified evidence is.
+    ///
+    /// The rule, which exists because a Bonjour Sleep Proxy answering for six
+    /// sleeping Macs used to hand all six names to the phone that transmitted:
+    ///
+    /// 1. Evidence naming an address the sender holds is the sender's. The
+    ///    frame's own source address counts, which is what makes an ordinary
+    ///    self-announcement work before ARP has said anything.
+    /// 2. Evidence naming an address some *other* known device holds is that
+    ///    device's. A sleep proxy's answer is evidence about the sleeper, which
+    ///    is what it was always for.
+    /// 3. Evidence naming an address nobody known holds is kept as a count and
+    ///    becomes nobody's name.
+    /// 4. Evidence naming no address at all falls back to the sender, unless
+    ///    the same frame proved it was speaking for somebody else. A responder
+    ///    that has demonstrated it answers for other hosts has forfeited the
+    ///    assumption that its unqualified records are about itself.
+    fn attribute(&self, obs: &Observation) -> Attributed {
+        let mut out = Attributed::default();
+        if obs.claims.is_empty() {
+            return out;
+        }
+
+        let mut sender = self
+            .devices
+            .get(&obs.mac)
+            .map(Entry::current_addresses)
+            .unwrap_or_default();
+        if let Some(ip) = obs.ip
+            && !sender.contains(&ip)
+        {
+            sender.push(ip);
+        }
+        let speaks_for_others = obs
+            .claims
+            .iter()
+            .any(|claim| !claim.addresses.is_empty() && !claim.matches(&sender));
+
+        for claim in &obs.claims {
+            if claim.signal.value.trim().is_empty() {
+                continue;
+            }
+            if claim.addresses.is_empty() {
+                if speaks_for_others {
+                    out.unattributed += 1;
+                } else {
+                    out.mine.push(claim.signal.clone());
+                }
+                continue;
+            }
+            if claim.matches(&sender) {
+                out.mine.push(claim.signal.clone());
+                continue;
+            }
+            match claim
+                .addresses
+                .iter()
+                .find_map(|address| self.holder_of(*address))
+            {
+                Some(mac) if mac == obs.mac => out.mine.push(claim.signal.clone()),
+                Some(mac) => out.others.push((mac, claim.signal.clone())),
+                None => out.unattributed += 1,
+            }
+        }
+        out
     }
 
     /// Takes every classification change since the last call.
@@ -573,6 +737,15 @@ impl Manager {
             // would stop the next enrichment poll from opening a fresh stay
             // because the access point would compare equal.
             let placed = record.state != DeviceState::Offline;
+            // Seed the address index, so that naming evidence about a device
+            // that has not been heard from since the restart still reaches it.
+            for address in [record.last_ip.as_deref(), record.last_ipv6.as_deref()]
+                .into_iter()
+                .flatten()
+                .filter_map(|text| text.parse::<IpAddr>().ok())
+            {
+                self.addresses.insert(address, record.mac);
+            }
             self.devices.insert(
                 record.mac,
                 Entry {
@@ -585,6 +758,7 @@ impl Manager {
                     last_interface: record.last_interface,
                     signals: stored,
                     identity,
+                    pending_identity: None,
                     classification,
                     display_name: record.display_name,
                     current_ap: record.current_ap.filter(|_| placed),
@@ -669,6 +843,20 @@ impl Manager {
         if !known {
             effects.extend(self.discover(obs));
         }
+
+        // The address index, which `attribute` reads. Updated first so that the
+        // sender's current address is in it before anything asks.
+        if let Some(ip) = obs.ip
+            && is_recordable(ip)
+        {
+            self.addresses.insert(ip, obs.mac);
+        }
+
+        // Who each piece of address-qualified evidence is actually about. Worked
+        // out before the device table is borrowed mutably, because answering it
+        // means reading other devices' addresses as well as the sender's.
+        let attributed = self.attribute(obs);
+        self.unattributed_claims += attributed.unattributed;
 
         let learning = self.learning;
         let config = self.config.clone();
@@ -761,12 +949,18 @@ impl Manager {
 
         // Identity evidence. Recorded as one batch so that the order the source
         // listed them in survives; see `record_signals`.
-        let usable: Vec<Signal> = obs
+        //
+        // `signals` is evidence about the sender by virtue of having been sent.
+        // `claims` is evidence the frame tied to an address; `attributed` above
+        // has already worked out whose it is. The two are concatenated in that
+        // order so a sender's own evidence still leads the batch.
+        let mut usable: Vec<Signal> = obs
             .signals
             .iter()
             .filter(|s| !s.value.trim().is_empty())
             .cloned()
             .collect();
+        usable.extend(attributed.mine.iter().cloned());
         entry.record_signals(&usable);
         for signal in usable {
             effects.push(Effect::Signal {
@@ -775,7 +969,7 @@ impl Manager {
                 at,
             });
         }
-        if let Some(previous) = entry.rescore()
+        if let Some(previous) = entry.rescore(at)
             && !matches!(effects.first(), Some(Effect::Discovered(_)))
         {
             effects.push(Effect::Event(Box::new(DeviceEvent {
@@ -811,6 +1005,19 @@ impl Manager {
         });
         drop(config);
         self.reclassifications.extend(reclassified);
+
+        // Evidence this frame carried about somebody else. Applied after the
+        // sender's own entry is finished with, because it reaches into other
+        // entries; `add_signal` is the same path a reverse-DNS answer takes.
+        for (mac, signal) in attributed.others {
+            tracing::debug!(
+                responder = %obs.mac,
+                subject = %mac,
+                kind = signal.kind.as_str(),
+                "mDNS evidence attributed to the address holder, not the responder"
+            );
+            effects.extend(self.add_signal(mac, &signal, at));
+        }
         effects
     }
 
@@ -836,6 +1043,7 @@ impl Manager {
             last_interface: Some(obs.interface.clone()),
             signals,
             identity,
+            pending_identity: None,
             classification: Classification::default(),
             display_name: None,
             current_ap: None,
@@ -907,7 +1115,7 @@ impl Manager {
             signal: signal.clone(),
             at,
         }];
-        if is_new && let Some(previous) = entry.rescore() {
+        if is_new && let Some(previous) = entry.rescore(at) {
             effects.push(Effect::Event(Box::new(DeviceEvent {
                 event_type: EventType::NameUpdated,
                 mac,
@@ -1212,7 +1420,7 @@ fn is_recordable(ip: IpAddr) -> bool {
 mod tests {
     use super::*;
     use crate::config::{HumanDuration, StateConfig};
-    use crate::types::ObservationKind;
+    use crate::types::{NameClaim, ObservationKind};
     use chrono::TimeZone;
 
     fn base() -> DateTime<Utc> {
@@ -1266,6 +1474,249 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_else(|| panic!("expected a {kind} event in {effects:?}"))
+    }
+
+    /// An observation carrying mDNS-shaped claims.
+    fn claiming(
+        m: &str,
+        ip: Option<&str>,
+        when: DateTime<Utc>,
+        claims: Vec<NameClaim>,
+    ) -> Observation {
+        let mut obs = Observation::new(
+            mac(m),
+            ip.map(|s| s.parse().expect("test ip")),
+            "eth0",
+            "mdns",
+            ObservationKind::Announcement,
+            when,
+        );
+        obs.claims = claims;
+        obs
+    }
+
+    /// A name the message proved for one address.
+    fn named(value: &str, address: &str) -> NameClaim {
+        NameClaim {
+            signal: Signal::new(SignalKind::MdnsName, value),
+            addresses: vec![address.parse().expect("test address")],
+        }
+    }
+
+    fn display_of(m: &Manager, who: &str) -> String {
+        m.devices
+            .get(&mac(who))
+            .map(|e| e.snapshot().display())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_name_proved_for_the_senders_own_address_is_the_senders() {
+        let mut m = Manager::new(config(), false);
+        let _ = m.observe(&claiming(
+            "3c:22:fb:00:00:01",
+            Some("192.168.1.40"),
+            base(),
+            vec![named("Jeremy's iPhone", "192.168.1.40")],
+        ));
+        assert_eq!(display_of(&m, "3c:22:fb:00:00:01"), "Jeremy's iPhone");
+    }
+
+    #[test]
+    fn a_sleep_proxy_does_not_take_the_names_of_the_hosts_it_answers_for() {
+        // The 2026-09-17 defect. One responder, three hosts' records: the
+        // responder keeps exactly one name, and the two addresses nobody is
+        // known to hold produce no name at all.
+        let mut m = Manager::new(config(), false);
+        let effects = m.observe(&claiming(
+            "3c:22:fb:00:00:01",
+            Some("192.168.1.40"),
+            base(),
+            vec![
+                named("Jeremy's iPhone", "192.168.1.40"),
+                named("Jeremy's iMac", "192.168.1.60"),
+                named("Ospiti", "192.168.1.61"),
+            ],
+        ));
+        assert_eq!(display_of(&m, "3c:22:fb:00:00:01"), "Jeremy's iPhone");
+        assert_eq!(m.len(), 1, "answering for a host does not invent it");
+        assert_eq!(
+            m.unattributed_claims(),
+            2,
+            "the two sleepers' names are counted, not guessed at"
+        );
+        // And no signal was stored for them under the responder's MAC.
+        let stored: Vec<&str> = effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Signal { signal, .. } if signal.kind == SignalKind::MdnsName => {
+                    Some(signal.value.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stored, vec!["Jeremy's iPhone"]);
+    }
+
+    #[test]
+    fn a_sleep_proxy_answer_names_the_sleeping_host_when_it_is_known() {
+        // The other half of the rule: once ARP has said who holds .60, the
+        // proxy's answer is evidence about that device and reaches it.
+        let mut m = Manager::new(config(), false);
+        let _ = m.observe(&obs_at("00:11:32:aa:bb:cc", Some("192.168.1.60"), base()));
+        assert_eq!(
+            display_of(&m, "00:11:32:aa:bb:cc"),
+            "Synology Incorporated device",
+            "known only by its vendor so far"
+        );
+
+        let effects = m.observe(&claiming(
+            "3c:22:fb:00:00:01",
+            Some("192.168.1.40"),
+            at(10),
+            vec![
+                named("Jeremy's iPhone", "192.168.1.40"),
+                named("Jeremy's iMac", "192.168.1.60"),
+            ],
+        ));
+        assert_eq!(display_of(&m, "3c:22:fb:00:00:01"), "Jeremy's iPhone");
+        assert_eq!(
+            display_of(&m, "00:11:32:aa:bb:cc"),
+            "Jeremy's iMac",
+            "the sleeper is named by the answer given on its behalf"
+        );
+        let renamed = event(&effects, EventType::NameUpdated);
+        assert_eq!(
+            renamed.mac,
+            mac("00:11:32:aa:bb:cc"),
+            "the event is about the sleeper, not the responder"
+        );
+    }
+
+    #[test]
+    fn an_unaddressed_name_from_a_responder_speaking_for_others_is_not_its_own() {
+        // A frame that has proved it answers for somebody else has forfeited
+        // the assumption that its unqualified records are about itself.
+        let mut m = Manager::new(config(), false);
+        let mut claims = vec![named("Jeremy's iMac", "192.168.1.60")];
+        claims.push(NameClaim::unaddressed(Signal::new(
+            SignalKind::MdnsName,
+            "Some Other Name",
+        )));
+        let _ = m.observe(&claiming(
+            "3c:22:fb:00:00:01",
+            Some("192.168.1.40"),
+            base(),
+            claims,
+        ));
+        assert_eq!(
+            display_of(&m, "3c:22:fb:00:00:01"),
+            "Apple, Inc. device",
+            "neither name was proved to be the responder's"
+        );
+    }
+
+    #[test]
+    fn an_unaddressed_name_from_an_ordinary_announcement_is_the_senders() {
+        // The printer case: a service announcement that never repeats its own
+        // address record still names the device that sent it.
+        let mut m = Manager::new(config(), false);
+        let _ = m.observe(&claiming(
+            "3c:2a:f4:00:00:01",
+            Some("192.168.1.80"),
+            base(),
+            vec![NameClaim::unaddressed(Signal::new(
+                SignalKind::MdnsName,
+                "Office Printer",
+            ))],
+        ));
+        assert_eq!(display_of(&m, "3c:2a:f4:00:00:01"), "Office Printer");
+    }
+
+    #[test]
+    fn two_equal_rank_names_alternating_produce_no_name_updated_events() {
+        // The second half of the 2026-09-17 defect: 385 name_updated events in
+        // thirty minutes, from two equal-rank mDNS names taking turns winning
+        // the scorer's same-kind tie-break. Neither ever settles, so neither is
+        // ever adopted and nothing is emitted.
+        let mut m = Manager::new(config(), false);
+        let _ = m.observe(&claiming(
+            "3c:22:fb:00:00:01",
+            Some("192.168.1.40"),
+            base(),
+            vec![named("Jeremy's MacBook Pro", "192.168.1.40")],
+        ));
+        let first = display_of(&m, "3c:22:fb:00:00:01");
+
+        let mut renames = 0;
+        for round in 1..400i64 {
+            let name = if round % 2 == 0 {
+                "Jeremy's MacBook Pro"
+            } else {
+                "Jeremy's MacBook Pro (2)"
+            };
+            let effects = m.observe(&claiming(
+                "3c:22:fb:00:00:01",
+                Some("192.168.1.40"),
+                at(round * 5),
+                vec![named(name, "192.168.1.40")],
+            ));
+            renames += events(&effects)
+                .iter()
+                .filter(|e| **e == EventType::NameUpdated)
+                .count();
+        }
+        assert_eq!(renames, 0, "an alternating name never settles");
+        assert_eq!(
+            display_of(&m, "3c:22:fb:00:00:01"),
+            first,
+            "and the display name never moved"
+        );
+    }
+
+    #[test]
+    fn a_name_that_stays_won_for_the_settle_window_is_adopted_once() {
+        // The other side of the same rule: a device somebody genuinely renamed
+        // must still get its new name, and exactly one event for it.
+        let mut m = Manager::new(config(), false);
+        let _ = m.observe(&claiming(
+            "3c:22:fb:00:00:01",
+            Some("192.168.1.40"),
+            base(),
+            vec![named("Old Name", "192.168.1.40")],
+        ));
+
+        let mut renames = 0;
+        for round in 1..40i64 {
+            let effects = m.observe(&claiming(
+                "3c:22:fb:00:00:01",
+                Some("192.168.1.40"),
+                at(round * 30),
+                vec![named("New Name", "192.168.1.40")],
+            ));
+            renames += events(&effects)
+                .iter()
+                .filter(|e| **e == EventType::NameUpdated)
+                .count();
+        }
+        assert_eq!(renames, 1, "adopted once, when the window elapsed");
+        assert_eq!(display_of(&m, "3c:22:fb:00:00:01"), "New Name");
+    }
+
+    #[test]
+    fn a_higher_ranked_name_is_adopted_without_waiting() {
+        // The settle window is for equal-rank rivals only. mDNS arriving on a
+        // device known by its vendor is a promotion and happens at once.
+        let mut m = Manager::new(config(), false);
+        let _ = m.observe(&obs_at("3c:22:fb:00:00:01", Some("192.168.1.40"), base()));
+        let effects = m.observe(&claiming(
+            "3c:22:fb:00:00:01",
+            Some("192.168.1.40"),
+            at(1),
+            vec![named("Aurora's iPad", "192.168.1.40")],
+        ));
+        assert_eq!(events(&effects), vec![EventType::NameUpdated]);
+        assert_eq!(display_of(&m, "3c:22:fb:00:00:01"), "Aurora's iPad");
     }
 
     #[test]

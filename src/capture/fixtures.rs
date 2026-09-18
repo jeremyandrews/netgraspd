@@ -55,6 +55,13 @@ pub fn mdns_response_ipv4() -> Vec<u8> {
     include_bytes!("../../tests/fixtures/mdns_response_ipv4.bin").to_vec()
 }
 
+/// A Bonjour Sleep Proxy answering for two sleeping Macs as well as itself: one
+/// source MAC, three hosts' records. See `build::mdns_sleep_proxy`.
+#[must_use]
+pub fn mdns_sleep_proxy() -> Vec<u8> {
+    include_bytes!("../../tests/fixtures/mdns_sleep_proxy.bin").to_vec()
+}
+
 /// An mDNS response over IPv6 from a printer, carrying SRV and TXT records and
 /// no address record.
 #[must_use]
@@ -186,6 +193,7 @@ pub fn all() -> Vec<(&'static str, Vec<u8>)> {
         ("nbns_registration", nbns_registration()),
         ("nbns_query", nbns_query()),
         ("nbns_datagram", nbns_datagram()),
+        ("mdns_sleep_proxy", mdns_sleep_proxy()),
     ]
 }
 

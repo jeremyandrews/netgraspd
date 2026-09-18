@@ -149,6 +149,26 @@ enabled = true
 gateway_mac = ""
 gateway_ip = ""
 
+# Whether an ARP reply from the gateway for an address that is not its own is
+# read as proxy ARP rather than as an attack.
+#
+# A router that routes between VLANs answers ARP for the far side with its own
+# hardware address, as a matter of course. That makes the same address show up
+# at the router's MAC and at its real owner's, which is indistinguishable from
+# two devices fighting over it unless you know which MAC is the router. Left on,
+# ip_conflict and arp_spoof both ignore those replies and neither records the
+# router as holding the address.
+#
+# It exempts nothing else. A MAC that is not the gateway claiming the gateway's
+# address still alerts immediately, and a second MAC claiming an address the
+# gateway did not proxy still alerts. Turn this off only on a network whose
+# router is known not to proxy, where an answer from it for somebody else's
+# address really would be worth waking up for.
+#
+# `netgraspd stats` reports how many addresses the gateway has been seen
+# proxying for, so you can tell the feature is doing something.
+proxy_arp_gateway = true
+
 # MACs no analyzer ever alerts on. For the monitoring box that is meant to sweep
 # the network. Note this silences the analyzers only: the device is still
 # tracked and its arrivals and departures are still recorded.

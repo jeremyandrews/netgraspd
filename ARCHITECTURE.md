@@ -228,6 +228,43 @@ DLNA stacks send `FRIENDLYNAME.DLNA.ORG`. Those bytes are already on the wire. A
 device that volunteers nothing has no 0.5 signal and the scorer falls through, as
 designed.
 
+### Attribution, corrected after the 2026-09-17 run (0.4.1)
+
+The scorer was never the problem. What was wrong sat one layer earlier: the mDNS
+walker attributed every name in a message to the frame's source MAC, and that is
+only true when a responder speaks for itself. It routinely does not. A Bonjour
+Sleep Proxy answers address queries on behalf of machines that are asleep, a
+responder answers for several of its own hostnames at once, and a service
+response carries the additional records of whoever the service belongs to. The
+live run produced one iPhone holding six other hosts' names, and one name
+recorded against six different MACs.
+
+The corrected model separates two questions that had been one. **What does this
+record say** is the parser's, and it is answered without reference to the sender:
+each piece of evidence is resolved to the address the message gave it, directly
+for an A or AAAA record and through the SRV target for an instance name. **Whose
+address is that** is the device table's, because it is the only layer holding the
+ARP and DHCP evidence that answers it. The pair crosses the boundary as a
+`NameClaim` on the observation, and `Manager::attribute` resolves it.
+
+That makes a sleep proxy's answer evidence about the sleeping host rather than
+about the proxy, which is what it always was. Evidence naming an address no known
+device holds is counted rather than attributed, because the alternative is
+inventing a device or libelling one. Evidence naming no address at all still
+falls back to the sender, since a device announcing a service without repeating
+its own address record is ordinary; the exception is a frame that has already
+proved it speaks for somebody else, which forfeits the assumption for the rest of
+its unqualified records.
+
+The same run exposed a second, independent defect in the scorer's *adoption*
+rule rather than its ranking. `improves_on` treated any equal-confidence change
+of text as an improvement, and because each frame's signals are re-inserted at
+the front of the list, two equal-weight mDNS names take turns winning the
+same-kind tie-break. 385 `name_updated` events in thirty minutes. Rank still
+promotes immediately; an equal-rank rival must now hold the win for five minutes
+before it is adopted, and loses the accumulated time the moment it stops winning.
+Alternating candidates never settle, a genuine rename settles once.
+
 ### Classifying signals, added in milestone 2
 
 Seven signal kinds carry evidence about what a device *is* rather than what it is
@@ -369,6 +406,32 @@ Two rules stop this becoming an attack surface of its own:
   gateway. On a settled network everybody already has the gateway cached and it
   may never answer an ARP at all; requiring a prior claim would mean the one
   attack this analyzer exists for is the one it would miss.
+
+### Proxy ARP, added after the 2026-09-17 run (0.4.1)
+
+Knowing which device is the gateway turned out to matter for a third reason. A
+router that routes between VLANs answers ARP for the far side with its own
+hardware address, so an address is legitimately in use at the router's MAC *and*
+at its real owner's. `ip_conflict` measures exactly that co-presence and
+`arp_spoof` measures exactly that handover, so both fired on every segment. All
+34 alerts in the live run were this, and an analyzer that fires on ordinary
+traffic trains its operator to ignore it, which is the failure mode the whole
+chain is designed around.
+
+The exemption is deliberately narrow and is evaluated per packet rather than
+from a remembered set, so nothing an attacker sends can widen it later. It
+requires all three of: a **reply**, because a request claims the sender's own
+address; the learned gateway MAC as the **Ethernet source**, not the ARP sender
+field, which an attacker writes freely; and an address that is **not** the
+gateway's own, because the gateway answering for the gateway is the gateway and
+impersonating it is the attack.
+
+Both analyzers return before touching their state, which is the part that is
+easy to get wrong. Had the router been recorded as a user or holder of the
+proxied address, the real owner's next packet would have read as displacing it
+and alerted on the way past: the false positive would have moved rather than
+gone. Because the router never becomes the holder, a stranger taking a proxied
+address is still caught against the real owner.
 
 ## IPv6 addressing, revisited
 
