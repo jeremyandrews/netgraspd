@@ -24,7 +24,7 @@
 //!
 //! None of this transmits anything.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr};
 
 use crate::types::{ArpOp, MacAddr, Observation};
@@ -77,6 +77,13 @@ impl GatewaySource {
     }
 }
 
+/// How many proxied addresses are remembered for reporting.
+///
+/// Reporting only: the suppression decision is made from the packet in hand and
+/// never from this set, so a full set costs visibility and nothing else. A
+/// router proxying for two or three VLANs is well inside it.
+const MAX_PROXIED: usize = 256;
+
 /// What is currently believed about the gateway.
 #[derive(Debug)]
 pub struct GatewayTracker {
@@ -86,6 +93,11 @@ pub struct GatewayTracker {
     mac_source: GatewaySource,
     /// Distinct MACs that have asked about each candidate address.
     askers: HashMap<Ipv4Addr, Vec<MacAddr>>,
+    /// Whether proxy ARP by the gateway is treated as ordinary.
+    proxy_arp: bool,
+    /// Addresses the gateway has been seen answering for on somebody's behalf.
+    /// Kept for `netgraspd stats` and for the logs; see [`MAX_PROXIED`].
+    proxied: BTreeSet<Ipv4Addr>,
 }
 
 impl GatewayTracker {
@@ -106,7 +118,63 @@ impl GatewayTracker {
                 GatewaySource::Unknown
             },
             askers: HashMap::new(),
+            proxy_arp: true,
+            proxied: BTreeSet::new(),
         }
+    }
+
+    /// Sets whether proxy ARP by the gateway is treated as ordinary, builder
+    /// style. Defaults to true; `security.proxy_arp_gateway` is the switch.
+    #[must_use]
+    pub const fn with_proxy_arp(mut self, proxy_arp: bool) -> Self {
+        self.proxy_arp = proxy_arp;
+        self
+    }
+
+    /// Addresses the gateway has been seen proxy-ARPing for.
+    #[must_use]
+    pub fn proxied(&self) -> &BTreeSet<Ipv4Addr> {
+        &self.proxied
+    }
+
+    /// The address a frame is the gateway proxy-ARPing for, when it is one.
+    ///
+    /// **A router that proxy-ARPs answers for addresses that are not its own,
+    /// with its own hardware address.** On a segment routed across VLANs that is
+    /// how a host on one segment reaches a host on another, and it means the
+    /// same address is legitimately seen at the router's MAC and at its real
+    /// owner's. Reading that as two devices fighting over an address produced
+    /// every one of the 34 `ip_conflict` and `arp_spoof` alerts on a real
+    /// network on 2026-09-17.
+    ///
+    /// The three conditions are all necessary and none of them is negotiable:
+    ///
+    /// 1. **A reply.** A request carries the sender's own address and is a claim
+    ///    on it, not an answer on anybody's behalf.
+    /// 2. **From the learned gateway MAC.** Not from the ARP sender field, which
+    ///    an attacker writes; from the Ethernet source, which is who actually
+    ///    transmitted. A MAC that is not the gateway gets no exemption at all.
+    /// 3. **For an address that is not the gateway's own.** The gateway
+    ///    answering for the gateway address is the gateway, and an impersonation
+    ///    of it is exactly what `arp_spoof` must still catch.
+    ///
+    /// The decision is made from the packet every time rather than from
+    /// [`proxied`](Self::proxied), so nothing an attacker sends can widen it
+    /// later.
+    #[must_use]
+    pub fn proxy_arp_for(&self, observation: &Observation) -> Option<Ipv4Addr> {
+        if !self.proxy_arp {
+            return None;
+        }
+        let arp = observation.arp()?;
+        if arp.op != ArpOp::Reply {
+            return None;
+        }
+        if !self.is_gateway(observation.mac) {
+            return None;
+        }
+        let claimed = arp.sender_ip?;
+        (!self.is_gateway_ip(claimed)).then_some(claimed)
     }
 
     /// The gateway's address, when one is known.
@@ -181,6 +249,33 @@ impl GatewayTracker {
         {
             self.set_mac(observation.mac, self.ip_source);
         }
+
+        // Record proxy ARP, which the analyzers then decline to alert on. This
+        // runs after the two `set_mac` branches above, so a frame that is itself
+        // what identified the gateway is judged against that knowledge.
+        if let Some(proxied) = self.proxy_arp_for(observation) {
+            self.note_proxy_arp(proxied);
+        }
+    }
+
+    /// Remembers an address the gateway answered for on somebody else's behalf.
+    ///
+    /// Logged the first time each address is seen and never again: a router
+    /// proxying for a VLAN answers constantly, and a line per packet would be
+    /// its own kind of alert fatigue.
+    fn note_proxy_arp(&mut self, address: Ipv4Addr) {
+        if self.proxied.contains(&address) {
+            return;
+        }
+        if self.proxied.len() >= MAX_PROXIED {
+            return;
+        }
+        self.proxied.insert(address);
+        tracing::info!(
+            %address,
+            gateway = ?self.mac.map(|m| m.to_string()),
+            "the gateway is proxy-ARPing for this address; it is not an address conflict"
+        );
     }
 
     /// Records that a MAC asked about an address, promoting the address to
@@ -313,6 +408,104 @@ mod tests {
         frame[22..28].copy_from_slice(&source);
         frame[38..42].copy_from_slice(&target);
         arp::parse_frame(&frame, "eth0", when).expect("parsed")
+    }
+
+    /// An ARP reply from `from` claiming `claimed`.
+    fn reply(from: &str, claimed: [u8; 4], when: DateTime<Utc>) -> Observation {
+        let mut frame = fixtures::arp_reply();
+        let source = mac(from).octets();
+        frame[6..12].copy_from_slice(&source);
+        frame[22..28].copy_from_slice(&source);
+        frame[28..32].copy_from_slice(&claimed);
+        arp::parse_frame(&frame, "eth0", when).expect("parsed")
+    }
+
+    /// A tracker that already knows both halves of the gateway.
+    fn known() -> GatewayTracker {
+        GatewayTracker::new(
+            Some(Ipv4Addr::new(192, 168, 1, 1)),
+            Some(mac("18:fd:74:39:e5:23")),
+        )
+    }
+
+    #[test]
+    fn the_gateway_answering_for_another_segment_is_proxy_arp() {
+        // The 2026-09-17 shape: a Routerboard proxy-ARPing across VLANs. Two
+        // segments, two addresses that are not the gateway's own.
+        let mut tracker = known();
+        for claimed in [[192, 168, 20, 55], [192, 168, 30, 12]] {
+            let observation = reply("18:fd:74:39:e5:23", claimed, at(0));
+            assert!(
+                tracker.proxy_arp_for(&observation).is_some(),
+                "{claimed:?} is the gateway answering on somebody's behalf"
+            );
+            tracker.observe(&observation);
+        }
+        assert_eq!(
+            tracker.proxied().len(),
+            2,
+            "both proxied addresses are recorded for the operator to see"
+        );
+    }
+
+    #[test]
+    fn the_gateway_answering_for_itself_is_not_proxy_arp() {
+        // Otherwise the exemption would swallow the gateway's own address, and
+        // an impersonation of it is the attack arp_spoof exists for.
+        let tracker = known();
+        let observation = reply("18:fd:74:39:e5:23", [192, 168, 1, 1], at(0));
+        assert_eq!(tracker.proxy_arp_for(&observation), None);
+    }
+
+    #[test]
+    fn a_stranger_answering_for_anything_is_not_proxy_arp() {
+        let tracker = known();
+        for claimed in [[192, 168, 1, 1], [192, 168, 20, 55]] {
+            let observation = reply("02:de:ad:be:ef:01", claimed, at(0));
+            assert_eq!(
+                tracker.proxy_arp_for(&observation),
+                None,
+                "only the gateway's own MAC earns the exemption"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_is_never_proxy_arp() {
+        // A request carries the sender's own address and is a claim on it.
+        let tracker = known();
+        let observation = request("18:fd:74:39:e5:23", [192, 168, 20, 55], at(0));
+        assert_eq!(tracker.proxy_arp_for(&observation), None);
+    }
+
+    #[test]
+    fn an_unknown_gateway_exempts_nothing() {
+        let tracker = GatewayTracker::new(None, None);
+        let observation = reply("18:fd:74:39:e5:23", [192, 168, 20, 55], at(0));
+        assert_eq!(tracker.proxy_arp_for(&observation), None);
+    }
+
+    #[test]
+    fn the_switch_turns_the_whole_rule_off() {
+        let tracker = known().with_proxy_arp(false);
+        let observation = reply("18:fd:74:39:e5:23", [192, 168, 20, 55], at(0));
+        assert_eq!(tracker.proxy_arp_for(&observation), None);
+    }
+
+    #[test]
+    fn the_proxied_set_is_bounded() {
+        // A router proxying for a whole /16 must not be able to grow this.
+        let mut tracker = known();
+        for n in 0..5000u32 {
+            let claimed = [
+                10,
+                u8::try_from((n >> 8) & 0xff).expect("byte"),
+                u8::try_from(n & 0xff).expect("byte"),
+                7,
+            ];
+            tracker.observe(&reply("18:fd:74:39:e5:23", claimed, at(0)));
+        }
+        assert!(tracker.proxied().len() <= MAX_PROXIED);
     }
 
     #[test]

@@ -618,6 +618,19 @@ pub struct SecurityConfig {
     pub gateway_mac: String,
     /// The gateway's address. Empty means "work it out from traffic".
     pub gateway_ip: String,
+    /// Whether an ARP reply from the gateway for an address that is not its own
+    /// is read as proxy ARP rather than as an attack.
+    ///
+    /// On by default, because a router that routes between VLANs answers ARP
+    /// for the far side as a matter of course and the alternative is an alert
+    /// per segment per cooldown. Turn it off only on a network where the router
+    /// is known not to proxy, and where an answer from it for somebody else's
+    /// address would therefore be worth waking up for.
+    ///
+    /// It exempts nothing else: a MAC that is not the gateway claiming the
+    /// gateway's address still alerts, and so does a second MAC claiming an
+    /// address the gateway did not proxy.
+    pub proxy_arp_gateway: bool,
     /// MAC addresses no analyzer alerts on. For the monitoring box that is
     /// meant to sweep the network.
     pub exempt_macs: Vec<String>,
@@ -647,6 +660,7 @@ impl Default for SecurityConfig {
             enabled: true,
             gateway_mac: String::new(),
             gateway_ip: String::new(),
+            proxy_arp_gateway: true,
             exempt_macs: Vec::new(),
             max_tracked: 4096,
             arp_scan: ArpScanConfig::default(),

@@ -334,6 +334,44 @@ impl Signal {
     }
 }
 
+/// Identity evidence together with the addresses the frame proved it for.
+///
+/// Most protocols volunteer evidence about the device that transmitted the
+/// frame, and for those the sender *is* the subject. mDNS is not like that: one
+/// responder legitimately answers on behalf of other hosts, and a frame full of
+/// names says nothing about whose names they are. So the mDNS walker resolves
+/// each name to the address the message gave it and hands the pair over, leaving
+/// the question of which device holds that address to the only layer that knows:
+/// [`crate::device::Manager`], which has the ARP and DHCP evidence.
+///
+/// `addresses` empty means the message tied this evidence to no address at all,
+/// which is the ordinary shape of a device announcing a service without
+/// repeating its own address record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameClaim {
+    /// The evidence itself.
+    pub signal: Signal,
+    /// Every address the message tied this evidence to.
+    pub addresses: Vec<IpAddr>,
+}
+
+impl NameClaim {
+    /// A claim the message gave no address for.
+    #[must_use]
+    pub fn unaddressed(signal: Signal) -> Self {
+        NameClaim {
+            signal,
+            addresses: Vec::new(),
+        }
+    }
+
+    /// True when this claim names one of the given addresses as its own.
+    #[must_use]
+    pub fn matches(&self, addresses: &[IpAddr]) -> bool {
+        self.addresses.iter().any(|a| addresses.contains(a))
+    }
+}
+
 /// Which ARP operation a frame carried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -481,8 +519,18 @@ pub struct Observation {
     pub source: &'static str,
     /// What kind of traffic this was.
     pub kind: ObservationKind,
-    /// Identity evidence carried by this packet, possibly empty.
+    /// Identity evidence carried by this packet **about the sender**, possibly
+    /// empty.
+    ///
+    /// A signal lands here only when the protocol makes the sender the subject.
+    /// Evidence whose subject the frame identified by address instead goes in
+    /// [`Observation::claims`].
     pub signals: Vec<Signal>,
+    /// Identity evidence the frame carried about whoever holds a given address,
+    /// which may or may not be the sender.
+    ///
+    /// Empty for every capture source but mDNS; see [`NameClaim`].
+    pub claims: Vec<NameClaim>,
     /// Protocol fields the security analyzers need, when the protocol has any.
     pub detail: Option<ProtocolDetail>,
     /// When the packet was seen.
@@ -506,6 +554,7 @@ impl Observation {
             source,
             kind,
             signals: Vec::new(),
+            claims: Vec::new(),
             detail: None,
             observed_at,
         }
@@ -515,6 +564,13 @@ impl Observation {
     #[must_use]
     pub fn with_signal(mut self, signal: Signal) -> Self {
         self.signals.push(signal);
+        self
+    }
+
+    /// Attaches one address-qualified claim, builder style.
+    #[must_use]
+    pub fn with_claim(mut self, claim: NameClaim) -> Self {
+        self.claims.push(claim);
         self
     }
 

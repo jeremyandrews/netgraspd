@@ -79,6 +79,14 @@ impl Analyzer for IpConflict {
         if address.is_unspecified() || address.is_broadcast() || address.is_multicast() {
             return Vec::new();
         }
+        // The gateway answering for somebody else's address is proxy ARP, not a
+        // second device using the address. Returning before the address map is
+        // touched is the point: if the gateway were recorded as a user of the
+        // address, the real owner's next packet would be read as displacing it
+        // and would alert on the way past.
+        if context.gateway.proxy_arp_for(observation).is_some() {
+            return Vec::new();
+        }
 
         let mac = observation.mac;
         let now = observation.observed_at;
@@ -197,6 +205,119 @@ mod tests {
         assert_eq!(alerts[0].mac, mac("00:11:32:aa:bb:cc"));
         assert_eq!(alerts[0].details["other_mac"], "3c:22:fb:00:00:01");
         assert_eq!(alerts[0].details["seconds_apart"], 5);
+    }
+
+    /// A context whose gateway is the Routerboard from the 2026-09-17 run.
+    fn proxying_context() -> Context {
+        Context {
+            gateway: GatewayTracker::new(
+                Some("192.168.1.1".parse().expect("gateway ip")),
+                Some(mac("18:fd:74:39:e5:23")),
+            ),
+            ..context()
+        }
+    }
+
+    /// An ARP reply from `from` claiming `claimed`.
+    fn claim(from: &str, claimed: &str, when: DateTime<Utc>) -> Observation {
+        let mut frame = crate::capture::fixtures::arp_reply();
+        let source = mac(from).octets();
+        let address: std::net::Ipv4Addr = claimed.parse().expect("test address");
+        frame[6..12].copy_from_slice(&source);
+        frame[22..28].copy_from_slice(&source);
+        frame[28..32].copy_from_slice(&address.octets());
+        crate::capture::arp::parse_frame(&frame, "eth0", when).expect("parsed")
+    }
+
+    #[test]
+    fn the_gateway_proxy_arping_across_vlans_is_not_a_conflict() {
+        // The 2026-09-17 pattern. Hosts on two other segments talk; the router
+        // answers ARP for both with its own MAC; the hosts talk again. Before
+        // the fix every one of those handovers was an address conflict.
+        let mut analyzer = IpConflict::new(&config(), 1024);
+        let context = proxying_context();
+        let mut alerts = Vec::new();
+        for second in 0..600i64 {
+            for host in ["192.168.20.55", "192.168.30.12"] {
+                alerts.extend(analyzer.analyze(
+                    &Stimulus::Observed(&using("00:11:32:aa:bb:cc", host, at(second))),
+                    &context,
+                ));
+                alerts.extend(analyzer.analyze(
+                    &Stimulus::Observed(&claim("18:fd:74:39:e5:23", host, at(second))),
+                    &context,
+                ));
+            }
+        }
+        assert!(alerts.is_empty(), "proxy ARP is not a conflict: {alerts:?}");
+    }
+
+    #[test]
+    fn a_real_conflict_on_an_address_the_gateway_did_not_proxy_still_fires() {
+        // The attack the analyzer exists for must survive the exemption.
+        let mut analyzer = IpConflict::new(&config(), 1024);
+        let context = proxying_context();
+        let _ = analyzer.analyze(
+            &Stimulus::Observed(&using("3c:22:fb:00:00:01", "192.168.1.40", at(0))),
+            &context,
+        );
+        let alerts = analyzer.analyze(
+            &Stimulus::Observed(&using("00:11:32:aa:bb:cc", "192.168.1.40", at(5))),
+            &context,
+        );
+        assert_eq!(alerts.len(), 1, "two ordinary devices, one address");
+    }
+
+    #[test]
+    fn a_proxied_address_still_conflicts_when_a_third_device_takes_it() {
+        // Proxy ARP must not make an address permanently safe. The gateway's own
+        // answers are ignored, so the real owner stays the recorded holder and a
+        // stranger claiming it is still a conflict.
+        let mut analyzer = IpConflict::new(&config(), 1024);
+        let context = proxying_context();
+        let _ = analyzer.analyze(
+            &Stimulus::Observed(&using("00:11:32:aa:bb:cc", "192.168.20.55", at(0))),
+            &context,
+        );
+        let _ = analyzer.analyze(
+            &Stimulus::Observed(&claim("18:fd:74:39:e5:23", "192.168.20.55", at(1))),
+            &context,
+        );
+        let alerts = analyzer.analyze(
+            &Stimulus::Observed(&using("02:de:ad:be:ef:01", "192.168.20.55", at(2))),
+            &context,
+        );
+        assert_eq!(
+            alerts.len(),
+            1,
+            "a stranger on a proxied address still alerts"
+        );
+        assert_eq!(
+            alerts[0].details["other_mac"], "00:11:32:aa:bb:cc",
+            "and it is compared against the real owner, not the router"
+        );
+    }
+
+    #[test]
+    fn turning_the_rule_off_restores_the_alert() {
+        let mut analyzer = IpConflict::new(&config(), 1024);
+        let context = Context {
+            gateway: GatewayTracker::new(
+                Some("192.168.1.1".parse().expect("gateway ip")),
+                Some(mac("18:fd:74:39:e5:23")),
+            )
+            .with_proxy_arp(false),
+            ..context()
+        };
+        let _ = analyzer.analyze(
+            &Stimulus::Observed(&using("00:11:32:aa:bb:cc", "192.168.20.55", at(0))),
+            &context,
+        );
+        let alerts = analyzer.analyze(
+            &Stimulus::Observed(&claim("18:fd:74:39:e5:23", "192.168.20.55", at(1))),
+            &context,
+        );
+        assert_eq!(alerts.len(), 1);
     }
 
     #[test]

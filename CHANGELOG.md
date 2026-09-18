@@ -13,6 +13,92 @@ The entries for 0.1.0 to 0.3.0 were written after the fact, from the README's
 milestone sections and `ARCHITECTURE.md`. They describe what those milestones
 shipped rather than a release that was tagged at the time.
 
+## [0.4.1] - 2026-09-18
+
+Four defects found in a live run on 2026-09-17, the first extended one on a
+real home network with VLANs. A patch rather than a minor because no milestone
+shipped: every entry is an existing feature that was wrong.
+
+### Fixed
+
+- **An mDNS responder's frames no longer name every host it answers for.** The
+  walker attributed every name in a message to the frame's source MAC. That is
+  wrong whenever a responder answers on somebody else's behalf, which is the
+  ordinary case: a Bonjour Sleep Proxy answers for machines that are asleep. In
+  the 2026-09-17 run one iPhone, `92:27:e6:9f:03:76`, was given the names of six
+  other hosts, and `Jeremy's MacBook Pro (2)` was recorded as the name of six
+  different MACs.
+
+  The rule now is that a name belongs to whoever holds the address the record
+  names, not to whoever transmitted it. An A or AAAA record gives its address
+  directly and an instance name reaches one through its SRV target; the pair
+  travels from the parser as a `NameClaim` and `device::Manager` resolves it
+  against the ARP and DHCP evidence it already holds. A name proved for another
+  known device is recorded against *that* device, so a sleep proxy's answer now
+  names the sleeper, which is what it was always evidence about. A name proved
+  for an address nobody known holds is counted rather than guessed at, and the
+  count is published as `unattributed_names` in the runtime status. A record
+  tied to no address still falls back to the sender, unless the same frame
+  proved it was speaking for somebody else.
+
+- **`name_updated` no longer fires on a name that is merely flapping.** A second
+  and independent defect, which produced 385 events in thirty minutes in the
+  same run. `improves_on` treated any equal-confidence change of text as an
+  improvement, and `record_signals` re-inserts each frame's batch at the front of
+  the signal list, so two mDNS names of equal weight take turns winning the
+  scorer's same-kind tie-break and each turn was adopted.
+
+  A candidate that wins on rank is still adopted immediately. A candidate of
+  equal rank is now held until it has been the winner continuously for five
+  minutes (`identity::SETTLE_WINDOW`), and a candidate that loses even once
+  starts the clock again. An alternating pair therefore never settles and emits
+  nothing, while a device somebody genuinely renamed settles once and emits one
+  event. Nothing is lost by waiting: the name is stored as a signal on arrival
+  and only the display identity and its event are held back.
+
+- **Proxy ARP by the gateway is no longer read as an attack.** A router that
+  routes between VLANs answers ARP for the far side with its own hardware
+  address, so the same address is legitimately seen at the router's MAC and at
+  its real owner's. `ip_conflict` reads that as two devices using one address and
+  `arp_spoof` reads it as an address changing hands while its holder is still
+  talking. On 2026-09-17 the Routerboard gateway `18:fd:74:39:e5:23` was the MAC
+  or the conflicting holder in **all 34** alerts the two analyzers produced.
+
+  `GatewayTracker::proxy_arp_for` now identifies such a frame and both analyzers
+  return before touching their state. Returning early is the load-bearing part:
+  had the router been recorded as holding the address, the real owner's next
+  packet would have read as taking it back and alerted on the way past. The
+  addresses are recorded for the operator, logged once each and published as
+  `proxy_arp_addresses` in the runtime status.
+
+  **Neither attack the analyzers exist for is weakened.** The exemption requires
+  all three of a reply, the learned gateway MAC as the *Ethernet* source, and an
+  address that is not the gateway's own. A stranger claiming the gateway's
+  address is not the gateway and still alerts with no grace period; a second MAC
+  claiming an address the gateway did not proxy still alerts; and because the
+  router never becomes the recorded holder, a stranger taking a proxied address
+  is still caught. Tests pin all three.
+
+### Added
+
+- `security.proxy_arp_gateway`, default true, which is the switch for the rule
+  above. Documented in `netgrasp.toml.example` and the README.
+- `unattributed_names` and `proxy_arp_addresses` in the runtime status file, both
+  `#[serde(default)]` so a file written by an older build still parses.
+- `mdns_sleep_proxy`, a built fixture: one source MAC carrying three hosts'
+  records, two of them proxied. It is the 2026-09-17 shape reduced to one frame.
+
+### Notes
+
+- No schema change. The two new counters live in the runtime status JSON, which
+  `runtime/mod.rs` already documents as the place for facts about the daemon
+  rather than about the database, for exactly this reason. Recording proxied
+  addresses as a column on `ng_ip_history` was considered and rejected: it is
+  additive and therefore permitted, but `ng_ip_history` is shared with the
+  Trovato plugin and an `ALTER` on it is a two-repository decision.
+- `Observation` gains a `claims` field. Every capture source but mDNS leaves it
+  empty, and `Observation::new` sets it so, so no other parser changed.
+
 ## [0.4.0] - 2026-09-18
 
 ### Added
