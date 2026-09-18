@@ -138,6 +138,65 @@ MAC address is the join key.
 `sync_state` and `trovato_item_id` exist in this repo as **contract stubs**.
 The daemon writes `sync_state`; nothing in this repo reads it.
 
+### The kernel-to-daemon direction needs a clock of its own
+
+Writing the user-owned columns back to `ng_devices` is only half of that second
+bullet. The daemon rehydrated them once, at startup, and no timer read them
+again, so muting a device in the admin UI did nothing until somebody restarted
+the daemon. The first joint run measured it: 33 of 35 presence deliveries
+ignored a `notify` set to false and a newly assigned owner.
+
+So there is a **reconcile tick**, `state.reconcile_interval`, ten seconds by
+default. It reads the user-owned columns and the whole `ng_people` mirror and
+merges them into the device table and the people registry, in that direction
+only. It is the mirror image of the flush: the flush writes what the daemon owns
+and names its columns explicitly, the reconcile reads what the user owns and
+names its columns explicitly, and a test guards each statement against the
+other's columns appearing in it.
+
+Three things are worth stating because each was a decision rather than an
+accident:
+
+- **The merge names its columns.** It iterates a list, exactly as the plugin's
+  `USER_OWNED` list works from the other side, so a column can only be merged on
+  purpose. `hidden` and `notes` are on the list as columns the daemon
+  deliberately does nothing with.
+- **A merge does not dirty a row.** Those columns are absent from the daemon's
+  update statement by design, so flushing after a merge would be a write that
+  writes nothing and a `sync_state = 'dirty'` the plugin's sweep would collect
+  for no reason.
+- **Configuration survives a null.** An install with no plugin has
+  `owner_item_id` null on every row and `[[people]]` as the only source of
+  ownership. Reading that null as "nobody owns it" would have disabled people
+  tracking ten seconds after start, so the registry remembers which ownership
+  came from configuration and falls back to it. The database still wins wherever
+  it says anything, which is the precedence the startup roster already applied.
+
+### Why the reconcile polls, and what `LISTEN` would take
+
+Polling is not the responsive option; it is the one that needs no agreement from
+another repository. `LISTEN`/`NOTIFY` would be better on latency and cost, and
+it is deferred rather than rejected:
+
+- **The plugin does not send it today.** A `NOTIFY netgrasp_user_edit` after the
+  update tap's write-back is a new line in the contract, and a contract line
+  lands in both repositories or neither.
+- **A pooled connection cannot hear one.** Asynchronous messages reach
+  `tokio_postgres::Connection::poll_message`, and deadpool spawns that driver
+  itself, so a notification never reaches a pooled `Client`. `LISTEN` means a
+  dedicated connection outside the pool, owned by a task that reconnects on its
+  own, because a `LISTEN` that dies silently is a daemon that stops noticing
+  edits and says nothing about it.
+- **The poll costs almost nothing to keep meanwhile.** The read is under a
+  millisecond of server time for two thousand devices, so the poll is cheap
+  enough that the interval is set by how long a person will wait after saving a
+  page, not by database load.
+
+The shape when it happens: the dedicated connection's task sends a tick down a
+channel, the select loop reconciles on either that or the timer, and the timer
+stays as the backstop for a missed or unsent notification. The merge itself does
+not change, which is the point of it being a plain function over state.
+
 ## Identity resolution
 
 Every raw signal is stored in `ng_device_signals` so that later signals refine
@@ -449,6 +508,9 @@ sources, 185 MB on a Docker host with twenty-three.
   registry is UniFi-specific.
 - **Plugin sync:** `ng_devices.sync_state` / `trovato_item_id` and
   `ng_events.sync_state` are written by the daemon and read by nothing here.
+- **`LISTEN` for user edits:** the reconcile tick is a plain function over state
+  with a timer in front of it, so the channel that replaces the timer attaches
+  without touching the merge. Design above, under "Why the reconcile polls".
 - **Per-poll telemetry:** VLAN and byte counters ride into
   `ng_events.details` on a location change rather than into columns. If anybody
   ever wants to chart them, that is a schema change the plugin has to see first.

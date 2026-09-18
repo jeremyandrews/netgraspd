@@ -186,11 +186,59 @@ struct DeviceView {
     last_edge: Option<(String, DateTime<Utc>)>,
 }
 
+/// One thing a reconcile changed about people or ownership.
+///
+/// Returned rather than logged in place so that the caller does the logging and
+/// the registry stays a pure state machine, which is what makes every transition
+/// in this module testable without a subscriber installed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistryChange {
+    /// A person the daemon had not seen before.
+    PersonAdded {
+        /// Their item id.
+        item_id: String,
+        /// Their name.
+        name: String,
+    },
+    /// A person's plugin-owned fields changed.
+    PersonEdited {
+        /// Their item id.
+        item_id: String,
+        /// Their name, after the edit.
+        name: String,
+        /// What changed, as `column=value` pairs.
+        fields: Vec<String>,
+    },
+    /// A person who is no longer in `ng_people`.
+    PersonRemoved {
+        /// Their item id.
+        item_id: String,
+        /// The name they had.
+        name: String,
+    },
+    /// A device's owner changed, was set, or was cleared.
+    OwnerChanged {
+        /// Which device.
+        mac: MacAddr,
+        /// Who owned it, if anybody.
+        from: Option<String>,
+        /// Who owns it now, if anybody.
+        to: Option<String>,
+    },
+}
+
 /// People, the devices they own, and the state machine over both.
 #[derive(Debug, Default)]
 pub struct Registry {
     people: BTreeMap<String, Person>,
     owner: HashMap<MacAddr, String>,
+    /// Ownership that came from `netgrasp.toml` rather than from the database.
+    ///
+    /// Held separately because a reconcile reads `ng_devices.owner_item_id`, and
+    /// a device owned only by configuration has that column null. Without this,
+    /// the first reconcile after startup would read the null as "nobody owns it"
+    /// and quietly undo an install that has no Trovato plugin at all.
+    config_owner: HashMap<MacAddr, String>,
     devices: HashMap<MacAddr, DeviceView>,
 }
 
@@ -218,6 +266,127 @@ impl Registry {
     /// mapping simply does nothing until it does.
     pub fn set_owner(&mut self, mac: MacAddr, item_id: impl Into<String>) {
         self.owner.insert(mac, item_id.into());
+    }
+
+    /// Records that configuration, rather than the database, says a device
+    /// belongs to a person.
+    ///
+    /// Sets the ownership as well as remembering where it came from, so a caller
+    /// never has to do both.
+    pub fn set_config_owner(&mut self, mac: MacAddr, item_id: impl Into<String>) {
+        let item_id = item_id.into();
+        self.config_owner.insert(mac, item_id.clone());
+        self.owner.insert(mac, item_id);
+    }
+
+    /// Folds the plugin's half of `ng_people` and `ng_devices.owner_item_id`
+    /// back in, without disturbing the daemon's half.
+    ///
+    /// `people` is the whole mirror and `owners` the whole ownership column, one
+    /// entry per device row, `None` where nobody owns it. Both are complete
+    /// rather than deltas, because the daemon has no way to know what the plugin
+    /// changed and a row that vanished is as much a change as one that appeared.
+    ///
+    /// What moves and what does not:
+    ///
+    /// - For somebody already known, only `name`, `notify_arrive` and
+    ///   `notify_depart` are taken. `state`, `current_location`,
+    ///   `last_arrived_at` and `last_departed_at` are the daemon's, and the copy
+    ///   in memory is ahead of the database's.
+    /// - Somebody new is taken whole: their stored state is all there is.
+    /// - Somebody no longer in the mirror is dropped. Devices that named them
+    ///   keep the mapping, which then does nothing, exactly as a mapping that
+    ///   points at a person the plugin has not mirrored yet does nothing.
+    /// - An owner set to null falls back to configuration if `netgrasp.toml`
+    ///   named one, and is otherwise cleared.
+    ///
+    /// Newly owned devices carry no presence here. The caller seeds that from
+    /// the device table with [`Registry::restore_device`], which is the same
+    /// silent seeding a restart does: a person is not announced as arriving
+    /// because somebody ticked a box next to a phone that was already online.
+    #[must_use]
+    pub fn reconcile(
+        &mut self,
+        people: Vec<Person>,
+        owners: &[(MacAddr, Option<String>)],
+    ) -> Vec<RegistryChange> {
+        let mut changes = Vec::new();
+        let mut present: HashSet<String> = HashSet::with_capacity(people.len());
+
+        for person in people {
+            present.insert(person.item_id.clone());
+            match self.people.get_mut(&person.item_id) {
+                Some(known) => {
+                    let mut fields = Vec::new();
+                    if known.name != person.name {
+                        fields.push(format!("name={:?}", person.name));
+                        known.name.clone_from(&person.name);
+                    }
+                    if known.notify_arrive != person.notify_arrive {
+                        fields.push(format!("notify_arrive={}", person.notify_arrive));
+                        known.notify_arrive = person.notify_arrive;
+                    }
+                    if known.notify_depart != person.notify_depart {
+                        fields.push(format!("notify_depart={}", person.notify_depart));
+                        known.notify_depart = person.notify_depart;
+                    }
+                    if !fields.is_empty() {
+                        changes.push(RegistryChange::PersonEdited {
+                            item_id: person.item_id.clone(),
+                            name: person.name.clone(),
+                            fields,
+                        });
+                    }
+                }
+                None => {
+                    changes.push(RegistryChange::PersonAdded {
+                        item_id: person.item_id.clone(),
+                        name: person.name.clone(),
+                    });
+                    self.people.insert(person.item_id.clone(), person);
+                }
+            }
+        }
+
+        self.people.retain(|item_id, person| {
+            let kept = present.contains(item_id);
+            if !kept {
+                changes.push(RegistryChange::PersonRemoved {
+                    item_id: item_id.clone(),
+                    name: person.name.clone(),
+                });
+            }
+            kept
+        });
+
+        for (mac, stored) in owners {
+            // The database wins where it says anything, configuration is the
+            // fallback where it says nothing. That is the precedence the startup
+            // roster already applies, and a reconcile that used a different one
+            // would change who owns a device the first time it ran.
+            let wanted = stored
+                .clone()
+                .or_else(|| self.config_owner.get(mac).cloned());
+            let current = self.owner.get(mac).cloned();
+            if current == wanted {
+                continue;
+            }
+            match &wanted {
+                Some(item_id) => {
+                    self.owner.insert(*mac, item_id.clone());
+                }
+                None => {
+                    self.owner.remove(mac);
+                }
+            }
+            changes.push(RegistryChange::OwnerChanged {
+                mac: *mac,
+                from: current,
+                to: wanted,
+            });
+        }
+
+        changes
     }
 
     /// How many people are known.
@@ -589,8 +758,16 @@ fn update_of(person: &Person) -> PersonUpdate {
 pub struct Roster {
     /// People, keyed by item id.
     pub people: Vec<Person>,
-    /// Which person owns which device.
+    /// Which person owns which device, lowest precedence first: the registry
+    /// keeps the last owner recorded for a MAC.
     pub owners: Vec<(MacAddr, String)>,
+    /// The subset of `owners` that came from `netgrasp.toml` rather than from
+    /// `ng_devices.owner_item_id`.
+    ///
+    /// Carried separately so a later reconcile can tell a device nobody owns
+    /// from one the database has nothing to say about. See
+    /// [`Registry::set_config_owner`].
+    pub config_owners: Vec<(MacAddr, String)>,
 }
 
 impl Roster {
@@ -601,6 +778,13 @@ impl Roster {
         let known: HashSet<String> = self.people.iter().map(|p| p.item_id.clone()).collect();
         for person in self.people {
             registry.insert_person(person);
+        }
+        // Recorded before the effective list, so an owner configuration supplies
+        // is remembered as a fallback even when the database overrides it.
+        for (mac, item_id) in self.config_owners {
+            if known.contains(&item_id) {
+                registry.set_config_owner(mac, item_id);
+            }
         }
         for (mac, item_id) in self.owners {
             if known.contains(&item_id) {
@@ -1107,6 +1291,114 @@ mod tests {
     }
 
     #[test]
+    fn a_reconcile_takes_the_plugin_s_fields_and_leaves_the_daemon_s_alone() {
+        let mut r = registry();
+        // Jeremy is home, which is the daemon's finding and not the plugin's.
+        let _ = r.device_online(mac(PHONE), base());
+        assert_eq!(
+            r.by_name("Jeremy").expect("Jeremy").state,
+            PersonState::Home
+        );
+
+        // The mirror still has him away, with an edited name and flags.
+        let mut stored = person("person-1", "Jeremy Andrews");
+        stored.notify_depart = false;
+        let changes = r.reconcile(vec![stored], &[(mac(PHONE), Some("person-1".into()))]);
+
+        let jeremy = r.person("person-1").expect("still there");
+        assert_eq!(jeremy.name, "Jeremy Andrews");
+        assert!(!jeremy.notify_depart);
+        assert!(jeremy.notify_arrive);
+        // Daemon-owned, and the in-memory copy is the newer one.
+        assert_eq!(jeremy.state, PersonState::Home);
+        assert_eq!(jeremy.last_arrived_at, Some(base()));
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert!(matches!(
+            &changes[0],
+            RegistryChange::PersonEdited { fields, .. } if fields.len() == 2
+        ));
+    }
+
+    #[test]
+    fn a_reconcile_adds_a_new_person_and_drops_one_the_mirror_no_longer_has() {
+        let mut r = registry();
+        let changes = r.reconcile(vec![person("person-2", "Jamie")], &[]);
+        assert!(r.person("person-1").is_none(), "removed with the mirror");
+        assert_eq!(r.by_name("Jamie").expect("Jamie").item_id, "person-2");
+        assert_eq!(changes.len(), 2, "{changes:?}");
+        assert!(changes.iter().any(|c| matches!(
+            c,
+            RegistryChange::PersonAdded { name, .. } if name == "Jamie"
+        )));
+        assert!(changes.iter().any(|c| matches!(
+            c,
+            RegistryChange::PersonRemoved { name, .. } if name == "Jeremy"
+        )));
+    }
+
+    #[test]
+    fn a_reconcile_moves_a_device_to_its_new_owner() {
+        let mut r = registry();
+        r.insert_person(person("person-2", "Jamie"));
+        let changes = r.reconcile(
+            vec![person("person-1", "Jeremy"), person("person-2", "Jamie")],
+            &[
+                (mac(PHONE), Some("person-2".into())),
+                (mac(LAPTOP), Some("person-1".into())),
+            ],
+        );
+        assert_eq!(r.devices_of("person-2"), vec![mac(PHONE)]);
+        assert_eq!(r.devices_of("person-1"), vec![mac(LAPTOP)]);
+        assert_eq!(changes.len(), 1, "only the phone moved: {changes:?}");
+    }
+
+    #[test]
+    fn a_reconcile_clears_an_owner_the_database_has_taken_away() {
+        let mut r = registry();
+        let changes = r.reconcile(vec![person("person-1", "Jeremy")], &[(mac(PHONE), None)]);
+        assert_eq!(r.devices_of("person-1"), vec![mac(LAPTOP)]);
+        assert!(matches!(
+            changes.as_slice(),
+            [RegistryChange::OwnerChanged { to: None, .. }]
+        ));
+        // And an unowned device's presence says nothing about anybody.
+        assert!(r.device_online(mac(PHONE), base()).is_empty());
+    }
+
+    #[test]
+    fn a_reconcile_does_not_undo_ownership_that_came_from_configuration() {
+        // An install with no Trovato plugin has owner_item_id null on every row
+        // and netgrasp.toml as the only source of ownership. Reading the null as
+        // "nobody owns it" would disable people tracking ten seconds after
+        // start, which is the worst kind of regression: it looks like it works.
+        let mut r = Registry::new();
+        r.insert_person(person("person-1", "Jeremy"));
+        r.set_config_owner(mac(PHONE), "person-1");
+        let changes = r.reconcile(vec![person("person-1", "Jeremy")], &[(mac(PHONE), None)]);
+        assert!(changes.is_empty(), "{changes:?}");
+        assert_eq!(r.devices_of("person-1"), vec![mac(PHONE)]);
+    }
+
+    #[test]
+    fn the_database_still_overrides_configuration_on_a_reconcile() {
+        let mut r = Registry::new();
+        r.insert_person(person("person-1", "Jeremy"));
+        r.insert_person(person("person-2", "Jamie"));
+        r.set_config_owner(mac(PHONE), "person-1");
+        let _ = r.reconcile(
+            vec![person("person-1", "Jeremy"), person("person-2", "Jamie")],
+            &[(mac(PHONE), Some("person-2".into()))],
+        );
+        assert_eq!(r.devices_of("person-2"), vec![mac(PHONE)]);
+        // ...and giving it back to nobody falls back to configuration again.
+        let _ = r.reconcile(
+            vec![person("person-1", "Jeremy"), person("person-2", "Jamie")],
+            &[(mac(PHONE), None)],
+        );
+        assert_eq!(r.devices_of("person-1"), vec![mac(PHONE)]);
+    }
+
+    #[test]
     fn the_roster_drops_owners_whose_person_is_missing_and_keeps_the_rest() {
         let roster = Roster {
             people: vec![person("person-1", "Jeremy")],
@@ -1114,6 +1406,7 @@ mod tests {
                 (mac(PHONE), "person-1".into()),
                 (mac(LAPTOP), "person-not-mirrored-yet".into()),
             ],
+            config_owners: Vec::new(),
         };
         let r = roster.into_registry();
         assert_eq!(r.devices_of("person-1"), vec![mac(PHONE)]);

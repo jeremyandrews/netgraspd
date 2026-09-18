@@ -57,6 +57,13 @@ flush_interval = "60s"
 # How often timeouts are applied.
 sweep_interval = "30s"
 
+# How often the columns a person owns (display_name, notes, hidden, notify, and
+# which person owns the device) are read back from Postgres. This is the delay
+# between muting a device in Trovato and the daemon acting on it; the read costs
+# well under a millisecond of database time even for a couple of thousand
+# devices, so it is set by how long somebody will wait, not by load.
+reconcile_interval = "10s"
+
 # Devices that are meant to be quiet for long stretches. Keyed by device_type,
 # which the classifier sets.
 [state.device_type_overrides.router]

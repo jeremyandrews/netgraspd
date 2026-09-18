@@ -620,3 +620,137 @@ async fn every_daemon_write_marks_the_row_dirty_for_the_plugin() {
         "the went_offline event is new and therefore dirty"
     );
 }
+
+/// The plugin's half of the contract, as a test writes it: a connection that is
+/// not the daemon's, changing only columns the daemon does not own.
+async fn as_the_plugin(db: &common::TestDb, sql: &str) {
+    let client = db.client().await;
+    client
+        .execute(sql, &[])
+        .await
+        .unwrap_or_else(|err| panic!("plugin write {sql:?}: {err}"));
+}
+
+#[tokio::test]
+async fn a_change_made_in_trovato_reaches_a_running_daemon() {
+    let Some(db) = common::test_db().await else {
+        return;
+    };
+    let mut p = Pipeline::new(state_config(), false);
+    let mut registry = netgraspd::people::Registry::new();
+    let phone = mac("3c:22:fb:9a:1b:2c");
+
+    p.frame(&db, &fixtures::arp_request(), "eth0", at(0)).await;
+    p.flush(&db).await;
+    let client = db.client().await;
+    let before = queries::find_device_by_mac(&client, phone)
+        .await
+        .expect("query")
+        .expect("the device was discovered");
+    assert!(
+        before.notify,
+        "devices notify until somebody says otherwise"
+    );
+
+    // Somebody opens the device in Trovato, renames it, mutes it, and says it
+    // is theirs. The plugin writes its own columns and nothing else.
+    let person = queries::ensure_person(&client, "Jeremy", true, true)
+        .await
+        .expect("a person");
+    as_the_plugin(
+        &db,
+        &format!(
+            "UPDATE ng_devices SET display_name = 'Jeremy''s phone', notify = false, \
+             hidden = true, notes = 'in the loft', \
+             owner_item_id = '{person}'::uuid WHERE mac = '{phone}'"
+        ),
+    )
+    .await;
+
+    netgraspd::daemon::reconcile_user_state(&db.db, &mut p.manager, &mut registry).await;
+
+    // The running daemon has it, with no restart in between.
+    let snapshot = p
+        .manager
+        .snapshot()
+        .into_iter()
+        .find(|d| d.mac == phone)
+        .expect("still known");
+    assert_eq!(snapshot.display_name.as_deref(), Some("Jeremy's phone"));
+    assert_eq!(snapshot.display(), "Jeremy's phone");
+    assert_eq!(registry.devices_of(&person), vec![phone]);
+    assert_eq!(registry.by_name("Jeremy").expect("Jeremy").item_id, person);
+
+    // Daemon-owned state is untouched, in memory and in the database alike.
+    let after = queries::find_device_by_mac(&client, phone)
+        .await
+        .expect("query")
+        .expect("still there");
+    assert_eq!(after.state, before.state);
+    assert_eq!(after.last_seen_at, before.last_seen_at);
+    assert_eq!(after.first_seen_at, before.first_seen_at);
+    assert_eq!(after.resolved_name, before.resolved_name);
+    assert_eq!(after.vendor, before.vendor);
+    assert_eq!(snapshot.state, before.state);
+    assert_eq!(snapshot.last_seen_at, before.last_seen_at);
+    // And the reconcile wrote nothing at all: the user's columns are still the
+    // user's, and the row was not re-dirtied for the plugin's sweep to collect.
+    assert_eq!(after.display_name.as_deref(), Some("Jeremy's phone"));
+    assert!(
+        after.hidden,
+        "hidden is the plugin's and stays as it set it"
+    );
+    assert_eq!(after.notes.as_deref(), Some("in the loft"));
+    assert!(p.manager.take_dirty().is_empty());
+}
+
+#[tokio::test]
+async fn muting_a_device_in_trovato_silences_the_next_alert_without_a_restart() {
+    let Some(db) = common::test_db().await else {
+        return;
+    };
+    let mut p = Pipeline::new(state_config(), false);
+    let mut registry = netgraspd::people::Registry::new();
+    let phone = mac("3c:22:fb:9a:1b:2c");
+
+    // Discovered, then long enough silence to go offline.
+    p.frame(&db, &fixtures::arp_request(), "eth0", at(0)).await;
+    p.sweep(&db, at(20_000)).await;
+    p.flush(&db).await;
+    assert_eq!(
+        db.scalar("SELECT COUNT(*) FROM ng_events WHERE event_type = 'went_offline'")
+            .await,
+        1
+    );
+
+    as_the_plugin(
+        &db,
+        &format!("UPDATE ng_devices SET notify = false WHERE mac = '{phone}'"),
+    )
+    .await;
+    netgraspd::daemon::reconcile_user_state(&db.db, &mut p.manager, &mut registry).await;
+
+    // It comes back. The event is recorded and is not deliverable.
+    let mut rx = p.bus.subscribe();
+    p.frame(&db, &fixtures::arp_request(), "eth0", at(20_100))
+        .await;
+    let recorded = rx.try_recv().expect("the return was recorded");
+    assert_eq!(recorded.event.event_type, EventType::Returned);
+    assert!(
+        !recorded.event.deliverable(),
+        "the mute reached the event itself: {recorded:?}"
+    );
+
+    let mut dispatcher = Dispatcher::with_local_offset(NotifyConfig::default(), Default::default());
+    let deliveries: Vec<Delivery> = dispatcher.offer(recorded, at(20_100));
+    assert!(
+        deliveries.is_empty(),
+        "a muted device must not notify: {deliveries:?}"
+    );
+    assert_eq!(
+        db.scalar("SELECT COUNT(*) FROM ng_events WHERE event_type = 'returned'")
+            .await,
+        1,
+        "the record survives the mute"
+    );
+}

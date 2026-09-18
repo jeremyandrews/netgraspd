@@ -241,6 +241,7 @@ pub async fn run(
 
     let mut sweep = ticker(config.state.sweep_interval.get());
     let mut flush = ticker(config.state.flush_interval.get());
+    let mut reconcile = ticker(config.state.reconcile_interval.get());
     let mut learning_tick = ticker(LEARNING_TICK);
     let mut render = ticker(RENDER_TICK);
     let mut enrich_tick = ticker(crate::enrich::TICK);
@@ -334,6 +335,14 @@ pub async fn run(
 
             _ = flush.tick() => {
                 flush_devices(&db, &persister, &mut manager).await;
+            }
+
+            // Notice what somebody changed from the web or through the
+            // assistant. Nothing else in this loop ever reads those columns
+            // again after the rehydrate above, so without this a muted device
+            // stays unmuted until the daemon is restarted.
+            _ = reconcile.tick() => {
+                reconcile_user_state(&db, &mut manager, &mut registry).await;
             }
 
             // Offer the enrichment task a fresh device list. A bounded channel
@@ -752,6 +761,7 @@ async fn build_registry(
     records: &[queries::DeviceRecord],
 ) -> Registry {
     let mut owners: Vec<(MacAddr, String)> = Vec::new();
+    let mut config_owners: Vec<(MacAddr, String)> = Vec::new();
 
     for person in &config.people {
         let name = person.name.trim();
@@ -760,6 +770,7 @@ async fn build_registry(
             Ok(item_id) => {
                 for mac in person.macs() {
                     owners.push((mac, item_id.clone()));
+                    config_owners.push((mac, item_id.clone()));
                 }
             }
             Err(err) => tracing::warn!(person = name, %err, "could not create or adopt a person"),
@@ -775,26 +786,19 @@ async fn build_registry(
     }
 
     let people = match queries::load_people(client).await {
-        Ok(rows) => rows
-            .into_iter()
-            .map(|row| people::Person {
-                item_id: row.item_id,
-                name: row.name,
-                notify_arrive: row.notify_arrive,
-                notify_depart: row.notify_depart,
-                state: people::PersonState::from_db(&row.state),
-                current_location: row.current_location,
-                last_arrived_at: row.last_arrived_at,
-                last_departed_at: row.last_departed_at,
-            })
-            .collect(),
+        Ok(rows) => rows.into_iter().map(person_from_record).collect(),
         Err(err) => {
             tracing::warn!(%err, "could not load people; nobody will be tracked");
             Vec::new()
         }
     };
 
-    let mut registry = people::Roster { people, owners }.into_registry();
+    let mut registry = people::Roster {
+        people,
+        owners,
+        config_owners,
+    }
+    .into_registry();
     // Seed device states without announcing anything: the whole household being
     // home is not news every time the daemon restarts.
     for record in records {
@@ -893,6 +897,130 @@ async fn drain_reclassifications(
         }
     }
     recorded
+}
+
+/// Reads the user-owned columns back and folds them into memory.
+///
+/// The daemon owns state; a person owns the name, the notes, the hidden flag,
+/// the notify toggle and who a device belongs to. This is the only place the
+/// second half travels from Postgres into a running daemon, and it travels in
+/// that direction only.
+///
+/// Polling rather than `LISTEN`. The daemon's connections come from a pool whose
+/// driver task consumes asynchronous messages itself, so a notification never
+/// reaches a pooled client: `LISTEN` would mean a dedicated connection outside
+/// the pool *and* a `NOTIFY` the plugin does not send today, which is a contract
+/// line two repositories would have to agree on. The read it replaces costs
+/// under a millisecond of server time for a couple of thousand devices, so the
+/// poll buys responsiveness for nothing. `ARCHITECTURE.md` records the `LISTEN`
+/// design for the day the plugin can send one.
+///
+/// Every failure is a warning rather than an error, for the reason every other
+/// database failure in this file is: a daemon that stops watching the network
+/// because it could not re-read a checkbox is the wrong trade.
+///
+/// Public because the integration suite drives this exact function against a
+/// real Postgres rather than a copy of it: a reconcile that only a copy exercises
+/// is a reconcile nothing tests.
+pub async fn reconcile_user_state(db: &Db, manager: &mut Manager, registry: &mut Registry) {
+    let client = match db.client().await {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::warn!(%err, "reconcile skipped: no database connection");
+            return;
+        }
+    };
+    let settings = match queries::load_user_settings(&client).await {
+        Ok(settings) => settings,
+        Err(err) => {
+            tracing::warn!(%err, "could not read the user-owned device columns");
+            return;
+        }
+    };
+    let people = match queries::load_people(&client).await {
+        Ok(rows) => rows.into_iter().map(person_from_record).collect(),
+        Err(err) => {
+            tracing::warn!(%err, "could not read people; ownership is unchanged this tick");
+            return;
+        }
+    };
+
+    for change in manager.apply_user_settings(&settings) {
+        tracing::info!(
+            mac = %change.mac,
+            column = change.column,
+            from = %change.from,
+            to = %change.to,
+            "a user-owned device setting changed"
+        );
+    }
+
+    let owners: Vec<(MacAddr, Option<String>)> = settings
+        .iter()
+        .map(|setting| (setting.mac, setting.owner_item_id.clone()))
+        .collect();
+    let changes = registry.reconcile(people, &owners);
+    for change in &changes {
+        match change {
+            people::RegistryChange::PersonAdded { item_id, name } => {
+                tracing::info!(person = %name, item_id = %item_id, "a person appeared");
+            }
+            people::RegistryChange::PersonEdited {
+                item_id,
+                name,
+                fields,
+            } => {
+                tracing::info!(
+                    person = %name,
+                    item_id = %item_id,
+                    changed = %fields.join(", "),
+                    "a person changed"
+                );
+            }
+            people::RegistryChange::PersonRemoved { item_id, name } => {
+                tracing::info!(person = %name, item_id = %item_id, "a person went away");
+            }
+            people::RegistryChange::OwnerChanged { mac, from, to } => {
+                tracing::info!(
+                    %mac,
+                    from = from.as_deref().unwrap_or("nobody"),
+                    to = to.as_deref().unwrap_or("nobody"),
+                    "a device changed owner"
+                );
+                // Seed the new owner's view of the device from the device table,
+                // silently. A restart does exactly this, and announcing that
+                // somebody arrived because a phone that was already online has
+                // just been assigned to them would be a lie with a notification
+                // attached.
+                if to.is_some()
+                    && let Some((state, last_seen_at)) = manager.state_of(*mac)
+                {
+                    registry.restore_device(*mac, state != DeviceState::Offline, last_seen_at);
+                }
+            }
+        }
+    }
+    if changes.is_empty() {
+        tracing::debug!(
+            devices = settings.len(),
+            people = registry.len(),
+            "reconciled; nothing had changed"
+        );
+    }
+}
+
+/// Turns a stored person into the registry's view of them.
+fn person_from_record(row: queries::PersonRecord) -> people::Person {
+    people::Person {
+        item_id: row.item_id,
+        name: row.name,
+        notify_arrive: row.notify_arrive,
+        notify_depart: row.notify_depart,
+        state: people::PersonState::from_db(&row.state),
+        current_location: row.current_location,
+        last_arrived_at: row.last_arrived_at,
+        last_departed_at: row.last_departed_at,
+    }
 }
 
 /// Writes changed devices to Postgres.
