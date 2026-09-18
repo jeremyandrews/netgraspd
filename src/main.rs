@@ -45,6 +45,7 @@ async fn main() -> Result<()> {
         Command::Events(args) => cli::events(&config, args).await,
         Command::People => cli::people(&config).await,
         Command::Stats => cli::stats(&config).await,
+        Command::Migrate => cli::migrate(&config).await,
         Command::Maintain(args) => cli::maintain(&config, args).await,
         Command::UpdateFingerprints(args) => cli::update_fingerprints(&config, args).await,
     }
