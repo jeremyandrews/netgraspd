@@ -9,12 +9,12 @@
 #      is on the host's segment. Without it the daemon starts and captures
 #      nothing, which looks exactly like working.
 #
-#   2. The `migrate` service. **The daemon owns the schema and must run its
-#      migrations before anything else touches the database.** If the Trovato
-#      plugin creates the ng_ tables first, the daemon refuses to start with a
-#      message telling you to reconcile, because adopting tables whose types
-#      nobody checked is worse than stopping. Running the migration as its own
-#      one-shot service is what makes the ordering a fact rather than a hope.
+#   2. The `migrate` service, and the order it enforces. **The daemon migrates
+#      first and the Trovato plugin second.** Running the plugin's migrations
+#      first is still fatal: the daemon finds ng_ tables it did not create,
+#      refuses to start, and tells you to reconcile, because adopting tables
+#      whose types nobody checked is worse than stopping. That is why migrating
+#      is its own one-shot service rather than a hope about startup order.
 #
 # Because the daemon uses host networking it reaches Postgres on the host's
 # published port rather than by service name, which is why DATABASE_URL points
@@ -46,11 +46,21 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      NETGRASP_DATABASE__URL: ${DATABASE_URL}
-    # `maintain --dry-run` connects, migrates, runs the schema preflight and
-    # changes nothing. It is the smallest command that proves the schema is
-    # right before the daemon or the plugin touches it.
-    command: ["maintain", "--dry-run"]
+      # Not ${DATABASE_URL}: that one says `localhost`, which is right only for
+      # the daemon below, because only the daemon is on the host's network
+      # stack. This service is on the default bridge and reaches Postgres by
+      # service name, exactly as the optional trovato service does.
+      NETGRASP_DATABASE__URL: ${MIGRATE_DATABASE_URL}
+    # `migrate` applies any pending migrations, runs the schema preflight, and
+    # exits zero whether or not it had to do anything. Safe on every boot.
+    #
+    # This used to be `maintain --dry-run`, on the strength of a comment saying
+    # it migrated. It does not. Like every read-only command it only *checks*
+    # the schema, so on a fresh install it exited 1, this service never
+    # completed, and both services below waited on it forever. It looked fine
+    # because `netgraspd run` migrates on startup, so any stack that reached the
+    # daemon had been migrated by the daemon.
+    command: ["migrate"]
     restart: "no"
 
   netgraspd:

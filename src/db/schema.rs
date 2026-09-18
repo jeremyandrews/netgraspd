@@ -545,10 +545,11 @@ pub async fn check_readable(client: &Client, expected_version: i32) -> Result<()
         bail!(
             "this database has no netgrasp schema: nothing is recorded in \
              {MIGRATION_TABLE}.\n\n\
-             netgraspd creates and owns the ng_ tables, and it does so when the daemon \
-             starts. Run `netgraspd run` against this database once (docker-compose.yml \
-             encodes the same thing as a one-shot `migrate` service) before reading from \
-             it.\n\n\
+             netgraspd creates and owns the ng_ tables. Run `netgraspd migrate` against \
+             this database to create them; it applies every pending migration, checks \
+             the result and exits. Starting the daemon does the same thing on its way \
+             up, and docker-compose.yml runs `migrate` as a one-shot service that \
+             everything else waits for.\n\n\
              If that is not the database you meant, check which one this command is \
              using: it is logged at startup, and with no netgrasp.toml in reach it is \
              the compiled default rather than the one the daemon is writing to."
