@@ -42,6 +42,21 @@ shipped rather than a release that was tagged at the time.
   clearing it. The database still wins wherever it says anything, which is the
   precedence the startup roster already applied.
 
+### Fixed
+
+Two failures that had accumulated on `main` since it last ran green on
+2026-08-15. Neither was caused by the change above; both are here because a
+branch cannot be merged red.
+
+- `rustls` 0.23.43 to 0.23.45, for RUSTSEC-2026-0285 (TLS 1.3 handshake messages
+  accepted across encryption level boundaries, medium), and `chacha20` 0.10.1 to
+  0.10.2, the 0.10.1 release having been yanked. Both arrive through `reqwest`,
+  which the UniFi enricher uses; nothing in this repository speaks TLS itself.
+- The NetBIOS name decoder uses `as_chunks::<2>()` rather than
+  `chunks_exact(2)`, which Rust 1.98's clippy flags. The pairs now arrive as
+  arrays, so the two reads are checked at compile time instead of being indexing
+  that happens never to be out of range.
+
 ### Notes
 
 - No schema change. `ng_devices` and `ng_people` are shared with the Trovato

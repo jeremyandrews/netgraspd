@@ -252,10 +252,11 @@ pub fn decode_name_at(buf: &[u8], offset: usize) -> Option<NetbiosName> {
     }
     let encoded = buf.get(offset + 1..offset + 1 + 32)?;
     let mut decoded = [0u8; 16];
-    for (i, pair) in encoded.chunks_exact(2).enumerate() {
-        let hi = nibble(pair[0])?;
-        let lo = nibble(pair[1])?;
-        decoded[i] = (hi << 4) | lo;
+    // `as_chunks` rather than `chunks_exact`: the chunk size is a constant, so
+    // the pairs arrive as arrays and the two reads below are checked at compile
+    // time rather than being indexing that happens never to be out of range.
+    for (i, [hi, lo]) in encoded.as_chunks::<2>().0.iter().enumerate() {
+        decoded[i] = (nibble(*hi)? << 4) | nibble(*lo)?;
     }
     // Fifteen characters of space-padded name, then the service suffix.
     let name = String::from_utf8_lossy(&decoded[..15])
