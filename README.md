@@ -25,10 +25,16 @@ suite asserts it.
 
 ## Status
 
-Version 0.4.0: milestone 3, which closes v1, plus the reconcile tick that makes
-an edit in Trovato reach a running daemon. `CHANGELOG.md` has the history; the
-version is one minor per shipped milestone, so 0.1.0 was milestone 1 and a
-feature landing on top of milestone 3 is 0.4.0.
+Version 1.0.0: milestone 3, which closes v1, plus the reconcile tick that makes
+an edit in Trovato reach a running daemon and the fixes from the first run on a
+real home network. It is the code that was 0.4.1, released: `CHANGELOG.md` has
+the history and the versioning rule, which from 1.0.0 is semantic versioning
+over the command line, the configuration file and the `ng_` schema.
+
+**No real UniFi controller has ever been contacted**, and the daemon has not yet
+run unattended on a real network for longer than an evening. Read
+[What has and has not been exercised](#what-has-and-has-not-been-exercised)
+before you rely on it.
 
 On top of milestones 1 and 2:
 
@@ -55,7 +61,102 @@ See `ARCHITECTURE.md` for the design record, and
 [What has and has not been exercised](#what-has-and-has-not-been-exercised)
 below before you trust any of it on a network you care about.
 
-## Quickstart
+## Install
+
+From a [release](https://github.com/jeremyandrews/netgraspd/releases), with no
+Rust toolchain. Each release publishes the same daemon two ways: a
+multi-architecture image, and the binary out of that image for `x86_64` and
+`aarch64` (a Raspberry Pi), with a `SHA256SUMS`.
+
+Whichever you choose, the daemon needs a Postgres database of its own, and it
+creates its tables there before anything else touches it:
+
+```sh
+createuser netgrasp --pwprompt
+createdb netgrasp --owner netgrasp
+```
+
+### The image
+
+```sh
+docker pull ghcr.io/jeremyandrews/netgraspd:1.0.0
+
+# The example configuration ships inside the image.
+docker run --rm --entrypoint cat ghcr.io/jeremyandrews/netgraspd:1.0.0 \
+    /usr/share/netgraspd/netgrasp.toml.example > netgrasp.toml
+$EDITOR netgrasp.toml          # at minimum, database.url
+```
+
+Then run it as [Docker](#docker) below describes, substituting
+`ghcr.io/jeremyandrews/netgraspd:1.0.0` for the locally built `netgraspd`, or
+with [Compose](#compose). Tags are the version (`1.0.0`), the minor line
+(`1.0`) and `latest`; pin the version.
+
+### The binary, under systemd
+
+```sh
+v=1.0.0
+arch=x86_64-unknown-linux-gnu          # or aarch64-unknown-linux-gnu
+base=https://github.com/jeremyandrews/netgraspd/releases/download/v$v
+curl -fLO "$base/netgraspd-$v-$arch"
+curl -fLO "$base/SHA256SUMS"
+sha256sum --check --ignore-missing SHA256SUMS
+
+sudo apt-get install libpcap0.8        # the one runtime library
+sudo install -m 0755 "netgraspd-$v-$arch" /usr/local/bin/netgraspd
+
+# The unit and the example configuration, from the same tag.
+raw=https://raw.githubusercontent.com/jeremyandrews/netgraspd/v$v
+curl -fLO "$raw/packaging/netgraspd.service"
+curl -fLO "$raw/netgrasp.toml.example"
+cp netgrasp.toml.example netgrasp.toml
+$EDITOR netgrasp.toml                  # at minimum, database.url
+
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin netgraspd
+sudo install -m 0640 -o root -g netgraspd netgrasp.toml /etc/netgrasp.toml
+sudo install -m 0644 netgraspd.service /etc/systemd/system/
+
+# Create the schema, then start. Starting would migrate too; doing it first
+# means a database problem is reported here rather than in the journal.
+sudo -u netgraspd netgraspd migrate --config /etc/netgrasp.toml
+sudo systemctl daemon-reload && sudo systemctl enable --now netgraspd
+```
+
+The binary is built on Debian 13 (trixie) and is dynamically linked against its
+glibc and libpcap, so it wants a comparably recent distribution. On an older
+one, run the image instead. The unit grants the capture capability itself, so
+the binary needs no `setcap`; see [Deploying](#deploying).
+
+If you run the Trovato plugin as well, read [Compatibility](#compatibility)
+first: the two versions have to pair, and the daemon migrates first.
+
+## Compatibility
+
+`netgraspd` shares its database with
+[netgrasp-trovato](https://github.com/jeremyandrews/netgrasp-trovato), the
+Trovato plugin that is its web interface. The two are separate releases that
+have to agree on one thing, the `ng_` tables.
+
+| netgraspd | netgrasp-trovato | `ng_` schema | Trovato kernel |
+|---|---|---|---|
+| 1.0.0 | 1.0.0 | version 3 (`V3__enrichment_location_people.sql`) | 0.102.0 or a later 0.x |
+
+**The rule.** A daemon and a plugin pair when they are built for the same `ng_`
+schema version, which is the highest migration under `migrations/` here.
+This repository owns that schema and its migrations are the canonical DDL; the
+plugin carries the tables it reads twice, as a test fixture reproducing this
+repository's DDL and as its own guarded migration, and its CI checks the
+migration against the fixture column by column. The daemon checks the other
+side at startup, refusing to run on tables whose columns differ from what it
+was built for, and naming the table and the column.
+
+**A schema change is a paired release.** Any change to an `ng_` table ships as a
+new daemon release and a new plugin release together, each naming the other in
+this table, and the daemon is upgraded and migrated first. A daemon or plugin
+release that does not touch the schema pairs with whatever the other side's
+current release is, and says so here.
+
+## Quickstart, from source
 
 ```sh
 # 1. A database of its own.
@@ -444,10 +545,16 @@ docker compose --profile trovato up -d
 
 ### Standalone binaries
 
-CI builds the image for `linux/amd64` and `linux/arm64`, extracts the binary
-from each, asserts with `file` that it really is for the architecture it claims,
-and uploads both as artifacts: `netgraspd-x86_64-unknown-linux-gnu` and
-`netgraspd-aarch64-unknown-linux-gnu`.
+Every release attaches both, named `netgraspd-<version>-x86_64-unknown-linux-gnu`
+and `netgraspd-<version>-aarch64-unknown-linux-gnu`, with a `SHA256SUMS`; see
+[Install](#install). The release workflow pushes each platform's image first and
+extracts the binary from the pushed image, so the file on the Release is the
+binary inside the image, not a second build of it.
+
+CI does the same on every push without publishing: it builds the image for
+`linux/amd64` and `linux/arm64`, extracts the binary from each, asserts with
+`file` that it really is for the architecture it claims, and uploads both as
+workflow artifacts.
 
 The container build *is* the cross-compilation story here. A separate
 [`cross`](https://github.com/cross-rs/cross) job was tried and removed: its
@@ -643,13 +750,28 @@ the gateway's address is not the gateway and still alerts immediately.
 Written plainly, because a monitoring tool whose limits you cannot see is worse
 than one that has none.
 
-**Exercised against a live network:** capture on Linux, in a container with
-`--network=host` and `--cap-add=NET_RAW`. All six sources start, the permission
-path works end to end, and devices, presence sessions, events and a security
-event were produced from real traffic. Clean shutdown on SIGTERM was verified
-there too, which is what the systemd unit's `TimeoutStopSec` depends on. That
-was a container host's own segment over a few minutes, not a home LAN over
-weeks.
+**No real UniFi controller has ever been contacted.** That comes first because
+it is the largest gap. The enricher is optional and off by default, and nothing
+but the access point and room columns depends on it.
+
+**Exercised against a live network:**
+
+- A home LAN of about 48 devices across several VLANs, on 2026-09-17, for about
+  half an hour: the ARP, mDNS, DHCP and SSDP sources on a MacBook's `en0`,
+  captured as root, writing to the same database as the Trovato plugin with the
+  plugin's AI assistant editing devices while the daemon ran. That run is the
+  first joint run of the two, recorded in the plugin repository's
+  `docs/JOINT-RUN.md`. It found four daemon defects, all fixed in 0.4.1: mDNS
+  names attributed to the wrong device, a name flapping between two candidates,
+  the router's proxy ARP read as an attack, and garbled non-ASCII notification
+  titles. **The fixes are tested against fixtures built from what that run saw,
+  not re-run on that network.**
+- Capture on Linux, in a container with `--network=host` and
+  `--cap-add=NET_RAW`: all six sources start, the permission path works end to
+  end, and devices, presence sessions, events and a security event were produced
+  from real traffic. Clean shutdown on SIGTERM was verified there too, which is
+  what the systemd unit's `TimeoutStopSec` depends on. That was a container
+  host's own segment over a few minutes.
 
 **Exercised against a real database:** the schema, every migration, the rollup,
 the retention, the location history invariants, the people state machine and the
@@ -659,8 +781,7 @@ columns were verified on both 16.13 and 17.10.
 **Exercised against fixtures or a mock:** every packet parser (recorded `.bin`
 frames), the six analyzers, and the whole UniFi enricher. The UniFi tests drive
 real HTTP over a real socket against a mock controller, including an expired
-session mid-poll and an unreachable controller, but **no real UniFi controller
-has ever been contacted**.
+session mid-poll and an unreachable controller.
 
 **Not exercised at all:**
 
@@ -668,14 +789,17 @@ has ever been contacted**.
   guess informed by published responses rather than something that has been
   seen. The decoder ignores unknown fields and tolerates missing ones, which is
   the best that can be done without one.
-- A Raspberry Pi. The aarch64 image is built and runs; nothing has been left on
-  a Pi for a month.
-- The Trovato plugin. The schema is asserted from this side against the DDL both
-  repositories agree on; the two have never been run together.
-- Capture on macOS beyond the permission check. `/dev/bpf*` is root-only, and
-  each protocol needs verifying separately there.
+- An unattended run on a real network: no week-long soak, no Raspberry Pi left
+  running, no nightly maintenance fired on real data. The aarch64 image is built
+  and runs; nothing has been left on a Pi.
+- The NDP and NetBIOS sources on a real network, and every source on macOS
+  except the four the 2026-09-17 run enabled. `/dev/bpf*` is root-only there, and
+  each protocol needs verifying separately.
 - Months of real elapsed time. The rollup evidence is a synthetic six-month
   dataset compacted in one run, not six months of a daemon running.
+- The release artifacts themselves until the first tag: the binary downloaded
+  from a Release and run under the shipped systemd unit, and the image pulled
+  from the registry rather than built locally.
 
 ## Development
 
