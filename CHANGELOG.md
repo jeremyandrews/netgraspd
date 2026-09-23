@@ -3,15 +3,62 @@
 Notable changes, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-**Versioning rule:** one minor version per shipped milestone, starting at 0.1.0
-for milestone 1. A feature landing on top of milestone 3 is therefore 0.4.0.
-There is no 1.0 until the daemon has run unattended on a real network for long
-enough to earn it; see
-[What has and has not been exercised](README.md#what-has-and-has-not-been-exercised).
+**Versioning rule:** from 1.0.0 on, semantic versioning over three surfaces:
+the command line, the configuration file, and the `ng_` schema. A change that
+breaks any of them is a major; a feature is a minor; a fix is a patch. **A
+change to the `ng_` schema is always a paired release** with the Trovato plugin,
+because the two share those tables; see
+[Compatibility](README.md#compatibility).
+
+Before 1.0.0 the rule was one minor per shipped milestone, starting at 0.1.0 for
+milestone 1, so a feature landing on top of milestone 3 was 0.4.0. That rule
+also said there would be no 1.0 until the daemon had run unattended on a real
+network long enough to earn it. 1.0.0 is cut before that has happened, by
+decision rather than by oversight, and its entry says so first.
 
 The entries for 0.1.0 to 0.3.0 were written after the fact, from the README's
 milestone sections and `ARCHITECTURE.md`. They describe what those milestones
 shipped rather than a release that was tagged at the time.
+
+## [1.0.0] - 2026-09-23
+
+**This daemon has never contacted a real UniFi controller.** The enricher is
+tested over real HTTP against a mock controller, and the JSON shape of real
+firmware is inferred from published responses. It has also never run
+unattended on a real network for longer than an evening: the longest live run
+was about half an hour on a home LAN on 2026-09-17. UniFi is optional and off by
+default, and everything except the access point and room columns works without
+it. The README's
+[What has and has not been exercised](https://github.com/jeremyandrews/netgraspd#what-has-and-has-not-been-exercised)
+is the full account, and it should be read before this is trusted on a network
+you care about.
+
+1.0.0 is a release of the code that was 0.4.1, with no functional change. What
+it adds is the ability to install it without building it, and a stated pairing
+with the Trovato plugin.
+
+### Added
+
+- **Releases.** A `v*` tag builds the image for `linux/amd64` and `linux/arm64`,
+  pushes it to `ghcr.io/jeremyandrews/netgraspd` as `1.0.0`, `1.0` and `latest`,
+  and attaches both binaries and a `SHA256SUMS` to the GitHub Release. Each
+  binary is extracted from the pushed image rather than built a second time, so
+  it is the binary a user of the image runs. The notes are this file's section
+  for the tag, and a tag that disagrees with `Cargo.toml`, or that has no
+  section here, is refused before anything is built.
+- **Install from the release** in the README: the image, the binary, the
+  systemd unit and the example configuration, without a Rust toolchain.
+- **Compatibility** in the README: this release pairs with `netgrasp-trovato`
+  1.0.0 on schema version 3, and the rule that keeps the two in step.
+
+### Changed
+
+- The versioning rule, above. The version is now a promise about the command
+  line, the configuration and the schema rather than a count of milestones.
+- The README's account of what has been exercised is brought up to date with
+  the first joint run with the plugin (2026-09-17), the first capture on a real
+  home network and the first on macOS. It still says, first, that no real UniFi
+  controller has been contacted.
 
 ## [0.4.1] - 2026-09-18
 

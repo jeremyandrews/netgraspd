@@ -1,0 +1,246 @@
+# Release: a `v*` tag becomes a GitHub Release with both binaries and a
+# multi-architecture image on the GitHub container registry.
+#
+# The build is ci.yml's `docker` job, run for real: the same Dockerfile, the same
+# two platforms, the same gha cache scopes (so a tag cut from a green `main`
+# builds mostly from cache), and the same checks that the image runs
+# unprivileged and that each binary is for the architecture it claims.
+#
+# What changes is the ordering. CI builds an image and pulls the binary out of
+# it; here each platform's image is pushed first, by digest, and the binary is
+# pulled out of *that pushed image*. So the binary attached to the Release is
+# byte for byte the one inside the image a user pulls, and there is no second
+# build that could quietly differ from the first.
+#
+# The tag is `v1.2.3` and everything published carries `1.2.3`: the image tags
+# are `1.2.3`, `1.2` and `latest`, matching how the Trovato kernel image is
+# tagged. A tag that disagrees with `Cargo.toml` is refused before anything is
+# built, because a Release named 1.0.0 whose `--version` prints 0.4.1 is worse
+# than no Release.
+#
+# The notes are the tag's section of CHANGELOG.md, verbatim. Nothing is
+# written here that the changelog does not already say.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  version:
+    name: tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: v
+        name: Compare
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          echo "tag $tag, Cargo.toml $crate"
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $crate"
+            exit 1
+          fi
+          echo "version=$crate" >> "$GITHUB_OUTPUT"
+
+      # The notes come from the changelog, so a tag with no changelog section
+      # would publish an empty Release. Fail here, before an hour of arm64
+      # emulation, rather than at the end.
+      - name: CHANGELOG.md has a section for this version
+        run: scripts/release-notes.sh "${{ steps.v.outputs.version }}" > /dev/null
+
+  image:
+    name: image and binary (${{ matrix.platform }})
+    needs: version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            target: x86_64-unknown-linux-gnu
+            arch: x86-64
+            slug: amd64
+          - platform: linux/arm64
+            target: aarch64-unknown-linux-gnu
+            arch: aarch64
+            slug: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Pushed by digest and untagged: nothing is visible under a tag until the
+      # merge job below has both platforms and writes the manifest list.
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+
+      # The same assertion as CI, against the pushed image rather than a local
+      # one: it runs unprivileged and reports the version the tag names.
+      - name: The pushed image runs unprivileged and reports the tag's version
+        run: |
+          ref="${IMAGE}@${{ steps.build.outputs.digest }}"
+          expected="netgraspd ${{ needs.version.outputs.version }}"
+          got="$(docker run --rm --platform ${{ matrix.platform }} "$ref" --version)"
+          echo "$got"
+          test "$got" = "$expected"
+          docker run --rm --platform ${{ matrix.platform }} "$ref" --help > /dev/null
+
+      - name: Extract the binary from the pushed image
+        run: |
+          ref="${IMAGE}@${{ steps.build.outputs.digest }}"
+          name="netgraspd-${{ needs.version.outputs.version }}-${{ matrix.target }}"
+          id=$(docker create --platform ${{ matrix.platform }} "$ref")
+          docker cp "$id:/usr/local/bin/netgraspd" "./$name"
+          docker rm "$id"
+          file "./$name"
+          file "./$name" | grep -qi '${{ matrix.arch }}'
+          mkdir -p dist
+          mv "./$name" dist/
+
+      - name: Record the digest
+        run: |
+          mkdir -p digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.slug }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.slug }}
+          path: digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  manifest:
+    name: multi-arch manifest
+    needs: [version, image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create the manifest list under the version, major.minor and latest
+        working-directory: digests
+        run: |
+          version="${{ needs.version.outputs.version }}"
+          minor="${version%.*}"
+          sources=()
+          for digest in *; do sources+=("${IMAGE}@sha256:${digest}"); done
+          test "${#sources[@]}" -eq 2 \
+            || { echo "::error::expected 2 platform digests, found ${#sources[@]}"; exit 1; }
+          docker buildx imagetools create \
+            -t "${IMAGE}:${version}" \
+            -t "${IMAGE}:${minor}" \
+            -t "${IMAGE}:latest" \
+            "${sources[@]}"
+
+      - name: Both platforms are in it
+        run: |
+          docker buildx imagetools inspect "${IMAGE}:${{ needs.version.outputs.version }}" | tee inspect.txt
+          grep -q 'linux/amd64' inspect.txt
+          grep -q 'linux/arm64' inspect.txt
+
+  release:
+    name: GitHub Release
+    needs: [version, image, manifest]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: binary-*
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          chmod +x netgraspd-*
+          sha256sum netgraspd-* > SHA256SUMS
+          cat SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 2
+
+      - name: Notes from CHANGELOG.md
+        run: |
+          version="${{ needs.version.outputs.version }}"
+          {
+            scripts/release-notes.sh "$version"
+            echo
+            echo "## Install"
+            echo
+            echo '```sh'
+            echo "docker pull ${IMAGE}:${version}"
+            echo '```'
+            echo
+            echo "Or download the binary for your architecture below and check it"
+            echo "against \`SHA256SUMS\`. The README's Install section has the rest."
+          } > notes.md
+          cat notes.md
+
+      - name: Create the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --title "netgraspd ${{ needs.version.outputs.version }}" \
+            --notes-file notes.md \
+            dist/netgraspd-* dist/SHA256SUMS
