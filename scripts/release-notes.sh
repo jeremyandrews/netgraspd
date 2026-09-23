@@ -20,7 +20,7 @@ notes="$(awk -v heading="## [$version]" '
 
 # Trim the blank lines either side, and refuse an empty section.
 notes="$(printf '%s\n' "$notes" | sed -e '/./,$!d')"
-if [ -z "${notes//[[:space:]]/}" ]; then
+if ! printf '%s' "$notes" | grep -q '[^[:space:]]'; then
     echo "error: CHANGELOG.md has no section for [$version]" >&2
     exit 1
 fi
