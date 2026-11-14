@@ -580,9 +580,15 @@ sources, 185 MB on a Docker host with twenty-three.
 
 ## Open questions
 
-1. macOS daemon support: pcap over BPF works but needs root or a `/dev/bpf*`
-   group, and each protocol wants re-verification there. Linux is the target;
-   macOS is a development convenience.
+1. macOS daemon support. Settled for capture: on 2026-11-14 all six sources
+   ran on a Mac Studio's Wi-Fi LAN for fifteen minutes as an ordinary user in a
+   group with read and write on `/dev/bpf*`, with no privilege raised by the
+   daemon. The default interface selection keeps only up, carrier-bearing,
+   Ethernet, IPv4-addressed interfaces on both platforms, which leaves out the
+   tunnels and link-local-only interfaces a Mac lists by the dozen. Still open:
+   resident memory is not self-reported on macOS (it would need a libc call that
+   `forbid(unsafe_code)` rules out), no Mac has run unattended, and Linux remains
+   the deployment target.
 2. Whether devices become kernel Items or lightweight records is a plugin
    decision, not a daemon one. The daemon's side of it is settled:
    `ng_devices.trovato_item_id` is a UUID the plugin fills and the daemon only

@@ -213,3 +213,13 @@ machine after whatever it last looked for.
 A browser announcement on UDP 138: source name `JEREMY-PC<00>`, destination name
 `WORKGROUP<1d>`, then a few bytes of SMB mailslot data. The suffix is what decides
 that one is a machine and the other is a workgroup.
+
+## Interface lists
+
+### `macos_ifconfig.txt`
+
+Not a frame: the full `ifconfig` output of a Mac Studio on 2026-11-14, read by
+the default interface selection test in `src/capture/mod.rs`. Recorded, not
+synthesised. Only the tailnet addresses on `utun4` were replaced (with
+`100.64.0.1` and `fd7a:115c:a1e0::1`); macOS itself printed every hardware
+address as `02:00:00:00:00:00` to the unprivileged user that ran it.

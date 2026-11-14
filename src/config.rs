@@ -318,8 +318,9 @@ impl Default for DatabaseConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CaptureConfig {
-    /// Interfaces to listen on. Empty means every non-loopback interface that
-    /// is up and has an address.
+    /// Interfaces to listen on. Empty means every interface that is up with
+    /// carrier, not loopback, Ethernet, and holds an IPv4 address; see
+    /// [`crate::capture::select_default_interfaces`].
     pub interfaces: Vec<String>,
     /// Capture sources to start, by name. Milestone 1 implements `arp` and
     /// `mdns`; the rest are stubs that decline to start.

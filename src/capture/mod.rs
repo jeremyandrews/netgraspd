@@ -259,8 +259,10 @@ fn permission_error(interface: &str, err: &pcap::Error) -> anyhow::Error {
              Packet capture needs raw socket access. Either run netgraspd as root, or grant \
              the capability once:\n\n    \
              sudo setcap cap_net_raw,cap_net_admin+ep $(which netgraspd)\n\n\
-             On macOS there is no setcap: run under sudo, or install Wireshark's ChmodBPF \
-             helper so that members of the access_bpf group can open /dev/bpf*."
+             On macOS there is no setcap: run under sudo, or give a group access to \
+             /dev/bpf*. Permanently, install Wireshark's ChmodBPF helper (brew install --cask \
+             wireshark-chmodbpf) so that members of the access_bpf group can open it; until \
+             the next reboot, sudo chgrp admin /dev/bpf* && sudo chmod g+rw /dev/bpf*."
         )
     } else {
         anyhow!("cannot open capture on {interface}: {text}")
@@ -280,16 +282,149 @@ pub fn looks_like_permission_denied(message: &str) -> bool {
         || m.contains("socket: operation not permitted")
 }
 
+/// libpcap's link-layer type for Ethernet (`DLT_EN10MB`), which is also what
+/// Wi-Fi presents in non-monitor mode on both Linux and macOS.
+pub const LINK_TYPE_ETHERNET: i32 = 1;
+
+/// What the default interface selection needs to know about one interface.
+///
+/// Plain data rather than a `pcap::Device`, so that the selection rule is a
+/// pure function that can be tested on every platform against a recorded or
+/// constructed interface list, without a live device list or capture
+/// permission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceDescription {
+    /// The name libpcap knows it by.
+    pub name: String,
+    /// `IFF_UP`: administratively up.
+    pub up: bool,
+    /// `IFF_RUNNING`: the driver says it is operational.
+    pub running: bool,
+    /// `IFF_LOOPBACK`.
+    pub loopback: bool,
+    /// libpcap reports the link as disconnected (no carrier). macOS sets
+    /// `IFF_RUNNING` on an Ethernet port with nothing plugged in, so the flag
+    /// alone does not say there is a link; this does.
+    pub disconnected: bool,
+    /// libpcap's link-layer type, when it was read. `None` when the interface
+    /// was not opened, or could not be.
+    pub link_type: Option<i32>,
+    /// Every address the interface holds.
+    pub addresses: Vec<std::net::IpAddr>,
+}
+
+impl InterfaceDescription {
+    /// Describes a libpcap device. The link type is left unread, because it
+    /// can only be read by opening the device.
+    fn from_device(device: &pcap::Device) -> Self {
+        InterfaceDescription {
+            name: device.name.clone(),
+            up: device.flags.is_up(),
+            running: device.flags.is_running(),
+            loopback: device.flags.is_loopback(),
+            disconnected: device.flags.connection_status == pcap::ConnectionStatus::Disconnected,
+            link_type: None,
+            addresses: device.addresses.iter().map(|a| a.addr).collect(),
+        }
+    }
+
+    /// Why the default selection leaves this interface out, judged on
+    /// everything except the link type; `None` when it may be kept.
+    ///
+    /// Split from [`exclusion`](Self::exclusion) so that the caller only opens
+    /// a device to read its link type when nothing cheaper has ruled it out.
+    #[must_use]
+    pub fn exclusion_before_link_type(&self) -> Option<&'static str> {
+        if self.loopback {
+            Some("loopback")
+        } else if !self.up {
+            Some("down")
+        } else if !self.running || self.disconnected {
+            Some("no carrier")
+        } else if !self.addresses.iter().any(std::net::IpAddr::is_ipv4) {
+            Some("no IPv4 address")
+        } else {
+            None
+        }
+    }
+
+    /// Why the default selection leaves this interface out, or `None` when it
+    /// is kept.
+    #[must_use]
+    pub fn exclusion(&self) -> Option<&'static str> {
+        self.exclusion_before_link_type().or(match self.link_type {
+            Some(LINK_TYPE_ETHERNET) => None,
+            Some(_) => Some("not an Ethernet link layer"),
+            None => Some("link layer could not be read"),
+        })
+    }
+}
+
+/// The default interface selection: the names of the interfaces that carry a
+/// broadcast LAN, in the order given.
+///
+/// Kept: up, running and not reported disconnected, not loopback, an Ethernet
+/// link layer, and at least one IPv4 address. Every capture source is a
+/// broadcast or link-local multicast protocol on Ethernet framing, so that is
+/// what an interface has to carry to be worth a pcap handle per source.
+///
+/// What that drops, and why each matters:
+///
+/// - **Tunnels** (`utun*` on macOS, `tailscale0`, `wg0`): no Ethernet header,
+///   so the ARP filter does not even compile on them, and nothing on them is a
+///   LAN neighbour.
+/// - **Link-local-only interfaces** (`awdl0`, `llw0`, `anpi*` and `anri0` on
+///   macOS; `veth*` on Linux): they hold only an IPv6 link-local address,
+///   because they are point-to-point links to one peer or to the host itself.
+/// - **Ports with no carrier** (an unplugged `en0`, `docker0` with no
+///   containers).
+///
+/// An addressed bridge with carrier is kept. That covers a router's LAN bridge
+/// and also a hypervisor's or container runtime's host network (`bridge100`
+/// on macOS, `docker0` with containers, `cni0`). Those two cannot be told apart
+/// from the interface alone: both are an Ethernet bridge the host is the
+/// gateway of, and dropping one by its shape would drop the other.
+#[must_use]
+pub fn select_default_interfaces(interfaces: &[InterfaceDescription]) -> Vec<String> {
+    interfaces
+        .iter()
+        .filter(|i| i.exclusion().is_none())
+        .map(|i| i.name.clone())
+        .collect()
+}
+
+/// Reads an interface's link-layer type by opening it briefly.
+///
+/// `Ok(None)` when the device will not open for a reason other than privilege,
+/// which leaves it out of the default selection. A privilege failure is an
+/// error, so that a process without capture permission gets the permission
+/// guidance rather than "no usable interfaces".
+fn probe_link_type(name: &str) -> Result<Option<i32>> {
+    let opened = pcap::Capture::from_device(name)
+        .and_then(|cap| cap.snaplen(64).promisc(false).timeout(10).open());
+    match opened {
+        Ok(cap) => Ok(Some(cap.get_datalink().0)),
+        Err(err) if looks_like_permission_denied(&err.to_string()) => {
+            Err(permission_error(name, &err))
+        }
+        Err(err) => {
+            tracing::debug!(interface = name, %err, "could not open interface to read its link type");
+            Ok(None)
+        }
+    }
+}
+
 /// Resolves the interfaces to listen on.
 ///
-/// An empty request means every non-loopback interface that is up. An explicit
-/// list is honoured as given, and a name that does not exist is an error rather
-/// than a silent omission.
+/// An empty request means [`select_default_interfaces`] over every device
+/// libpcap lists. An explicit list is honoured as given, and a name that does
+/// not exist is an error rather than a silent omission.
 ///
 /// # Errors
 ///
 /// Returns an error when the device list cannot be read, when a requested
-/// interface does not exist, or when nothing usable is left.
+/// interface does not exist, when the process may not open a device to read
+/// its link type, or when nothing usable is left.
 pub fn resolve_interfaces(requested: &[String]) -> Result<Vec<String>> {
     let devices = pcap::Device::list().context("could not list capture devices")?;
     if !requested.is_empty() {
@@ -305,14 +440,33 @@ pub fn resolve_interfaces(requested: &[String]) -> Result<Vec<String>> {
         return Ok(requested.to_vec());
     }
 
-    let usable: Vec<String> = devices
-        .into_iter()
-        .filter(|d| !d.flags.is_loopback() && d.flags.is_up() && !d.addresses.is_empty())
-        .map(|d| d.name)
+    let mut interfaces: Vec<InterfaceDescription> = devices
+        .iter()
+        .map(InterfaceDescription::from_device)
         .collect();
-    if usable.is_empty() {
-        bail!("no usable capture interfaces found (none are up, non-loopback and addressed)");
+    for interface in &mut interfaces {
+        if interface.exclusion_before_link_type().is_none() {
+            interface.link_type = probe_link_type(&interface.name)?;
+        }
     }
+    for interface in &interfaces {
+        if let Some(reason) = interface.exclusion() {
+            tracing::debug!(interface = %interface.name, reason, "interface left out of the default selection");
+        }
+    }
+
+    let usable = select_default_interfaces(&interfaces);
+    if usable.is_empty() {
+        bail!(
+            "no usable capture interfaces found: none is up with carrier, non-loopback, Ethernet \
+             and holding an IPv4 address; name one with capture.interfaces or -i"
+        );
+    }
+    tracing::info!(
+        selected = ?usable,
+        left_out = interfaces.len() - usable.len(),
+        "capture interfaces chosen by default; capture.interfaces or -i overrides this"
+    );
     Ok(usable)
 }
 
@@ -457,6 +611,7 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("setcap cap_net_raw"), "{text}");
         assert!(text.contains("ChmodBPF"), "{text}");
+        assert!(text.contains("chgrp admin /dev/bpf*"), "{text}");
     }
 
     #[test]
@@ -529,5 +684,185 @@ mod tests {
             tv_sec: secs.try_into().unwrap_or_default(),
             tv_usec: usecs.try_into().unwrap_or_default(),
         }
+    }
+
+    /// Turns `ifconfig` output from macOS into interface descriptions, the way
+    /// libpcap would describe the same interfaces.
+    ///
+    /// `ifconfig` prints `ether` only for an Ethernet link layer, and
+    /// `status: inactive` where libpcap reports the connection as
+    /// disconnected. Checked against `pcap::Device::list()` and
+    /// `pcap_datalink` on the same machine at the same moment: they agreed on
+    /// every interface.
+    fn parse_macos_ifconfig(text: &str) -> Vec<InterfaceDescription> {
+        let mut interfaces: Vec<InterfaceDescription> = Vec::new();
+        for line in text.lines() {
+            if !line.starts_with(['\t', ' ']) {
+                let (name, rest) = line.split_once(": flags=").expect("an interface header");
+                let flags = rest
+                    .split_once('<')
+                    .and_then(|(_, f)| f.split_once('>'))
+                    .map_or("", |(f, _)| f);
+                let has = |flag: &str| flags.split(',').any(|f| f == flag);
+                interfaces.push(InterfaceDescription {
+                    name: name.to_string(),
+                    up: has("UP"),
+                    running: has("RUNNING"),
+                    loopback: has("LOOPBACK"),
+                    disconnected: false,
+                    link_type: None,
+                    addresses: Vec::new(),
+                });
+                continue;
+            }
+            let current = interfaces.last_mut().expect("a line inside an interface");
+            let mut words = line.split_whitespace();
+            match (words.next(), words.next()) {
+                (Some("ether"), _) => current.link_type = Some(LINK_TYPE_ETHERNET),
+                (Some("inet"), Some(addr)) => current.addresses.push(addr.parse().expect("IPv4")),
+                (Some("inet6"), Some(addr)) => {
+                    let addr = addr.split('%').next().unwrap_or(addr);
+                    current.addresses.push(addr.parse().expect("IPv6"));
+                }
+                (Some("status:"), Some("inactive")) => current.disconnected = true,
+                _ => {}
+            }
+        }
+        // ifconfig prints no link-layer line for a tunnel; libpcap reports
+        // DLT_NULL or DLT_RAW there, which is not Ethernet either way.
+        for interface in &mut interfaces {
+            interface.link_type.get_or_insert(0);
+        }
+        interfaces
+    }
+
+    /// The Mac Studio's interfaces on 2026-11-14: Wi-Fi on the LAN as `en1`,
+    /// Tailscale and other VPN tunnels on `utun*`, OrbStack's VM networks on
+    /// `bridge100` to `bridge105`, and every unplugged Thunderbolt and
+    /// Ethernet port. Recorded with `ifconfig`; only the tailnet addresses were
+    /// replaced.
+    #[test]
+    fn the_default_selection_on_a_recorded_mac_keeps_the_lan_and_drops_the_rest() {
+        let interfaces =
+            parse_macos_ifconfig(include_str!("../../tests/fixtures/macos_ifconfig.txt"));
+        assert_eq!(interfaces.len(), 52, "the whole recorded list was parsed");
+
+        let selected = select_default_interfaces(&interfaces);
+        assert_eq!(
+            selected,
+            vec![
+                "en1",
+                // OrbStack's host networks: Ethernet bridges with carrier and
+                // an IPv4 address, the same shape as a router's LAN bridge.
+                // See select_default_interfaces for why they stay.
+                "bridge100",
+                "bridge101",
+                "bridge102",
+                "bridge103",
+                // In the order the system lists them, which is not numeric.
+                "bridge105",
+                "bridge104",
+            ]
+        );
+
+        let reason = |name: &str| {
+            interfaces
+                .iter()
+                .find(|i| i.name == name)
+                .unwrap_or_else(|| panic!("{name} is in the fixture"))
+                .exclusion()
+        };
+        assert_eq!(reason("lo0"), Some("loopback"));
+        assert_eq!(reason("ap1"), Some("down"));
+        assert_eq!(reason("awdl0"), Some("no IPv4 address"));
+        assert_eq!(reason("llw0"), Some("no IPv4 address"));
+        assert_eq!(reason("anri0"), Some("no IPv4 address"));
+        assert_eq!(reason("anpi0"), Some("no carrier"));
+        assert_eq!(
+            reason("en0"),
+            Some("no carrier"),
+            "an unplugged port still says RUNNING"
+        );
+        assert_eq!(reason("bridge0"), Some("no carrier"));
+        assert_eq!(reason("utun0"), Some("no IPv4 address"));
+        // The tailnet tunnel is the one utun with an IPv4 address; it has no
+        // Ethernet header, so the ARP filter would not compile on it.
+        assert_eq!(reason("utun4"), Some("not an Ethernet link layer"));
+        for i in &interfaces {
+            let name = i.name.as_str();
+            if ["awdl0", "llw0", "ap1"].contains(&name)
+                || ["utun", "anpi", "vmenet", "gif", "stf", "nan"]
+                    .iter()
+                    .any(|p| name.starts_with(p))
+            {
+                assert!(
+                    !selected.iter().any(|s| s == name),
+                    "{name} must be dropped"
+                );
+            }
+        }
+    }
+
+    /// A k3s node running flannel and Docker. **Constructed, not captured**:
+    /// the shape is what `ip addr` shows on such a node, written out by hand.
+    #[test]
+    fn the_default_selection_on_a_k3s_node_keeps_the_lan_and_the_pod_bridge() {
+        let iface =
+            |name: &str, running: bool, link_type: i32, addresses: &[&str]| InterfaceDescription {
+                name: name.to_string(),
+                up: true,
+                running,
+                loopback: name == "lo",
+                disconnected: false,
+                link_type: Some(link_type),
+                addresses: addresses
+                    .iter()
+                    .map(|a| a.parse().expect("an address"))
+                    .collect(),
+            };
+        let interfaces = vec![
+            iface("lo", true, 772, &["127.0.0.1", "::1"]),
+            iface(
+                "enp3s0",
+                true,
+                1,
+                &["192.168.1.20", "fe80::1e1d:d3ff:fe00:1"],
+            ),
+            // The bridge pods hang off. It is kept: the node is the gateway of
+            // an Ethernet broadcast domain, the same shape as a router's LAN,
+            // and pods answering ARP and mDNS on it are devices of a kind.
+            iface("cni0", true, 1, &["10.42.0.1", "fe80::1"]),
+            // VXLAN to the other nodes. Linux presents it as Ethernet and gives
+            // it a /32, so it is kept by the same rule; it carries the
+            // cluster's ARP between nodes, which is real traffic.
+            iface("flannel.1", true, 1, &["10.42.0.0", "fe80::2"]),
+            // One end of each pod's veth pair: link-local IPv6 only.
+            iface("veth3a1b2c4d", true, 1, &["fe80::3"]),
+            iface("vethd4e5f6a7", true, 1, &["fe80::4"]),
+            // Docker with no containers: up, addressed, NO-CARRIER, so no
+            // IFF_RUNNING.
+            iface("docker0", false, 1, &["172.17.0.1"]),
+            // A tailnet: an IPv4 address, but no Ethernet header (DLT_RAW).
+            iface("tailscale0", true, 12, &["100.64.0.2", "fd7a:115c:a1e0::2"]),
+        ];
+        assert_eq!(
+            select_default_interfaces(&interfaces),
+            vec!["enp3s0", "cni0", "flannel.1"]
+        );
+    }
+
+    #[test]
+    fn an_interface_whose_link_type_was_not_read_is_left_out() {
+        let interface = InterfaceDescription {
+            name: "en1".into(),
+            up: true,
+            running: true,
+            loopback: false,
+            disconnected: false,
+            link_type: None,
+            addresses: vec!["10.0.0.2".parse().expect("an address")],
+        };
+        assert_eq!(interface.exclusion_before_link_type(), None);
+        assert_eq!(interface.exclusion(), Some("link layer could not be read"));
     }
 }
