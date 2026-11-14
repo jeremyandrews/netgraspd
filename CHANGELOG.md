@@ -20,6 +20,17 @@ The entries for 0.1.0 to 0.3.0 were written after the fact, from the README's
 milestone sections and `ARCHITECTURE.md`. They describe what those milestones
 shipped rather than a release that was tagged at the time.
 
+## [Unreleased]
+
+### Changed
+
+- **Behavior change:** with no `capture.interfaces` and no `-i`, capture only on interfaces that are up with carrier, not loopback, Ethernet and IPv4-addressed ([#15](https://github.com/jeremyandrews/netgraspd/pull/15)).
+- The macOS permission message names both routes, ChmodBPF and the `admin` group `chmod` ([#15](https://github.com/jeremyandrews/netgraspd/pull/15)).
+
+### Documentation
+
+- README: Capturing on macOS, the 2026-11-14 run of all six sources on macOS as an ordinary user, and macOS resident memory ([#15](https://github.com/jeremyandrews/netgraspd/pull/15)).
+
 ## [1.0.0] - 2026-09-23
 
 **This daemon has never contacted a real UniFi controller.** The enricher is
