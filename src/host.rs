@@ -67,13 +67,37 @@ pub fn read() -> HostFacts {
     }
 }
 
+/// What Apple platforms report in place of a hardware address they decline to
+/// disclose. Observed on the Mac Studio on 2026-11-15 for every interface, from
+/// `ifconfig` and `getifaddrs` alike, as an ordinary user: it is a placeholder,
+/// not an address, and no frame on the wire carries it.
+pub const WITHHELD_MAC: MacAddr = MacAddr([0x02, 0, 0, 0, 0, 0]);
+
+/// The captured interfaces whose hardware address the operating system
+/// withheld, so that the daemon can say why the capture host is not
+/// identified rather than guess.
+#[must_use]
+pub fn withheld(facts: &HostFacts, captured: &[String]) -> Vec<String> {
+    captured
+        .iter()
+        .filter(|name| {
+            facts
+                .interfaces
+                .iter()
+                .any(|i| i.name == **name && i.mac == Some(WITHHELD_MAC))
+        })
+        .cloned()
+        .collect()
+}
+
 /// The capture host's own MACs on the interfaces it captures on.
 ///
 /// The host is recorded under the MAC of the interface its default route
 /// leaves by, when that interface is captured; otherwise under the first
 /// captured interface that has a MAC. Every other captured interface's MAC is
 /// an alias of it. `None` when no captured interface has a usable MAC (a
-/// capture on tunnels only), in which case nothing is folded.
+/// capture on tunnels only, or an operating system that withholds them; see
+/// [`WITHHELD_MAC`]), in which case nothing is folded.
 #[must_use]
 pub fn capture_host(facts: &HostFacts, captured: &[String]) -> Option<CaptureHost> {
     let mac_of = |name: &str| {
@@ -82,7 +106,7 @@ pub fn capture_host(facts: &HostFacts, captured: &[String]) -> Option<CaptureHos
             .iter()
             .find(|i| i.name == name)
             .and_then(|i| i.mac)
-            .filter(|m| !m.is_zero() && !m.is_group())
+            .filter(|m| !m.is_zero() && !m.is_group() && *m != WITHHELD_MAC)
     };
     let own: Vec<(&str, MacAddr)> = captured
         .iter()
@@ -174,5 +198,33 @@ mod tests {
     #[test]
     fn capturing_only_on_tunnels_names_no_capture_host() {
         assert_eq!(capture_host(&studio(None), &names(&["utun4", "lo0"])), None);
+    }
+
+    #[test]
+    fn a_withheld_hardware_address_is_not_a_hardware_address() {
+        // What the Mac Studio's own OS answered on 2026-11-15, for every
+        // interface: the placeholder, never the address.
+        let facts = HostFacts {
+            route: Some(DefaultRoute {
+                gateway: Ipv4Addr::new(10, 20, 0, 1),
+                interface: "en1".to_string(),
+            }),
+            interfaces: vec![
+                iface("en1", Some("02:00:00:00:00:00")),
+                iface("bridge100", Some("02:00:00:00:00:00")),
+                iface("utun0", None),
+            ],
+        };
+        let captured = names(&["en1", "bridge100", "utun0"]);
+        assert_eq!(capture_host(&facts, &captured), None);
+        assert_eq!(withheld(&facts, &captured), names(&["en1", "bridge100"]));
+
+        // One withheld among real ones: the real ones still count.
+        let mut facts = studio(Some("en1"));
+        facts.interfaces[1].mac = Some(WITHHELD_MAC);
+        let host = capture_host(&facts, &names(&["en1", "bridge100", "bridge101"]))
+            .expect("a capture host");
+        assert_eq!(host.primary, mac("9a:3b:5c:7d:20:c8"));
+        assert_eq!(host.aliases, vec![mac("36:e6:8a:a1:7b:65")]);
     }
 }

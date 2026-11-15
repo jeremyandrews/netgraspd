@@ -267,7 +267,11 @@ running the daemon is still one device however many of these it captures on:
 the daemon reads each capture interface's hardware address from the operating
 system at startup, records the host under its MAC on the interface its default
 route leaves by, and does not turn its own frames on the other interfaces into
-devices. The VMs and containers behind a bridge are devices of their own. If
+devices. The VMs and containers behind a bridge are devices of their own. On a
+Mac where the operating system withholds interface hardware addresses from the
+user running the daemon (it reports `02:00:00:00:00:00` for every interface;
+`ifconfig` shows the same), the daemon cannot tell which MACs are its own, says
+so in a warning at startup, and records the host once per interface as before. If
 an earlier version already recorded the Mac's bridge addresses as devices,
 those rows are left alone and go offline like any silent device. If you do not
 want the bridges at all, name your LAN interface:

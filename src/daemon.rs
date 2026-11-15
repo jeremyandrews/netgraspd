@@ -169,9 +169,21 @@ pub async fn run(
     let host = crate::host::read();
     match crate::host::capture_host(&host, &interfaces) {
         Some(capture_host) => manager.set_capture_host(capture_host),
-        None => tracing::info!(
-            "no capture interface has a hardware address; the capture host is not identified"
-        ),
+        None => {
+            let withheld = crate::host::withheld(&host, &interfaces);
+            if withheld.is_empty() {
+                tracing::info!(
+                    "no capture interface has a hardware address; the capture host is not identified"
+                );
+            } else {
+                tracing::warn!(
+                    interfaces = ?withheld,
+                    "the operating system withheld these interfaces' hardware addresses \
+                     (it reports 02:00:00:00:00:00), so the capture host cannot be identified \
+                     and will be recorded once per interface it transmits on"
+                );
+            }
+        }
     }
 
     let (obs_tx, mut obs_rx) = mpsc::channel::<Observation>(config.capture.channel_capacity);

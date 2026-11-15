@@ -599,7 +599,11 @@ capture interface, with no such route), and frames from its other interfaces'
 MACs, such as a hypervisor's bridges, create no device and change no address.
 The analyzer chain still sees them. Rows earlier runs wrote for those MACs are
 left alone and go offline like any silent device. The route and the MACs both
-come from the `netdev` crate, a local read of the host's own tables.
+come from the `netdev` crate, a local read of the host's own tables. A Mac can
+withhold hardware addresses from an ordinary user and report the placeholder
+`02:00:00:00:00:00` instead; the Mac Studio did, for every interface, on
+2026-11-15. That placeholder is never taken for an address: the host is then
+not identified, a warning says why, and it is recorded per interface as before.
 
 ## Where deferred work attaches
 
