@@ -509,6 +509,9 @@ fn print_runtime_section(config: &Config, now: chrono::DateTime<Utc>) {
             println!("    {source:<8} {count:>10} observations  {rate:>8.2}/s");
         }
     }
+    for line in status.capture_failure_lines() {
+        println!("    {line}");
+    }
 
     if !status.enrichers.is_empty() {
         println!("  Enrichment");

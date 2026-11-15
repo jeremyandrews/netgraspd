@@ -24,6 +24,11 @@ clap = { version = "4.6.5", features = ["derive"] }
 deadpool-postgres = "0.14.1"
 figment = { version = "0.10.19", features = ["toml", "env", "test"] }
 hickory-resolver = { version = "0.26.1", features = ["tokio"] }
+# The capture host's own default route and interface hardware addresses, read
+# locally from the OS (netlink on Linux, the routing sysctl and getifaddrs on
+# macOS). Default features off: they pull in SystemConfiguration extras and
+# Android support this daemon does not use.
+netdev = { version = "0.47.0", default-features = false, features = ["gateway"] }
 pcap = "2.4.0"
 refinery = { version = "0.9.2", features = ["tokio-postgres"] }
 reqwest = { version = "0.12", default-features = false, features = [

@@ -83,6 +83,14 @@ pub struct Status {
     pub offline: usize,
     /// Observations seen per capture source, before deduplication.
     pub sources: BTreeMap<String, u64>,
+    /// Capture threads that ended in failure: which source, on which
+    /// interface, when and why. The other interfaces and sources keep running,
+    /// so without this a dead interface is invisible here.
+    ///
+    /// Defaulted on read so that a status file written by an older build still
+    /// parses.
+    #[serde(default)]
+    pub capture_failures: Vec<crate::capture::CaptureFailure>,
     /// Poll and failure counts per enricher.
     pub enrichers: BTreeMap<String, EnricherCounters>,
     /// Resident set size, when the platform can report it without unsafe code.
@@ -113,6 +121,7 @@ impl Status {
             idle: 0,
             offline: 0,
             sources: BTreeMap::new(),
+            capture_failures: Vec::new(),
             enrichers: BTreeMap::new(),
             resident_bytes: None,
         }
@@ -146,6 +155,23 @@ impl Status {
                 #[allow(clippy::cast_precision_loss)] // A count large enough to
                 // lose precision here would be trillions of packets.
                 (name.clone(), *count, *count as f64 / seconds)
+            })
+            .collect()
+    }
+
+    /// One line per failed capture thread, for `netgraspd stats`.
+    #[must_use]
+    pub fn capture_failure_lines(&self) -> Vec<String> {
+        self.capture_failures
+            .iter()
+            .map(|f| {
+                format!(
+                    "FAILED {} on {} at {}: {}",
+                    f.source,
+                    f.interface,
+                    f.at.format("%Y-%m-%d %H:%M:%S UTC"),
+                    f.error
+                )
             })
             .collect()
     }
@@ -299,6 +325,49 @@ mod tests {
 
         let read = Status::read(&path).expect("reads");
         assert_eq!(read, status);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_failed_capture_thread_is_recorded_and_printed() {
+        let dir = temp_dir("capture_failures");
+        let path = dir.join("status.json");
+        let mut status = Status::new(base());
+        status
+            .capture_failures
+            .push(crate::capture::CaptureFailure {
+                source: "arp".into(),
+                interface: "utun0".into(),
+                error: "BPF filter \"arp\" was rejected on utun0: expression rejects all packets"
+                    .into(),
+                at: base(),
+            });
+        status.write(&path).expect("writes");
+        let read = Status::read(&path).expect("reads");
+        assert_eq!(read.capture_failures, status.capture_failures);
+        assert_eq!(
+            read.capture_failure_lines(),
+            vec![
+                "FAILED arp on utun0 at 2026-08-14 09:00:00 UTC: BPF filter \"arp\" was \
+                 rejected on utun0: expression rejects all packets"
+                    .to_string()
+            ]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_status_file_from_before_capture_failures_still_parses() {
+        let dir = temp_dir("older_build");
+        let path = dir.join("status.json");
+        let mut json = serde_json::to_value(Status::new(base())).expect("encodes");
+        json.as_object_mut()
+            .expect("an object")
+            .remove("capture_failures");
+        std::fs::write(&path, serde_json::to_vec(&json).expect("encodes")).expect("writes");
+        let read = Status::read(&path).expect("an older file still parses");
+        assert!(read.capture_failures.is_empty());
+        assert!(read.capture_failure_lines().is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 

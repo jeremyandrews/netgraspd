@@ -98,6 +98,8 @@ pub struct RunSummary {
     pub location_changes: u64,
     /// Person arrivals and departures recorded.
     pub person_events: u64,
+    /// Capture threads that ended in failure, in the order they failed.
+    pub capture_failures: Vec<capture::CaptureFailure>,
 }
 
 /// Starts capture, processes observations, and returns when shutdown is
@@ -160,15 +162,35 @@ pub async fn run(
     capture::check_capture_permission(&first)?;
     tracing::info!(interfaces = ?interfaces, "capture permission confirmed");
 
+    // What the host already knows about itself, read locally once: the default
+    // route, which names the gateway, and its own interfaces' hardware
+    // addresses, which make it one device however many interfaces it captures
+    // on. See crate::host for why neither is guessed from the wire any more.
+    let host = crate::host::read();
+    match crate::host::capture_host(&host, &interfaces) {
+        Some(capture_host) => manager.set_capture_host(capture_host),
+        None => tracing::info!(
+            "no capture interface has a hardware address; the capture host is not identified"
+        ),
+    }
+
     let (obs_tx, mut obs_rx) = mpsc::channel::<Observation>(config.capture.channel_capacity);
+    // Capture threads that fail are reported here the moment they end, rather
+    // than when the daemon stops and awaits them.
+    let (failure_tx, mut failure_rx) = mpsc::channel::<capture::CaptureFailure>(64);
+    let mut failures_open = true;
     let mut source_handles = Vec::new();
     for source in capture::build_sources(&config.capture, &interfaces)? {
         let name = source.name().to_string();
-        source_handles.push((name, source.run(obs_tx.clone(), shutdown.clone())));
+        source_handles.push((
+            name,
+            source.run(obs_tx.clone(), failure_tx.clone(), shutdown.clone()),
+        ));
     }
     // The pipeline holds no sender of its own, so the channel closes when every
-    // capture source has stopped.
+    // capture source has stopped. The same goes for the failure channel.
     drop(obs_tx);
+    drop(failure_tx);
 
     let bus = EventBus::default();
     let notifier_handle = spawn_notifier(config, &db, &bus, shutdown.clone());
@@ -228,7 +250,13 @@ pub async fn run(
         config.capture.dedup_capacity,
         config.capture.dedup_resolution_secs,
     );
-    let mut analyzers = Chain::new(&config.security);
+    let mut analyzers =
+        Chain::new(&config.security).with_default_route(host.route.as_ref(), &interfaces);
+    tracing::info!(
+        gateway = ?analyzers.gateway().ip().map(|ip| ip.to_string()),
+        source = analyzers.gateway().ip_source().as_str(),
+        "gateway belief at startup"
+    );
     if analyzers.is_active() {
         tracing::info!(analyzers = ?analyzers.names(), "security analyzers running");
     } else {
@@ -263,6 +291,21 @@ pub async fn run(
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
                     break;
+                }
+            }
+
+            // Already logged by the capture layer when the thread ended; this
+            // records it where `netgraspd stats` can see it, at once.
+            failure = failure_rx.recv(), if failures_open => {
+                match failure {
+                    Some(failure) => {
+                        summary.capture_failures.push(failure);
+                        write_status(
+                            config, started_at, &summary, &manager, &dedup, &enricher_counters,
+                            analyzers.gateway().proxied().len(),
+                        );
+                    }
+                    None => failures_open = false,
                 }
             }
 
@@ -419,6 +462,9 @@ pub async fn run(
     drop(snapshot_tx);
     enrich_handle.abort();
 
+    // A capture thread that failed was logged and recorded when it failed; the
+    // pcap sources resolve Ok afterwards, so nothing below repeats it. An Err
+    // here is a source failing in some other way.
     for (name, handle) in source_handles {
         match handle.await {
             Ok(Ok(())) => {}
@@ -727,6 +773,7 @@ fn write_status(
     status.idle = idle;
     status.offline = offline;
     status.sources = summary.sources.clone();
+    status.capture_failures = summary.capture_failures.clone();
     status.enrichers = enricher_counters
         .iter()
         .map(|(name, polls, failures)| {

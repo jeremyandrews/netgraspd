@@ -390,9 +390,26 @@ bypass; it is the detector declining to say the same thing twice.
 
 `arp_spoof` treats a claim on the gateway address as an immediate alert, and
 `arp_scan` holds the gateway to a looser threshold, so the chain needs to know
-which device it is. In order of trust: configuration, then DHCP option 3, then
-the address the most *distinct* MACs have ARPed for. Distinct askers rather than
-total requests, because one device retrying one address would otherwise elect it.
+which device it is. In order of trust: configuration; then the capture host's
+own default route, read locally at startup; then DHCP option 3; then the address
+the most *distinct* MACs have ARPed for, once at least three have. Distinct
+askers rather than total requests, because one device retrying one address would
+otherwise elect it.
+
+The host route was added after the first C1 run on 2026-11-14, where popularity
+alone elected the capture host itself (three hosts ARPed for it within a
+second) and the real router's proxy ARP replies then read as five address
+conflicts and a gateway impersonation until a DHCP Ack corrected the belief at
+minute 8.5. A capture host that is not the router has a default route and is
+using it, so the daemon reads that instead of guessing. It ranks above DHCP
+because it is what this host actually routes through, while an Offer on the
+wire may be for somebody else. It counts only when the route leaves by a
+captured interface: a router running the daemon routes out of its WAN, and there
+DHCP and popularity decide as before. Only the address comes from the route; the
+MAC is still learned from the wire under the rule below. Popularity, as the
+fallback, now elects the leading candidate rather than the first to reach the
+quorum, so an address that got there early is overtaken by one more of the
+network asks about.
 
 Two rules stop this becoming an attack surface of its own:
 
@@ -560,6 +577,29 @@ or stale, and answers the database half regardless.
 Resident memory scales with interfaces × sources × `capture.buffer_size`, since
 each is a pcap handle with a kernel buffer: 15 MB on one interface with all six
 sources, 185 MB on a Docker host with twenty-three.
+
+### Capture failures surface when they happen
+
+Each source runs one blocking capture thread per interface. They are supervised
+together and collected in the order they **finish**, so a thread that fails is
+logged at `error`, naming the source, the interface and the error, the moment
+it ends, and is sent to the daemon over a channel. The daemon records it in the
+status file's `capture_failures`, which `stats` prints, and the other
+interfaces and sources keep running. Until the C1 run they were awaited in spawn
+order and only at shutdown, so the ARP filter rejected on eleven `utun`
+interfaces at startup was reported eleven times at SIGTERM, without naming an
+interface.
+
+### The capture host is one device
+
+At startup the daemon reads the hardware address of every capture interface
+from the operating system, never from the wire. The capture host is recorded
+under its MAC on the interface the default route leaves by (or the first
+capture interface, with no such route), and frames from its other interfaces'
+MACs, such as a hypervisor's bridges, create no device and change no address.
+The analyzer chain still sees them. Rows earlier runs wrote for those MACs are
+left alone and go offline like any silent device. The route and the MACs both
+come from the `netdev` crate, a local read of the host's own tables.
 
 ## Where deferred work attaches
 

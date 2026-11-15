@@ -221,14 +221,14 @@ impl Chain {
     }
 
     /// Seeds the gateway belief from the capture host's own default route,
-    /// builder style. Red-commit stub: ignores the route, which is `main`'s
-    /// behaviour.
+    /// builder style; see [`GatewayTracker::with_default_route`].
     #[must_use]
     pub fn with_default_route(
-        self,
-        _route: Option<&gateway::DefaultRoute>,
-        _captured: &[String],
+        mut self,
+        route: Option<&gateway::DefaultRoute>,
+        captured: &[String],
     ) -> Self {
+        self.context.gateway.apply_default_route(route, captured);
         self
     }
 
