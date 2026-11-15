@@ -408,6 +408,7 @@ netgraspd migrate                  # apply pending migrations, check, exit
 netgraspd maintain                 # run the nightly jobs now
 netgraspd maintain --dry-run       # ...and report what they would do
 netgraspd update-fingerprints URL  # refresh the DHCP fingerprint table
+netgraspd export DIR               # write a trip bundle; see below
 ```
 
 The first run on an empty database spends five minutes learning the network.
@@ -553,7 +554,10 @@ space back, `VACUUM FULL` while the daemon is stopped.
 missing:
 
 - The **runtime status file** for facts about the process: uptime, resident
-  memory, per-source capture rates, enricher poll and failure counts. `stats` is
+  memory, per-source capture rates, enricher poll and failure counts, and the
+  [visibility report](#running-on-a-network-you-do-not-own): per interface and
+  source, frames, distinct senders and listening time, the gateway belief, and
+  a verdict. `stats` is
   a separate process, so none of that can come from Postgres. If the file is
   absent or stale, `stats` says the daemon is not running and answers the rest
   regardless.
@@ -573,6 +577,130 @@ the handle count: measured with `ps` on a Mac Studio, 115 handles (six sources
 on twenty-one interfaces, under the previous default selection) held 23.8 MB and 42 handles
 held 21.7 MB. `stats` cannot report it there; see
 [Capturing on macOS](#capturing-on-macos).
+
+## Running on a network you do not own
+
+A hotel, a conference, a friend's flat: a few hours on a network with no
+controller of yours on it, hundreds of strangers' devices, and quite possibly
+wireless client isolation hiding every one of them. netgraspd still never
+sends a packet there. What changes is the configuration, what you read, and
+what you take home.
+
+**The profile.** [`netgrasp.foreign.toml.example`](netgrasp.foreign.toml.example)
+is an ordinary configuration file, not a mode: notifications off (every
+analyzer fires on an unknown network and the alerts are noise; the events are
+still recorded), enrichment off, reverse DNS off, all six sources on, one day of
+retention, the unknown-device sample on, and its own database, never the home
+one. Its status file and sample are relative paths, so they land where you run
+it and an ordinary user can write them; run every command from one directory.
+
+```sh
+createdb netgrasp_trip --owner netgrasp     # once, or CREATE DATABASE in psql
+cp netgrasp.foreign.toml.example trip.toml
+netgraspd --config trip.toml migrate
+netgraspd --config trip.toml run -i en0     # `route -n get default` names it
+netgraspd --config trip.toml stats          # from another terminal, any time
+netgraspd --config trip.toml export trip-bundle
+```
+
+Name the interface. Left to the default selection, a Mac running OrbStack,
+Docker Desktop or another hypervisor keeps its bridges too, and they are not
+the network you came to look at.
+
+**The visibility report** is the first thing to read. `netgraspd stats` prints,
+per interface, how long it has been listening, how many frames arrived and from
+how many distinct senders, the same per source, and one plain verdict:
+
+```
+Visibility
+  gateway 10.20.0.1 (from route) at 00:11:22:33:44:01 (from inferred)
+  en0: listening 10m 0s, 40 frames from 2 senders
+    arp          40 frames  2 senders
+    capture is working: 1 sender seen (the gateway), consistent with client isolation
+```
+
+How to read it:
+
+- *capture is working: N senders seen besides this host* is an ordinary shared
+  segment.
+- *1 sender seen (the gateway), consistent with client isolation* is what an
+  isolated guest network looks like: the access point forwards the gateway's
+  broadcasts and nobody else's. Capture is fine; the network is hiding its
+  clients from you, and from everyone else. That is the honest answer, and
+  netgraspd will not probe to second-guess it.
+- *only this host's own frames arrive* means capture works (libpcap hands a
+  host its own broadcasts back) but nothing else reaches it, not even the
+  gateway: isolation that hides the gateway too, or an empty segment.
+- *nothing received on en0 in 10m: capture may be broken* means not even this
+  host's own frames arrived. Check permissions and the interface name. Under two
+  minutes it says it is too early to say instead.
+- *capture failed on X* means every capture thread there failed; the reason is
+  printed beside it.
+
+Frames are counted as the BPF filter delivers them, before any parser looks at
+them. The distinct sender count is bounded: each interface (and each source on
+it) remembers at most 4096 addresses, about 100 KiB, and beyond that reports
+"at least 4096". The gateway line says where the belief came from: `route`
+(this host's routing table), `dhcp`, `configured` or `inferred`.
+
+**The unknown-device sample** keeps the first few frames from each device the
+identifier could not name (no name from mDNS, DHCP, NetBIOS, SSDP, reverse DNS
+or a person; a vendor guess or a bare MAC does not count) in one pcap file, so
+they can be studied afterwards. It is off by default and on in the profile:
+
+```toml
+[capture.unknown_sample]
+enabled = true
+path = "netgraspd-trip/unknown-sample.pcap"   # relative to where you run it
+frames_per_device = 5
+max_devices = 200
+max_bytes = 10485760                          # the header included
+settle = "1m"
+```
+
+The frames are **broadcast and multicast only**, because that is all
+netgraspd's filters ever deliver; no unicast traffic of anyone's is in it.
+A device's frames are held for `settle` to give it the chance to be named (its
+DHCP request or mDNS announcement usually follows its first ARP), and dropped
+if it is; a device already named is never held at all, and the capture host's
+own frames are never kept. Each bound stops something and is logged once:
+`frames_per_device` stops that device, `max_devices` admits no new device, and
+`max_bytes` stops the file. An existing sample at the path is appended to, so a
+restart keeps what came before. `stats` shows how far it has got. Open it in
+Wireshark or `tcpdump -r`.
+
+**The export.** `netgraspd export DIR` writes a bundle that needs no database
+to read: `SUMMARY.md` for a person, and beside it `devices.json` (every device,
+what named it and what typed it, and every signal behind it), `events.json`
+(every event still in the database), `visibility.json` (the report and its
+verdicts), `config.json` (the configuration with every password, token, topic
+and API key replaced by `***`) and `unknown-sample.pcap` when there is one. It
+refuses a directory that already holds anything.
+
+**Leaving nothing behind.** Stop the daemon, export, then `dropdb
+netgrasp_trip` and delete the run directory. Nothing else was written.
+
+**Two honest ways to run it away from home:**
+
+- **Natively on macOS**, as yourself, once BPF access is set up; see
+  [Capturing on macOS](#capturing-on-macos). No container runtime on a Mac
+  can capture the Mac's own network.
+- **On a Linux host, from the image**, with host networking and the one
+  capability, the trip directory mounted as the working directory so the
+  relative paths land in it. The profile and `export` are newer than 1.0.0, so
+  use an image built from this repository (`docker build -t netgraspd .`, as in
+  [Docker](#docker)) until the next release:
+
+  ```sh
+  mkdir trip && cd trip
+  docker run --rm --entrypoint cat netgraspd \
+      /usr/share/netgraspd/netgrasp.foreign.toml.example > trip.toml
+  $EDITOR trip.toml              # database.url, for the database you brought
+  docker run --rm -it --network=host --cap-drop=ALL --cap-add=NET_RAW --user root \
+      -v "$PWD:/trip" -w /trip netgraspd --config trip.toml run -i wlan0 --no-table
+  docker run --rm --network=host -v "$PWD:/trip" -w /trip --user root \
+      netgraspd --config trip.toml export bundle
+  ```
 
 ## Deploying
 

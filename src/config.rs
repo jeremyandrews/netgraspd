@@ -368,6 +368,48 @@ pub struct UnknownSampleConfig {
     pub settle: HumanDuration,
 }
 
+impl UnknownSampleConfig {
+    /// Rejects bounds that would keep nothing, or keep without limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error, when the sample is on, for an empty path, a zero
+    /// bound, or a byte limit too small for the file header and one frame.
+    pub fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.path.as_os_str().is_empty() {
+            bail!("capture.unknown_sample.path is empty");
+        }
+        if self.frames_per_device == 0 {
+            bail!("capture.unknown_sample.frames_per_device must be at least 1");
+        }
+        if self.max_devices == 0 {
+            bail!("capture.unknown_sample.max_devices must be at least 1");
+        }
+        if self.max_bytes < 4096 {
+            bail!(
+                "capture.unknown_sample.max_bytes must be at least 4096, room for the file \
+                 header and a frame"
+            );
+        }
+        Ok(())
+    }
+
+    /// The bounds, in the sampler's terms.
+    #[must_use]
+    pub fn limits(&self) -> crate::capture::sample::SampleLimits {
+        crate::capture::sample::SampleLimits {
+            frames_per_device: self.frames_per_device,
+            max_devices: self.max_devices,
+            max_bytes: self.max_bytes,
+            settle: chrono::TimeDelta::from_std(self.settle.get())
+                .unwrap_or_else(|_| chrono::TimeDelta::minutes(1)),
+        }
+    }
+}
+
 impl Default for UnknownSampleConfig {
     fn default() -> Self {
         UnknownSampleConfig {
@@ -1366,7 +1408,24 @@ impl Config {
     /// password and API key.
     #[must_use]
     pub fn redacted(&self) -> Config {
-        self.clone()
+        fn hide(value: &mut String) {
+            if !value.is_empty() {
+                *value = REDACTED.to_string();
+            }
+        }
+        let mut out = self.clone();
+        out.database.url = redact_database_url(&out.database.url);
+        if let Some(ntfy) = out.notify.ntfy.as_mut() {
+            hide(&mut ntfy.topic);
+            if let Some(token) = ntfy.token.as_mut() {
+                hide(token);
+            }
+        }
+        let unifi = &mut out.enrichment.unifi;
+        hide(&mut unifi.username);
+        hide(&mut unifi.password);
+        hide(&mut unifi.api_key);
+        out
     }
 
     /// Rejects combinations that would misbehave silently at runtime.
@@ -1417,6 +1476,7 @@ impl Config {
                 bail!("notify.ntfy.server is empty");
             }
         }
+        self.capture.unknown_sample.validate()?;
         self.security.validate()?;
         self.enrichment.unifi.validate()?;
         self.maintenance.validate()?;
@@ -1710,6 +1770,20 @@ mod tests {
             );
             Ok(())
         });
+    }
+
+    #[test]
+    fn an_unknown_sample_with_a_zero_bound_is_rejected_only_when_it_is_on() {
+        let mut c = Config::default();
+        c.capture.unknown_sample.max_devices = 0;
+        c.validate().expect("off, so its bounds do not matter");
+        c.capture.unknown_sample.enabled = true;
+        let err = c.validate().expect_err("on with a zero bound");
+        assert!(err.to_string().contains("max_devices"), "{err}");
+        c.capture.unknown_sample.max_devices = 1;
+        c.capture.unknown_sample.max_bytes = 100;
+        let err = c.validate().expect_err("too small for a frame");
+        assert!(err.to_string().contains("max_bytes"), "{err}");
     }
 
     #[test]

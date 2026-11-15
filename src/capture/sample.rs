@@ -36,8 +36,8 @@
 //! - devices: no new device is admitted, admitted ones finish their quota;
 //! - total bytes, the file header included: nothing more is written at all.
 //!
-//! Held frames are bounded too: at most `max_devices` senders, each with at
-//! most `frames_per_device` frames of at most the capture snapshot length.
+//! Held frames are bounded too: at most [`MAX_HELD_SENDERS`] senders, each with
+//! at most `frames_per_device` frames of at most the capture snapshot length.
 //!
 //! # The file
 //!
@@ -65,6 +65,13 @@ pub const PCAP_MAGIC: u32 = 0xa1b2_c3d4;
 /// `LINKTYPE_ETHERNET`.
 pub const LINKTYPE_ETHERNET: u32 = 1;
 
+/// How many senders' frames may be held at once while they settle.
+///
+/// With the default five frames each and the default 1600-byte snapshot
+/// length, at most about two megabytes. A sender arriving while this many are
+/// held is not sampled.
+pub const MAX_HELD_SENDERS: usize = 256;
+
 /// Size of the pcap file header.
 pub const FILE_HEADER_LEN: u64 = 24;
 
@@ -90,8 +97,18 @@ impl Frame {
     /// to have a source address or its sender is not a unicast device address.
     #[must_use]
     pub fn from_ethernet(data: &[u8], wire_len: u32, at: DateTime<Utc>) -> Option<Frame> {
-        let _ = (data, wire_len, at);
-        None
+        let sender = crate::runtime::visibility::ethernet_source(data)?;
+        Some(Frame {
+            sender,
+            at,
+            data: data.to_vec(),
+            wire_len: wire_len.max(u32::try_from(data.len()).unwrap_or(u32::MAX)),
+        })
+    }
+
+    /// The bytes this frame takes in the file, record header included.
+    fn record_len(&self) -> u64 {
+        RECORD_HEADER_LEN + self.data.len() as u64
     }
 }
 
@@ -120,6 +137,18 @@ pub enum Limit {
     Bytes,
 }
 
+impl Limit {
+    /// Stable name, for the status file.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Limit::FramesPerDevice => "frames_per_device",
+            Limit::Devices => "devices",
+            Limit::Bytes => "bytes",
+        }
+    }
+}
+
 /// What the sample has done, for the status file and the export.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SampleStatus {
@@ -137,6 +166,30 @@ pub struct SampleStatus {
     pub stopped: Option<String>,
 }
 
+impl SampleStatus {
+    /// One line for `netgraspd stats` and the export.
+    #[must_use]
+    pub fn line(&self) -> String {
+        let mut line = format!(
+            "{} frames from {} devices this run, {} in {}",
+            self.frames,
+            self.devices,
+            crate::runtime::human_bytes(self.bytes),
+            self.path
+        );
+        if self.pending_devices > 0 {
+            line.push_str(&format!(
+                "; {} more waiting to see whether they get named",
+                self.pending_devices
+            ));
+        }
+        if let Some(limit) = &self.stopped {
+            line.push_str(&format!("; stopped at the {limit} limit"));
+        }
+        line
+    }
+}
+
 /// Collects the sample. See the module documentation for the design.
 #[derive(Debug)]
 pub struct UnknownSampler {
@@ -147,6 +200,12 @@ pub struct UnknownSampler {
     frames: u64,
     bytes: u64,
     stopped: Option<Limit>,
+    /// Whether the per-device limit has been logged, which happens once.
+    quota_logged: bool,
+    /// The open file, once anything has been written. `None` and `broken` set
+    /// means it could not be opened, which is logged once and stops the sample.
+    file: Option<std::fs::File>,
+    broken: bool,
 }
 
 impl UnknownSampler {
@@ -162,6 +221,9 @@ impl UnknownSampler {
             frames: 0,
             bytes: 0,
             stopped: None,
+            quota_logged: false,
+            file: None,
+            broken: false,
         }
     }
 
@@ -175,19 +237,274 @@ impl UnknownSampler {
     /// sender right now: `Some(true)` named, `Some(false)` a device with no
     /// name, `None` not a device (yet).
     pub fn offer(&mut self, frame: Frame, named: Option<bool>) {
-        let _ = (frame, named);
+        let sender = frame.sender;
+        if named == Some(true) {
+            // Named: nothing of it is held, and anything held is let go.
+            self.pending.remove(&sender);
+            return;
+        }
+        if self.stopped == Some(Limit::Bytes) || self.broken {
+            return;
+        }
+        if let Some(&count) = self.written.get(&sender) {
+            // Admitted already. Written straight through while it stays
+            // unnamed; a sender that is not a device any more is let go.
+            if named == Some(false) {
+                if count < self.limits.frames_per_device {
+                    self.write(&frame);
+                } else {
+                    self.quota_reached();
+                }
+            }
+            return;
+        }
+        if self.stopped == Some(Limit::Devices) {
+            return;
+        }
+        if let Some((_, held)) = self.pending.get_mut(&sender) {
+            if (held.len() as u64) < u64::from(self.limits.frames_per_device) {
+                held.push(frame);
+            }
+            return;
+        }
+        // A new sender. Held senders are bounded on their own, because some
+        // of them will turn out to be named and the device limit counts only
+        // the ones that were not.
+        if self.pending.len() < MAX_HELD_SENDERS {
+            self.pending.insert(sender, (frame.at, vec![frame]));
+        }
     }
 
     /// Decides every sender held for at least the settle time, asking `named`
     /// about each.
     pub fn settle(&mut self, now: DateTime<Utc>, named: impl Fn(MacAddr) -> Option<bool>) {
-        let _ = (now, named);
+        let mut due: Vec<(DateTime<Utc>, MacAddr)> = self
+            .pending
+            .iter()
+            .filter(|(_, (first, _))| now - *first >= self.limits.settle)
+            .map(|(mac, (first, _))| (*first, *mac))
+            .collect();
+        // First come, first admitted, so the device limit is deterministic.
+        due.sort();
+        for (_, sender) in due {
+            let Some((_, held)) = self.pending.remove(&sender) else {
+                continue;
+            };
+            if named(sender) != Some(false) {
+                continue;
+            }
+            if self.stopped.is_some() || self.broken {
+                continue;
+            }
+            if self.written.len() >= self.limits.max_devices {
+                self.stop(Limit::Devices);
+                continue;
+            }
+            self.written.insert(sender, 0);
+            for frame in held {
+                self.write(&frame);
+            }
+        }
     }
 
     /// What the sample has done so far.
     #[must_use]
     pub fn status(&self) -> SampleStatus {
-        SampleStatus::default()
+        SampleStatus {
+            path: self.path.display().to_string(),
+            devices: self.written.values().filter(|n| **n > 0).count(),
+            frames: self.frames,
+            bytes: self.bytes,
+            pending_devices: self.pending.len(),
+            stopped: self.stopped.map(|l| l.as_str().to_string()),
+        }
+    }
+
+    /// Writes one frame from an admitted sender, within every bound.
+    fn write(&mut self, frame: &Frame) {
+        if self.stopped == Some(Limit::Bytes) || self.broken {
+            return;
+        }
+        let count = self.written.get(&frame.sender).copied().unwrap_or(0);
+        if count >= self.limits.frames_per_device {
+            self.quota_reached();
+            return;
+        }
+        if self.file.is_none() && !self.open() {
+            return;
+        }
+        if self.bytes + frame.record_len() > self.limits.max_bytes {
+            self.stop(Limit::Bytes);
+            return;
+        }
+        let record = record(frame);
+        let written = self
+            .file
+            .as_mut()
+            .map(|file| std::io::Write::write_all(file, &record));
+        match written {
+            Some(Ok(())) => {
+                self.bytes += record.len() as u64;
+                self.frames += 1;
+                self.written.insert(frame.sender, count + 1);
+            }
+            Some(Err(err)) => self.fail(&err.to_string()),
+            None => {}
+        }
+    }
+
+    /// Opens the file, appending to a valid existing sample or starting one.
+    fn open(&mut self) -> bool {
+        match open_sample(&self.path) {
+            Ok((file, size)) => {
+                self.bytes = size;
+                self.file = Some(file);
+                if size > FILE_HEADER_LEN {
+                    tracing::info!(
+                        path = %self.path.display(),
+                        existing_bytes = size,
+                        "appending to the unknown-device sample an earlier run started"
+                    );
+                } else {
+                    tracing::info!(
+                        path = %self.path.display(),
+                        "writing the unknown-device sample"
+                    );
+                }
+                true
+            }
+            Err(err) => {
+                self.fail(&format!("{err:#}"));
+                false
+            }
+        }
+    }
+
+    fn fail(&mut self, err: &str) {
+        if !self.broken {
+            tracing::warn!(
+                path = %self.path.display(),
+                err,
+                "the unknown-device sample cannot be written; no more frames will be kept"
+            );
+        }
+        self.broken = true;
+        self.pending.clear();
+    }
+
+    fn quota_reached(&mut self) {
+        if !self.quota_logged {
+            self.quota_logged = true;
+            tracing::info!(
+                frames_per_device = self.limits.frames_per_device,
+                "an unnamed device reached its frame quota in the unknown-device sample; \
+                 further frames from any device past its quota are not kept (said once)"
+            );
+        }
+    }
+
+    /// Stops the sample at a device or byte limit, saying so once.
+    fn stop(&mut self, limit: Limit) {
+        if self.stopped.is_some() {
+            return;
+        }
+        self.stopped = Some(limit);
+        match limit {
+            Limit::Devices => tracing::warn!(
+                path = %self.path.display(),
+                max_devices = self.limits.max_devices,
+                "the unknown-device sample reached its device limit; no new device will be kept"
+            ),
+            Limit::Bytes => {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    max_bytes = self.limits.max_bytes,
+                    "the unknown-device sample reached its size limit; nothing more will be written"
+                );
+                self.pending.clear();
+            }
+            Limit::FramesPerDevice => {}
+        }
+    }
+}
+
+/// The pcap file header: version 2.4, microsecond timestamps, Ethernet.
+#[must_use]
+pub fn file_header(snaplen: u32) -> [u8; 24] {
+    let mut out = [0u8; 24];
+    out[0..4].copy_from_slice(&PCAP_MAGIC.to_ne_bytes());
+    out[4..6].copy_from_slice(&2u16.to_ne_bytes());
+    out[6..8].copy_from_slice(&4u16.to_ne_bytes());
+    // thiszone and sigfigs stay zero.
+    out[16..20].copy_from_slice(&snaplen.to_ne_bytes());
+    out[20..24].copy_from_slice(&LINKTYPE_ETHERNET.to_ne_bytes());
+    out
+}
+
+/// The snapshot length written in the header: the largest a frame can be.
+const HEADER_SNAPLEN: u32 = 65_535;
+
+/// One pcap record: its header and the frame's bytes.
+fn record(frame: &Frame) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + frame.data.len());
+    let secs = u32::try_from(frame.at.timestamp().max(0)).unwrap_or(u32::MAX);
+    let micros = frame.at.timestamp_subsec_micros().min(999_999);
+    let caplen = u32::try_from(frame.data.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&secs.to_ne_bytes());
+    out.extend_from_slice(&micros.to_ne_bytes());
+    out.extend_from_slice(&caplen.to_ne_bytes());
+    out.extend_from_slice(&frame.wire_len.to_ne_bytes());
+    out.extend_from_slice(&frame.data);
+    out
+}
+
+/// Opens a sample for appending, writing a header when the file is new or
+/// empty. Returns the file and its size.
+///
+/// An existing file that is not a pcap of this kind is refused rather than
+/// overwritten: it may be somebody's capture.
+fn open_sample(path: &Path) -> anyhow::Result<(std::fs::File, u64)> {
+    use anyhow::Context;
+    use std::io::Write;
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("could not create {}", parent.display()))?;
+    }
+    let existing = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if existing > 0 {
+        let mut header = [0u8; 24];
+        let mut file = std::fs::File::open(path)
+            .with_context(|| format!("could not read {}", path.display()))?;
+        std::io::Read::read_exact(&mut file, &mut header)
+            .with_context(|| format!("{} is not a pcap file", path.display()))?;
+        let magic = u32::from_ne_bytes([header[0], header[1], header[2], header[3]]);
+        let link = u32::from_ne_bytes([header[20], header[21], header[22], header[23]]);
+        if magic != PCAP_MAGIC || link != LINKTYPE_ETHERNET {
+            anyhow::bail!(
+                "{} exists and is not an Ethernet pcap written here; refusing to append to it",
+                path.display()
+            );
+        }
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .with_context(|| format!("could not append to {}", path.display()))?;
+        return Ok((file, existing));
+    }
+    let mut file = std::fs::File::create(path)
+        .with_context(|| format!("could not create {}", path.display()))?;
+    file.write_all(&file_header(HEADER_SNAPLEN))
+        .with_context(|| format!("could not write {}", path.display()))?;
+    Ok((file, FILE_HEADER_LEN))
+}
+
+impl Drop for UnknownSampler {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.as_mut() {
+            let _ = std::io::Write::flush(file);
+        }
     }
 }
 

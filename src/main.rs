@@ -48,6 +48,7 @@ async fn main() -> Result<()> {
         Command::Migrate => cli::migrate(&config).await,
         Command::Maintain(args) => cli::maintain(&config, args).await,
         Command::UpdateFingerprints(args) => cli::update_fingerprints(&config, args).await,
+        Command::Export(args) => cli::export(&config, args).await,
     }
 }
 

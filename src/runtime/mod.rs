@@ -96,10 +96,16 @@ pub struct Status {
     /// What each capture interface has seen: frames, distinct senders and
     /// listening time, per interface and per source. See
     /// [`visibility`] for what the numbers mean and how they are bounded.
+    ///
+    /// This and the two fields after it are defaulted on read, so that a
+    /// status file written by an older build still parses.
+    #[serde(default)]
     pub interfaces: BTreeMap<String, visibility::InterfaceVisibility>,
     /// The gateway the daemon believes in, and where that belief came from.
+    #[serde(default)]
     pub gateway: Option<visibility::GatewayBelief>,
     /// The unknown-device sample capture, when it is switched on.
+    #[serde(default)]
     pub unknown_sample: Option<crate::capture::sample::SampleStatus>,
     /// Poll and failure counts per enricher.
     pub enrichers: BTreeMap<String, EnricherCounters>,
@@ -196,13 +202,60 @@ impl Status {
     /// whose every thread failed and so never counted anything.
     #[must_use]
     pub fn visibility_lines(&self) -> Vec<String> {
-        Vec::new()
+        let mut lines = vec![self.gateway.as_ref().map_or_else(
+            || "gateway not known yet".to_string(),
+            visibility::GatewayBelief::line,
+        )];
+        let verdicts = self.verdicts();
+        for (name, verdict) in &verdicts {
+            let v = self.interfaces.get(name).cloned().unwrap_or_default();
+            let listening = v.listening_since.map_or_else(
+                || "never listened".to_string(),
+                |since| format!("listening {}", human_duration(self.updated_at - since)),
+            );
+            let at_least = if v.senders_capped { "at least " } else { "" };
+            lines.push(format!(
+                "{name}: {listening}, {} from {at_least}{}",
+                plural(v.frames, "frame"),
+                plural(v.senders, "sender"),
+            ));
+            for (source, s) in &v.sources {
+                let at_least = if s.senders_capped { "at least " } else { "" };
+                lines.push(format!(
+                    "  {source:<6} {:>8} frames  {at_least}{} senders",
+                    s.frames, s.senders
+                ));
+            }
+            lines.push(format!("  {}", verdict.line));
+        }
+        lines
     }
 
     /// One verdict per interface, in interface order.
+    ///
+    /// Covers every interface with counts and every interface a capture thread
+    /// failed on, so an interface whose every thread failed is reported rather
+    /// than missing.
     #[must_use]
     pub fn verdicts(&self) -> Vec<(String, visibility::Verdict)> {
-        Vec::new()
+        let mut names: std::collections::BTreeSet<&str> =
+            self.interfaces.keys().map(String::as_str).collect();
+        names.extend(self.capture_failures.iter().map(|f| f.interface.as_str()));
+        names
+            .into_iter()
+            .map(|name| {
+                let v = self.interfaces.get(name).cloned().unwrap_or_default();
+                let failures = self
+                    .capture_failures
+                    .iter()
+                    .filter(|f| f.interface == name)
+                    .count();
+                (
+                    name.to_string(),
+                    visibility::verdict(name, &v, failures, self.updated_at),
+                )
+            })
+            .collect()
     }
 
     /// Writes the file atomically.
@@ -239,6 +292,15 @@ impl Status {
             std::fs::read(path).with_context(|| format!("could not read {}", path.display()))?;
         serde_json::from_slice(&bytes)
             .with_context(|| format!("{} is not a netgraspd status file", path.display()))
+    }
+}
+
+/// "1 frame", "2 frames".
+fn plural(count: u64, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
     }
 }
 

@@ -180,10 +180,63 @@ pub fn verdict(
     failures: usize,
     as_of: DateTime<Utc>,
 ) -> Verdict {
-    let _ = (interface, v, failures, as_of);
-    Verdict {
-        kind: VerdictKind::Working,
-        line: String::new(),
+    let listened = v
+        .listening_since
+        .map(|since| (as_of - since).max(TimeDelta::zero()));
+    let Some(listened) = listened else {
+        let why = if failures == 0 {
+            "no capture thread started".to_string()
+        } else {
+            format!(
+                "{failures} capture thread{} failed",
+                if failures == 1 { "" } else { "s" }
+            )
+        };
+        return Verdict {
+            kind: VerdictKind::CaptureFailed,
+            line: format!("capture failed on {interface}: {why}, so nothing here was seen"),
+        };
+    };
+    let duration = super::human_duration(listened);
+
+    if v.frames == 0 {
+        return if listened < SILENCE_BEFORE_FAULT {
+            Verdict {
+                kind: VerdictKind::TooEarly,
+                line: format!(
+                    "nothing received on {interface} yet, after {duration}: too early to say"
+                ),
+            }
+        } else {
+            Verdict {
+                kind: VerdictKind::PossibleFault,
+                line: format!(
+                    "nothing received on {interface} in {duration}: capture may be broken"
+                ),
+            }
+        };
+    }
+
+    let others = v.other_senders();
+    let at_least = if v.senders_capped { "at least " } else { "" };
+    match others {
+        0 => Verdict {
+            kind: VerdictKind::OnlyThisHost,
+            line: "capture is working, but only this host's own frames arrive: no other sender \
+                   seen, consistent with client isolation that hides even the gateway"
+                .to_string(),
+        },
+        1 => Verdict {
+            kind: VerdictKind::Isolated,
+            line: format!(
+                "capture is working: 1 sender seen{}, consistent with client isolation",
+                if v.gateway_seen { " (the gateway)" } else { "" }
+            ),
+        },
+        n => Verdict {
+            kind: VerdictKind::Working,
+            line: format!("capture is working: {at_least}{n} senders seen besides this host"),
+        },
     }
 }
 
@@ -195,8 +248,20 @@ struct Senders {
 }
 
 impl Senders {
+    /// Remembers a sender, unless the set is full.
     fn insert(&mut self, mac: MacAddr) {
-        let _ = mac;
+        if self.seen.contains(&mac) {
+            return;
+        }
+        if self.seen.len() >= MAX_TRACKED_SENDERS {
+            self.capped = true;
+        } else {
+            self.seen.insert(mac);
+        }
+    }
+
+    fn count(&self) -> u64 {
+        self.seen.len() as u64
     }
 }
 
@@ -222,7 +287,10 @@ pub struct Tally {
 impl Tally {
     /// Records that a capture thread on `interface` has started listening.
     pub fn listening(&self, interface: &str, at: DateTime<Utc>) {
-        let _ = (interface, at, &self.interfaces);
+        let mut interfaces = self.lock();
+        let entry = interfaces.entry(interface.to_string()).or_default();
+        // The earliest start: a second source starting later does not reset it.
+        entry.listening_since = Some(entry.listening_since.map_or(at, |since| since.min(at)));
     }
 
     /// Records one frame the filter delivered.
@@ -233,7 +301,24 @@ impl Tally {
         sender: Option<MacAddr>,
         at: DateTime<Utc>,
     ) {
-        let _ = (interface, source, sender, at);
+        let mut interfaces = self.lock();
+        let entry = interfaces.entry(interface.to_string()).or_default();
+        entry.frames += 1;
+        entry.last_frame_at = Some(entry.last_frame_at.map_or(at, |last| last.max(at)));
+        let (frames, senders) = entry.sources.entry(source).or_default();
+        *frames += 1;
+        if let Some(sender) = sender {
+            senders.insert(sender);
+            entry.senders.insert(sender);
+        }
+    }
+
+    /// Locks the counts. A capture thread that panicked holding the lock left
+    /// nothing half-written that matters, so a poisoned lock is used as is.
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, InterfaceTally>> {
+        self.interfaces
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The counts as they stand, for the status file.
@@ -247,16 +332,48 @@ impl Tally {
         this_host: &[MacAddr],
         gateway: Option<MacAddr>,
     ) -> BTreeMap<String, InterfaceVisibility> {
-        let _ = (this_host, gateway);
-        BTreeMap::new()
+        self.lock()
+            .iter()
+            .map(|(name, t)| {
+                let sources = t
+                    .sources
+                    .iter()
+                    .map(|(source, (frames, senders))| {
+                        (
+                            (*source).to_string(),
+                            SourceVisibility {
+                                frames: *frames,
+                                senders: senders.count(),
+                                senders_capped: senders.capped,
+                            },
+                        )
+                    })
+                    .collect();
+                let visibility = InterfaceVisibility {
+                    listening_since: t.listening_since,
+                    frames: t.frames,
+                    senders: t.senders.count(),
+                    senders_capped: t.senders.capped,
+                    this_host_seen: this_host.iter().any(|m| t.senders.seen.contains(m)),
+                    gateway_seen: gateway.is_some_and(|m| t.senders.seen.contains(&m)),
+                    last_frame_at: t.last_frame_at,
+                    sources,
+                };
+                (name.clone(), visibility)
+            })
+            .collect()
     }
 }
 
 /// The source MAC of an Ethernet frame, when it has one worth counting.
 #[must_use]
+///
+/// Bytes six to twelve. Group addresses and the all-zero address identify no
+/// device, so they are not senders.
 pub fn ethernet_source(frame: &[u8]) -> Option<MacAddr> {
-    let _ = frame;
-    None
+    let bytes: [u8; 6] = frame.get(6..12)?.try_into().ok()?;
+    let mac = MacAddr(bytes);
+    (!mac.is_group() && !mac.is_zero()).then_some(mac)
 }
 
 #[cfg(test)]

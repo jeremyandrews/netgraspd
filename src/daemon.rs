@@ -64,6 +64,13 @@ const DISPATCH_TICK: Duration = Duration::from_secs(1);
 /// as soon as it wakes.
 const MAINTENANCE_TICK: Duration = Duration::from_secs(60);
 
+/// How often frames held for the unknown-device sample are decided on.
+const SAMPLE_TICK: Duration = Duration::from_secs(5);
+
+/// Frame copies waiting for the unknown-device sample. Full drops the copy,
+/// never slows capture.
+const FRAME_CHANNEL_CAPACITY: usize = 1024;
+
 /// Options that come from the command line rather than the config file.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RunOptions {
@@ -167,7 +174,14 @@ pub async fn run(
     // addresses, which make it one device however many interfaces it captures
     // on. See crate::host for why neither is guessed from the wire any more.
     let host = crate::host::read();
-    match crate::host::capture_host(&host, &interfaces) {
+    let capture_host = crate::host::capture_host(&host, &interfaces);
+    // Every MAC this host owns, so the visibility report can tell its own
+    // frames from everybody else's and the sample never keeps them.
+    let this_host: Vec<MacAddr> = capture_host
+        .iter()
+        .flat_map(|h| std::iter::once(h.primary).chain(h.aliases.iter().copied()))
+        .collect();
+    match capture_host {
         Some(capture_host) => manager.set_capture_host(capture_host),
         None => {
             let withheld = crate::host::withheld(&host, &interfaces);
@@ -191,8 +205,32 @@ pub async fn run(
     // than when the daemon stops and awaits them.
     let (failure_tx, mut failure_rx) = mpsc::channel::<capture::CaptureFailure>(64);
     let mut failures_open = true;
+    // The unknown-device sample, when it is on: frame copies from the capture
+    // threads, decided on here where the device table is. See
+    // crate::capture::sample for the design.
+    let sample_config = &config.capture.unknown_sample;
+    let (frame_tx, mut frame_rx) = if sample_config.enabled {
+        let (tx, rx) = mpsc::channel::<capture::sample::Frame>(FRAME_CHANNEL_CAPACITY);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    let mut sampler = sample_config.enabled.then(|| {
+        tracing::info!(
+            path = %sample_config.path.display(),
+            frames_per_device = sample_config.frames_per_device,
+            max_devices = sample_config.max_devices,
+            max_bytes = sample_config.max_bytes,
+            "keeping a sample of frames from devices nothing names"
+        );
+        capture::sample::UnknownSampler::new(sample_config.path.clone(), sample_config.limits())
+    });
+    let tap = capture::Tap {
+        tally: std::sync::Arc::new(crate::runtime::visibility::Tally::default()),
+        frames: frame_tx,
+    };
     let mut source_handles = Vec::new();
-    for source in capture::build_sources(&config.capture, &interfaces)? {
+    for source in capture::build_tapped_sources(&config.capture, &interfaces, &tap)? {
         let name = source.name().to_string();
         source_handles.push((
             name,
@@ -203,6 +241,8 @@ pub async fn run(
     // capture source has stopped. The same goes for the failure channel.
     drop(obs_tx);
     drop(failure_tx);
+    let tally = std::sync::Arc::clone(&tap.tally);
+    drop(tap);
 
     let bus = EventBus::default();
     let notifier_handle = spawn_notifier(config, &db, &bus, shutdown.clone());
@@ -287,6 +327,7 @@ pub async fn run(
     let mut enrich_tick = ticker(crate::enrich::TICK);
     let mut maintenance_tick = ticker(MAINTENANCE_TICK);
     let mut status_tick = ticker(config.runtime.status_interval.get());
+    let mut sample_tick = ticker(SAMPLE_TICK);
     let learning_deadline = Instant::now() + config.learning.duration.get();
     let show_table = !opts.no_table && std::io::stdout().is_terminal();
     let mut shutdown_rx = shutdown.clone();
@@ -314,7 +355,7 @@ pub async fn run(
                         summary.capture_failures.push(failure);
                         write_status(
                             config, started_at, &summary, &manager, &dedup, &enricher_counters,
-                            analyzers.gateway().proxied().len(),
+                            &visibility(&tally, &this_host, analyzers.gateway(), sampler.as_ref()),
                         );
                     }
                     None => failures_open = false,
@@ -441,8 +482,30 @@ pub async fn run(
             _ = status_tick.tick() => {
                 write_status(
                     config, started_at, &summary, &manager, &dedup, &enricher_counters,
-                    analyzers.gateway().proxied().len(),
+                    &visibility(&tally, &this_host, analyzers.gateway(), sampler.as_ref()),
                 );
+            }
+
+            // A frame copy for the unknown-device sample. The capture host's
+            // own frames are never kept.
+            frame = recv_frame(&mut frame_rx) => {
+                match frame {
+                    Some(frame) => {
+                        if let Some(sampler) = sampler.as_mut()
+                            && !this_host.contains(&frame.sender)
+                        {
+                            let named = manager.is_named(frame.sender);
+                            sampler.offer(frame, named);
+                        }
+                    }
+                    None => frame_rx = None,
+                }
+            }
+
+            _ = sample_tick.tick(), if sampler.is_some() => {
+                if let Some(sampler) = sampler.as_mut() {
+                    sampler.settle(Utc::now(), |mac| manager.is_named(mac));
+                }
             }
 
             _ = learning_tick.tick(), if manager.is_learning() => {
@@ -464,6 +527,22 @@ pub async fn run(
 
     tracing::info!("shutting down");
     flush_devices(&db, &persister, &mut manager).await;
+    // Held frames are decided now, on what is known now, rather than lost.
+    if let Some(sampler) = sampler.as_mut() {
+        sampler.settle(Utc::now() + sample_config.limits().settle, |mac| {
+            manager.is_named(mac)
+        });
+    }
+    // One last write, so `stats` and the export see the whole run.
+    write_status(
+        config,
+        started_at,
+        &summary,
+        &manager,
+        &dedup,
+        &enricher_counters,
+        &visibility(&tally, &this_host, analyzers.gateway(), sampler.as_ref()),
+    );
     summary.devices = manager.len();
     summary.duplicates = dedup.duplicates_suppressed();
 
@@ -768,7 +847,7 @@ fn write_status(
     manager: &Manager,
     dedup: &ObservationDedup,
     enricher_counters: &[(String, u64, u64)],
-    proxy_arp_addresses: usize,
+    visibility: &Visibility,
 ) {
     let (online, idle, offline) = manager.state_counts();
     let mut status = Status::new(started_at);
@@ -779,7 +858,10 @@ fn write_status(
     status.events = summary.events;
     status.security_events = summary.security_events;
     status.unattributed_names = manager.unattributed_claims();
-    status.proxy_arp_addresses = proxy_arp_addresses;
+    status.proxy_arp_addresses = visibility.proxy_arp_addresses;
+    status.interfaces.clone_from(&visibility.interfaces);
+    status.gateway = Some(visibility.gateway.clone());
+    status.unknown_sample.clone_from(&visibility.sample);
     status.devices = manager.len();
     status.online = online;
     status.idle = idle;
@@ -806,6 +888,46 @@ fn write_status(
             %err,
             "could not write the runtime status file"
         );
+    }
+}
+
+/// What the status file says about what the daemon can see.
+struct Visibility {
+    interfaces: BTreeMap<String, crate::runtime::visibility::InterfaceVisibility>,
+    gateway: crate::runtime::visibility::GatewayBelief,
+    proxy_arp_addresses: usize,
+    sample: Option<capture::sample::SampleStatus>,
+}
+
+/// Gathers the visibility report from the capture threads' tally, the
+/// gateway belief and the sample.
+fn visibility(
+    tally: &crate::runtime::visibility::Tally,
+    this_host: &[MacAddr],
+    gateway: &crate::analyze::gateway::GatewayTracker,
+    sampler: Option<&capture::sample::UnknownSampler>,
+) -> Visibility {
+    Visibility {
+        interfaces: tally.snapshot(this_host, gateway.mac()),
+        gateway: crate::runtime::visibility::GatewayBelief {
+            ip: gateway.ip().map(|ip| ip.to_string()),
+            mac: gateway.mac().map(|mac| mac.to_string()),
+            ip_source: gateway.ip_source().as_str().to_string(),
+            mac_source: gateway.mac_source().as_str().to_string(),
+        },
+        proxy_arp_addresses: gateway.proxied().len(),
+        sample: sampler.map(capture::sample::UnknownSampler::status),
+    }
+}
+
+/// The next frame copy, or never when the sample is off or its channel has
+/// closed, so the select arm simply does not fire.
+async fn recv_frame(
+    rx: &mut Option<mpsc::Receiver<capture::sample::Frame>>,
+) -> Option<capture::sample::Frame> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
     }
 }
 

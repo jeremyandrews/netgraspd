@@ -1447,6 +1447,22 @@ impl Manager {
         out
     }
 
+    /// Whether the identifier has named a device: `Some(true)` when it has a
+    /// name a person typed or one a naming signal gave it, `Some(false)` when
+    /// all it has is a vendor guess or its bare MAC, `None` when no device has
+    /// this MAC (including the capture host's other interfaces).
+    ///
+    /// The unknown-device sample keeps frames only from `Some(false)`.
+    #[must_use]
+    pub fn is_named(&self, mac: MacAddr) -> Option<bool> {
+        let entry = self.devices.get(&mac)?;
+        let typed = entry
+            .display_name
+            .as_deref()
+            .is_some_and(|n| !n.trim().is_empty());
+        Some(typed || is_naming_source(entry.identity.source))
+    }
+
     /// Snapshots every device, most recently seen first, for the CLI table.
     #[must_use]
     pub fn snapshot(&self) -> Vec<DeviceSnapshot> {
@@ -1458,6 +1474,13 @@ impl Manager {
         });
         out
     }
+}
+
+/// True when an identity from this kind of signal is a real name, rather than
+/// a vendor guess or the MAC the scorer falls back to.
+#[must_use]
+pub const fn is_naming_source(kind: SignalKind) -> bool {
+    !matches!(kind, SignalKind::Vendor | SignalKind::Mac)
 }
 
 /// Renders an IPv4 address, or `None` for anything else.
@@ -1970,6 +1993,25 @@ mod tests {
         assert_eq!(ev.display_name, "Aurora's iPad");
         assert_eq!(ev.details["previous_source"], "vendor");
         assert_eq!(ev.details["new_source"], "mdns_name");
+    }
+
+    #[test]
+    fn a_device_is_named_by_a_naming_signal_and_not_by_its_vendor_or_mac() {
+        let mut m = Manager::new(config(), false);
+        assert_eq!(m.is_named(mac("3c:22:fb:00:00:01")), None, "no device yet");
+        let _ = m.observe(&obs_at("3c:22:fb:00:00:01", Some("192.168.1.40"), base()));
+        // An Apple prefix: the scorer can say "Apple device" and nothing more.
+        assert_eq!(m.is_named(mac("3c:22:fb:00:00:01")), Some(false));
+        let _ = m.observe(&obs_at("da:a1:19:00:00:02", Some("192.168.1.41"), base()));
+        assert_eq!(
+            m.is_named(mac("da:a1:19:00:00:02")),
+            Some(false),
+            "a bare MAC"
+        );
+        let obs = obs_at("3c:22:fb:00:00:01", Some("192.168.1.40"), at(30))
+            .with_signal(Signal::new(SignalKind::MdnsName, "Aurora's iPad"));
+        let _ = m.observe(&obs);
+        assert_eq!(m.is_named(mac("3c:22:fb:00:00:01")), Some(true));
     }
 
     #[test]

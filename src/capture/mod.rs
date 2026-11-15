@@ -82,6 +82,46 @@ pub struct PcapSource {
     interfaces: Vec<String>,
     snaplen: i32,
     buffer_size: i32,
+    tap: Tap,
+}
+
+/// What the capture threads hand over besides observations: the visibility
+/// counts, always, and a copy of each frame for the unknown-device sample, when
+/// it is on.
+///
+/// Both are taken before any parser looks at the frame, because both are about
+/// what reached this machine rather than what could be understood.
+#[derive(Debug, Clone, Default)]
+pub struct Tap {
+    /// Frames, distinct senders and listening time per interface and source.
+    pub tally: std::sync::Arc<crate::runtime::visibility::Tally>,
+    /// Where frame copies go for the unknown-device sample. Sent with
+    /// `try_send`, so a full channel drops the copy and never slows capture.
+    pub frames: Option<mpsc::Sender<sample::Frame>>,
+}
+
+impl Tap {
+    /// Records one delivered frame.
+    fn frame(
+        &self,
+        interface: &str,
+        source: &'static str,
+        packet: &pcap::Packet<'_>,
+        at: DateTime<Utc>,
+    ) {
+        self.tally.frame(
+            interface,
+            source,
+            crate::runtime::visibility::ethernet_source(packet.data),
+            at,
+        );
+        if let Some(frames) = &self.frames
+            && let Some(frame) = sample::Frame::from_ethernet(packet.data, packet.header.len, at)
+        {
+            // Full means the daemon is busy; the sample can spare a frame.
+            let _ = frames.try_send(frame);
+        }
+    }
 }
 
 impl PcapSource {
@@ -101,7 +141,15 @@ impl PcapSource {
             interfaces,
             snaplen: cfg.snaplen,
             buffer_size: cfg.buffer_size,
+            tap: Tap::default(),
         }
+    }
+
+    /// Hands this source's frames to a tap as well as to its parser.
+    #[must_use]
+    pub fn with_tap(mut self, tap: Tap) -> Self {
+        self.tap = tap;
+        self
     }
 }
 
@@ -123,6 +171,7 @@ impl CaptureSource for PcapSource {
                 let shutdown = shutdown.clone();
                 let (name, filter, parser) = (self.name, self.filter, self.parser);
                 let (snaplen, buffer_size) = (self.snaplen, self.buffer_size);
+                let tap = self.tap.clone();
                 let thread = tokio::task::spawn_blocking({
                     let interface = interface.clone();
                     move || {
@@ -134,6 +183,7 @@ impl CaptureSource for PcapSource {
                             snaplen,
                             buffer_size,
                             &tx,
+                            &tap,
                             &shutdown,
                         )
                     }
@@ -268,6 +318,7 @@ fn capture_loop(
     snaplen: i32,
     buffer_size: i32,
     tx: &mpsc::Sender<Observation>,
+    tap: &Tap,
     shutdown: &watch::Receiver<bool>,
 ) -> Result<()> {
     let cap = pcap::Capture::from_device(interface)
@@ -300,6 +351,7 @@ fn capture_loop(
     apply_filter(&mut cap, filter, interface)?;
 
     tracing::info!(source, interface, filter, "capture started");
+    tap.tally.listening(interface, Utc::now());
 
     loop {
         if *shutdown.borrow() {
@@ -309,6 +361,7 @@ fn capture_loop(
         match cap.next_packet() {
             Ok(packet) => {
                 let observed_at = packet_time(packet.header);
+                tap.frame(interface, source, &packet, observed_at);
                 if let Some(obs) = parser(packet.data, interface, observed_at)
                     && tx.blocking_send(obs).is_err()
                 {
@@ -606,6 +659,20 @@ pub fn build_sources(
     cfg: &CaptureConfig,
     interfaces: &[String],
 ) -> Result<Vec<Box<dyn CaptureSource>>> {
+    build_tapped_sources(cfg, interfaces, &Tap::default())
+}
+
+/// Builds the configured sources, every one of them handing its frames to
+/// `tap` as well.
+///
+/// # Errors
+///
+/// The same as [`build_sources`].
+pub fn build_tapped_sources(
+    cfg: &CaptureConfig,
+    interfaces: &[String],
+    tap: &Tap,
+) -> Result<Vec<Box<dyn CaptureSource>>> {
     let mut sources: Vec<Box<dyn CaptureSource>> = Vec::with_capacity(cfg.sources.len());
     for name in &cfg.sources {
         let Some((source, filter, parser)) = SOURCES.iter().find(|(s, _, _)| *s == name) else {
@@ -618,13 +685,10 @@ pub fn build_sources(
                     .join(", ")
             );
         };
-        sources.push(Box::new(PcapSource::new(
-            source,
-            filter,
-            *parser,
-            interfaces.to_vec(),
-            cfg,
-        )));
+        sources.push(Box::new(
+            PcapSource::new(source, filter, *parser, interfaces.to_vec(), cfg)
+                .with_tap(tap.clone()),
+        ));
     }
     Ok(sources)
 }

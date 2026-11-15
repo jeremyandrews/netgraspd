@@ -3,7 +3,7 @@
 //! `run` starts the daemon with a live device table; `devices`, `events` and
 //! `people` print one table and exit; `stats` answers whether the installation
 //! is healthy; `maintain` runs the nightly jobs by hand; `update-fingerprints`
-//! refreshes the DHCP fingerprint table.
+//! refreshes the DHCP fingerprint table; `export` writes a trip bundle.
 //!
 //! Every flag that overrides configuration is expressed as a dotted
 //! [`Override`] rather than as a partial `Config`, so that an absent flag leaves
@@ -76,6 +76,18 @@ pub enum Command {
     Maintain(MaintainArgs),
     /// Download a fresh DHCP fingerprint table.
     UpdateFingerprints(UpdateFingerprintsArgs),
+    /// Write a trip bundle: devices, events, the visibility report, the
+    /// configuration with secrets removed, and the unknown-device sample.
+    Export(ExportArgs),
+}
+
+/// Arguments to `export`.
+#[derive(Debug, Args)]
+pub struct ExportArgs {
+    /// Directory to write the bundle into. Created if absent; refused if it
+    /// already holds anything.
+    #[arg(value_name = "DIR")]
+    pub dir: PathBuf,
 }
 
 /// Arguments to `run`.
@@ -513,6 +525,18 @@ fn print_runtime_section(config: &Config, now: chrono::DateTime<Utc>) {
         println!("    {line}");
     }
 
+    // What this daemon can and cannot see: first class, because on a network
+    // somebody else runs it is the first question, and an empty device table
+    // means nothing until it is answered.
+    println!("  Visibility");
+    for line in status.visibility_lines() {
+        println!("    {line}");
+    }
+    if let Some(sample) = &status.unknown_sample {
+        println!("  Unknown device sample");
+        println!("    {}", sample.line());
+    }
+
     if !status.enrichers.is_empty() {
         println!("  Enrichment");
         for (name, counters) in &status.enrichers {
@@ -664,6 +688,25 @@ pub async fn update_fingerprints(config: &Config, args: &UpdateFingerprintsArgs)
     std::fs::write(&path, text.as_bytes())
         .with_context(|| format!("could not write {}", path.display()))?;
     println!("Wrote {}.", path.display());
+    Ok(())
+}
+
+/// Runs `export`.
+///
+/// # Errors
+///
+/// The same as [`crate::export::export`].
+pub async fn export(config: &Config, args: &ExportArgs) -> Result<()> {
+    let report = crate::export::export(config, &args.dir).await?;
+    println!(
+        "Wrote {} devices and {} events to {}:",
+        report.devices,
+        report.events,
+        report.dir.display()
+    );
+    for file in &report.files {
+        println!("  {file}");
+    }
     Ok(())
 }
 
