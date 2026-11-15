@@ -69,6 +69,7 @@ RUN apt-get update \
 
 COPY --from=build /src/target/release/netgraspd /usr/local/bin/netgraspd
 COPY --from=build /src/netgrasp.toml.example /usr/share/netgraspd/netgrasp.toml.example
+COPY --from=build /src/netgrasp.foreign.toml.example /usr/share/netgraspd/netgrasp.foreign.toml.example
 
 # Deliberately no `setcap` on the binary, which is the obvious thing to do and
 # is wrong here.

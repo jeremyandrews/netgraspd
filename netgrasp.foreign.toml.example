@@ -1,0 +1,83 @@
+# netgraspd on a network you do not own: a hotel, a conference, a friend's
+# flat. A profile, not a mode: an ordinary configuration file that turns the
+# right switches. Use it as is with
+#
+#     netgraspd --config netgrasp.foreign.toml.example migrate
+#     netgraspd --config netgrasp.foreign.toml.example run -i en0
+#     netgraspd --config netgrasp.foreign.toml.example stats
+#     netgraspd --config netgrasp.foreign.toml.example export trip-bundle
+#
+# or copy it and change what you need. Anything not set here is the compiled
+# default, documented in netgrasp.toml.example.
+#
+# It never transmits, like every netgraspd configuration: capture is passive and
+# non-promiscuous, reverse DNS stays off, and no enricher runs. Nothing probes
+# the network to find out what it hides.
+#
+# The relative paths below are relative to the directory you run netgraspd
+# from, which is what makes them writable by an ordinary user. Run every command
+# from the same directory.
+
+[database]
+# Its own database, never the home one: the trip's strangers do not belong in
+# your device history, and dropping the database afterwards is how you leave
+# nothing behind. Create it once (createdb netgrasp_trip, or CREATE DATABASE in
+# psql), then run `migrate`.
+url = "postgres://netgrasp:netgrasp@localhost:5432/netgrasp_trip"
+
+[capture]
+# Empty means the default selection: every interface that is up with carrier,
+# Ethernet (Wi-Fi counts) and IPv4-addressed, loopback excepted. On a Mac running
+# a hypervisor (OrbStack, Docker Desktop, UTM, Parallels) its bridges pass that
+# test and are kept, so name the real interface instead: pass -i en0, or
+# whichever interface `route -n get default` names.
+interfaces = []
+
+# Every source: all six are passive, and on a network you know nothing about,
+# each one is a different way for a device to say what it is.
+sources = ["arp", "mdns", "dhcp", "ssdp", "ndp", "nbns"]
+
+[capture.unknown_sample]
+# The first few frames from each device the identifier could not name, kept to
+# learn from afterwards. Broadcast and multicast frames only: frames unicast to
+# this host, which capture also delivers, are never kept. Bounded three ways;
+# reaching a bound is said once in the log.
+enabled = true
+path = "netgraspd-trip/unknown-sample.pcap"
+frames_per_device = 5
+max_devices = 200
+max_bytes = 10485760
+settle = "10m"
+
+[state]
+# Devices on a shared network come and go within the hour.
+idle_timeout = "10m"
+offline_timeout = "30m"
+
+[identity]
+# Reverse DNS asks the network's resolver about its own clients. Off.
+reverse_dns = false
+
+[notify]
+# Off. On an unknown network every analyzer fires (a neighbour's scanner, a
+# second DHCP server, a gateway that answers ARP for everyone) and the alerts
+# are noise. The events are still recorded, and are worth reading afterwards:
+# `netgraspd events --security`, or events.json in the export.
+enabled = false
+
+[enrichment]
+# Off. There is no controller of yours on this network to ask.
+enabled = false
+
+[maintenance]
+# A trip lasts hours. One day of events and presence detail is all there is.
+enabled = true
+rollup_after_days = 1
+event_retention_days = 1
+
+[runtime]
+# Somewhere an ordinary user can write, so `netgraspd stats` has the
+# visibility report to show. The default, /var/lib/netgraspd, is not writable
+# without privilege on a Mac.
+status_path = "netgraspd-trip/status.json"
+status_interval = "30s"

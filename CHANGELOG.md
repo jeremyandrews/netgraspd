@@ -22,6 +22,13 @@ shipped rather than a release that was tagged at the time.
 
 ## [Unreleased]
 
+### Added
+
+- **A profile for a network you do not own**, `netgrasp.foreign.toml.example`. It is an ordinary configuration file, not a mode. Notifications, enrichment and reverse DNS are off; all six sources are on; events and rollup are kept for one day; the unknown-device sample is on. It names its own database, and its status file and sample are relative paths an ordinary user can write. The image ships it beside the home example ([#18](https://github.com/jeremyandrews/netgraspd/pull/18)).
+- **The visibility report**, in the status file and in `netgraspd stats`. For each interface and each source it gives frames delivered, distinct source MACs (at most 4096 kept per set, then reported as "at least"), and how long the interface has been listening. It also gives the gateway the daemon believes in and where that belief came from. Each interface then gets one plain verdict, so an isolated guest network ("capture is working: 1 sender seen (the gateway), consistent with client isolation") no longer looks like broken capture ("nothing received on en0 in 10m: capture may be broken"). The new status fields are defaulted on read, so an older status file still parses ([#18](https://github.com/jeremyandrews/netgraspd/pull/18)).
+- **The unknown-device sample**, `[capture.unknown_sample]`, off by default. It keeps the first frames from each device the identifier could not name in one pcap file. These are broadcast and multicast frames only: a frame unicast to the capture host, which non-promiscuous capture also delivers, is refused, after the first home LAN run sampled 128 of them out of 150. It is bounded by frames per device, by devices and by total bytes, and each limit is logged once. Frames are held only while a device has `settle` (ten minutes, because real devices were named four to seven minutes after first sight) to be named, and a named device is never written ([#18](https://github.com/jeremyandrews/netgraspd/pull/18)).
+- **`netgraspd export DIR`** writes a trip bundle that needs no database to read: `SUMMARY.md`, `devices.json` (what named and what typed each device), `events.json`, `visibility.json`, `config.json` with every secret replaced by `***`, and the unknown-device sample ([#18](https://github.com/jeremyandrews/netgraspd/pull/18)).
+
 ### Fixed
 
 - **The gateway is read from the capture host's own default route**, when it leaves by a captured interface, instead of being guessed from ARP popularity when the host's route already said it. In the C1 run popularity elected the capture host itself, and the router's proxy ARP then raised 5 `ip_conflict` and 1 `arp_spoof` false alerts until a DHCP Ack corrected it at minute 8.5. The route ranks below configuration and above DHCP. Popularity, now only a fallback, elects the address the most distinct MACs asked about, as its documentation always said, rather than the first to reach three ([#17](https://github.com/jeremyandrews/netgraspd/pull/17)).
@@ -35,6 +42,7 @@ shipped rather than a release that was tagged at the time.
 
 ### Documentation
 
+- README: Running on a network you do not own ([#18](https://github.com/jeremyandrews/netgraspd/pull/18)).
 - README: Capturing on macOS, the 2026-11-14 run of all six sources on macOS as an ordinary user, and macOS resident memory ([#15](https://github.com/jeremyandrews/netgraspd/pull/15)).
 
 ## [1.0.0] - 2026-09-23
