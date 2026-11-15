@@ -39,15 +39,15 @@ sources = ["arp", "mdns", "dhcp", "ssdp", "ndp", "nbns"]
 
 [capture.unknown_sample]
 # The first few frames from each device the identifier could not name, kept to
-# learn from afterwards. Broadcast and multicast frames only, because that is
-# all netgraspd ever sees. Bounded three ways; reaching a bound is said once in
-# the log.
+# learn from afterwards. Broadcast and multicast frames only: frames unicast to
+# this host, which capture also delivers, are never kept. Bounded three ways;
+# reaching a bound is said once in the log.
 enabled = true
 path = "netgraspd-trip/unknown-sample.pcap"
 frames_per_device = 5
 max_devices = 200
 max_bytes = 10485760
-settle = "1m"
+settle = "10m"
 
 [state]
 # Devices on a shared network come and go within the hour.

@@ -50,7 +50,8 @@ dedup_capacity = 8192
 # The unknown-device sample: the first few frames from each device the
 # identifier could not name, written to one pcap file so they can be studied
 # later. Off here; netgrasp.foreign.toml.example turns it on. The frames are
-# broadcast and multicast only, because that is all netgraspd ever captures.
+# broadcast and multicast only: frames unicast to this host, which capture
+# also delivers, are never kept.
 # Each bound stops something and is logged once: a device's further frames, new
 # devices, or (at max_bytes, header included) everything. An existing sample at
 # the path is appended to.
@@ -62,7 +63,7 @@ max_devices = 200
 max_bytes = 10485760
 # How long a device has to be named (by DHCP, mDNS, NetBIOS...) before its
 # frames are kept. Frames from a device that is named in that time are dropped.
-settle = "1m"
+settle = "10m"
 
 [state]
 # Silence after which an online device becomes idle, then offline.

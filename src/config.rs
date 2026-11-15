@@ -346,8 +346,9 @@ pub struct CaptureConfig {
 /// The unknown-device sample: the first few frames from each device the
 /// identifier could not name, kept in one pcap file to learn from later.
 ///
-/// Off by default. The frames are broadcast and multicast only, because that is
-/// all the daemon ever captures. See [`crate::capture::sample`].
+/// Off by default. The frames are broadcast and multicast only; frames unicast
+/// to the capture host, which capture also delivers, are never kept. See
+/// [`crate::capture::sample`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UnknownSampleConfig {
@@ -362,9 +363,11 @@ pub struct UnknownSampleConfig {
     pub max_devices: usize,
     /// Largest the file may grow, in bytes, its header included.
     pub max_bytes: u64,
-    /// How long a device has to be named before its frames are kept. A device
-    /// is often named a moment after it is first seen, by a DHCP request or an
-    /// mDNS announcement that follows its first ARP.
+    /// How long a device has to be named before its frames are kept.
+    ///
+    /// Ten minutes by default. On the first home LAN run, four devices were
+    /// named by mDNS or NetBIOS between four and seven minutes after they were
+    /// first seen; a one-minute settle wrote their frames as unknowns.
     pub settle: HumanDuration,
 }
 
@@ -418,7 +421,7 @@ impl Default for UnknownSampleConfig {
             frames_per_device: 5,
             max_devices: 200,
             max_bytes: 10 * 1024 * 1024,
-            settle: HumanDuration::from_secs(60),
+            settle: HumanDuration::from_secs(10 * 60),
         }
     }
 }

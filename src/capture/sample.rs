@@ -48,8 +48,10 @@
 //! to, so a restart mid-trip keeps what the earlier run kept; its size counts
 //! towards the byte limit.
 //!
-//! The frames are broadcast and multicast only, because that is all the
-//! daemon's filters ever deliver.
+//! The frames are broadcast and multicast only. The filters alone do not
+//! guarantee that: non-promiscuous capture also delivers frames unicast to
+//! the capture host itself, so [`Frame::from_ethernet`] refuses any frame not
+//! addressed to a group.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -94,9 +96,19 @@ pub struct Frame {
 
 impl Frame {
     /// Copies a captured Ethernet frame, or returns `None` when it is too short
-    /// to have a source address or its sender is not a unicast device address.
+    /// to have a source address, its sender is not a unicast device address,
+    /// or it is not addressed to a broadcast or multicast group.
+    ///
+    /// The last check is what makes the sample broadcast and multicast only.
+    /// The BPF filters are not enough on their own: non-promiscuous capture
+    /// still delivers frames unicast to the capture host itself (the gateway's
+    /// ARP replies to it, unicast mDNS answers), and those are this host's own
+    /// conversations, not something to keep in a file meant for sharing.
     #[must_use]
     pub fn from_ethernet(data: &[u8], wire_len: u32, at: DateTime<Utc>) -> Option<Frame> {
+        if data.first().is_none_or(|first| first & 0x01 == 0) {
+            return None;
+        }
         let sender = crate::runtime::visibility::ethernet_source(data)?;
         Some(Frame {
             sender,
@@ -780,5 +792,24 @@ mod tests {
         group[6] = 0x01;
         assert!(Frame::from_ethernet(&group, 60, at(0)).is_none());
         assert!(Frame::from_ethernet(&[0u8; 10], 10, at(0)).is_none());
+    }
+
+    #[test]
+    fn a_frame_unicast_to_this_host_is_never_kept() {
+        // Non-promiscuous capture still delivers frames addressed to the
+        // capture host itself: on the 2026-11-15 home LAN run, 128 of the 150
+        // sampled frames were the gateway's unicast ARP to this Mac. The sample
+        // promises broadcast and multicast only, so those are refused.
+        let mut to_us = fixtures::arp_reply();
+        to_us[0..6].copy_from_slice(&[0x56, 0x2c, 0xd9, 0x00, 0x00, 0x01]);
+        to_us[6..12].copy_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x01]);
+        assert!(Frame::from_ethernet(&to_us, 60, at(0)).is_none());
+        for frame in fixtures() {
+            assert!(
+                frame[0] & 0x01 == 1,
+                "every sampled fixture is addressed to a group"
+            );
+            assert!(Frame::from_ethernet(&frame, 60, at(0)).is_some());
+        }
     }
 }

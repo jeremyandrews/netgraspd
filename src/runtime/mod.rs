@@ -222,8 +222,9 @@ impl Status {
             for (source, s) in &v.sources {
                 let at_least = if s.senders_capped { "at least " } else { "" };
                 lines.push(format!(
-                    "  {source:<6} {:>8} frames  {at_least}{} senders",
-                    s.frames, s.senders
+                    "  {source:<6} {:>8} frames  {at_least}{}",
+                    s.frames,
+                    plural(s.senders, "sender")
                 ));
             }
             lines.push(format!("  {}", verdict.line));

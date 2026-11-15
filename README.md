@@ -655,15 +655,22 @@ path = "netgraspd-trip/unknown-sample.pcap"   # relative to where you run it
 frames_per_device = 5
 max_devices = 200
 max_bytes = 10485760                          # the header included
-settle = "1m"
+settle = "10m"
 ```
 
-The frames are **broadcast and multicast only**, because that is all
-netgraspd's filters ever deliver; no unicast traffic of anyone's is in it.
-A device's frames are held for `settle` to give it the chance to be named (its
-DHCP request or mDNS announcement usually follows its first ARP), and dropped
-if it is; a device already named is never held at all, and the capture host's
-own frames are never kept. Each bound stops something and is logged once:
+The frames are **broadcast and multicast only**: a frame is kept only when it
+is addressed to a group. The filters alone would not guarantee that, because
+non-promiscuous capture also delivers frames unicast to the capture host
+itself (on the run that found this, 128 of 150 sampled frames were the
+gateway's unicast ARP to the Mac); those are this host's own conversations and
+are never kept.
+
+A device's frames are held for `settle` (ten minutes) to give it the chance to
+be named, and dropped if it is. Naming is slower than it looks: on a real LAN,
+mDNS and NetBIOS names arrived four to seven minutes after a device was first
+seen. A device already named is never held at all, and the capture host's own
+frames are never kept. When the daemon stops, frames still held are decided
+on what is known at that moment. Each bound stops something and is logged once:
 `frames_per_device` stops that device, `max_devices` admits no new device, and
 `max_bytes` stops the file. An existing sample at the path is appended to, so a
 restart keeps what came before. `stats` shows how far it has got. Open it in
