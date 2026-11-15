@@ -260,11 +260,21 @@ rule applies on Linux, where it leaves out `lo`, `veth*`, a `docker0` with no
 containers and `tailscale0`.
 
 An addressed bridge with carrier is kept. On a Mac that runs OrbStack, Docker
-Desktop or another hypervisor, that is its host networks (`bridge100` and up),
-and the daemon will record the Mac's own address on each of them as a device;
+Desktop or another hypervisor, that is its host networks (`bridge100` and up);
 on Linux it is `cni0` or a `docker0` with containers. Nothing about the
-interface tells such a bridge apart from a router's LAN bridge. If you do not
-want them, name your LAN interface:
+interface tells such a bridge apart from a router's LAN bridge. The machine
+running the daemon is still one device however many of these it captures on:
+the daemon reads each capture interface's hardware address from the operating
+system at startup, records the host under its MAC on the interface its default
+route leaves by, and does not turn its own frames on the other interfaces into
+devices. The VMs and containers behind a bridge are devices of their own. On a
+Mac where the operating system withholds interface hardware addresses from the
+user running the daemon (it reports `02:00:00:00:00:00` for every interface;
+`ifconfig` shows the same), the daemon cannot tell which MACs are its own, says
+so in a warning at startup, and records the host once per interface as before. If
+an earlier version already recorded the Mac's bridge addresses as devices,
+those rows are left alone and go offline like any silent device. If you do not
+want the bridges at all, name your LAN interface:
 
 ```sh
 netgraspd run -i en1                # or en0; `route -n get default` says which
@@ -799,9 +809,12 @@ the debounce and the batch window. The one thing they do not bypass is
 `notify.enabled`, because a master switch with an exception is not a master
 switch.
 
-The gateway is worked out passively, because several analyzers treat it
-differently: DHCP option 3 states it outright, and failing that the address the
-most *distinct* MACs ARP for is the gateway. Once known, it is not given up to
+The gateway is worked out without asking, because several analyzers treat it
+differently. `security.gateway_ip` wins if set. Otherwise the daemon reads its
+own host's default route at startup, when that route leaves by a captured
+interface, and logs `gateway belief at startup` with the address and where it
+came from. Failing that, DHCP option 3 states it outright, and failing that the
+address the most *distinct* MACs ARP for is the gateway. Once known, it is not given up to
 evidence that is no stronger, which is what stops an attacker forging one ARP
 reply to become the gateway and silence the detector that was watching for
 exactly that.

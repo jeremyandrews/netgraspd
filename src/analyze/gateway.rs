@@ -6,23 +6,43 @@
 //! `arp_scan` holds the gateway to a looser threshold, because a router
 //! legitimately ARPs for everything it forwards to.
 //!
-//! Three sources, in descending order of how much they can be trusted:
+//! Four sources, in descending order of how much they can be trusted:
 //!
 //! 1. **Configuration.** An operator who typed it in is right.
-//! 2. **DHCP option 3.** The server handing out leases states the default
+//! 2. **The capture host's own default route.** A capture host that is not
+//!    the router has a default route and is using it, so the gateway it sends
+//!    through is a fact it already holds, read locally at startup. It ranks
+//!    above DHCP because the route is what this host actually uses, while a
+//!    DHCP Offer on the wire may be for somebody else. It applies only when the
+//!    route leaves by a captured interface: a router running the daemon itself
+//!    routes out of its WAN, which is not the LAN being watched, and then the
+//!    two sources below decide as they always did.
+//! 3. **DHCP option 3.** The server handing out leases states the default
 //!    gateway. This is authoritative, it is on the wire already, and it costs
 //!    nothing to read. A rogue DHCP server could lie, which is why `rogue_dhcp`
 //!    exists and why a learned value never overrides a configured one.
-//! 3. **ARP request popularity.** Every device on a LAN ARPs for the gateway,
+//! 4. **ARP request popularity.** Every device on a LAN ARPs for the gateway,
 //!    and almost nothing else is asked about by everybody. The address that the
-//!    most *distinct* MACs have asked about is the gateway. Distinct askers
-//!    rather than total requests, because one chatty device retrying one address
-//!    would otherwise elect it.
+//!    most *distinct* MACs have asked about is the gateway, once at least
+//!    `INFERENCE_QUORUM` (three) have. Distinct askers rather than total requests,
+//!    because one chatty device retrying one address would otherwise elect it.
+//!    The tallies are kept while this is the only source, so an address that
+//!    reached the quorum first (in the C1 run, the capture host itself, which
+//!    three hosts asked for within a second) is overtaken by one more of the
+//!    network asks about, rather than holding the belief because it was quick.
+//!
+//! The first C1 run on 2026-11-14 is why the route is read at all: with only
+//! popularity to go on, the daemon elected the capture host, and the real
+//! router's proxy ARP replies then read as five address conflicts and a
+//! gateway impersonation until a DHCP Ack corrected the belief eight and a half
+//! minutes later.
 //!
 //! The MAC then follows from the address: whoever answers an ARP for the gateway
 //! address, or sources traffic from it, is the gateway.
 //!
-//! None of this transmits anything.
+//! None of this transmits anything. Reading the route is a local read of the
+//! host's own routing table, done once at startup by the daemon and handed in
+//! through [`GatewayTracker::with_default_route`].
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr};
@@ -40,6 +60,12 @@ const INFERENCE_QUORUM: usize = 3;
 /// asking about the whole subnet cannot grow it.
 const MAX_CANDIDATES: usize = 512;
 
+/// How many distinct askers are counted per candidate address. Bounded so that
+/// keeping the tallies past the first election cannot grow without limit; an
+/// address this many MACs have asked about is not going to be overtaken by
+/// coincidence.
+const MAX_ASKERS: usize = 256;
+
 /// Where the current belief came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatewaySource {
@@ -51,6 +77,8 @@ pub enum GatewaySource {
     Dhcp,
     /// Inferred from who everybody ARPs for.
     Inferred,
+    /// The capture host's own default route, read from its routing table.
+    Route,
 }
 
 impl GatewaySource {
@@ -62,6 +90,7 @@ impl GatewaySource {
             GatewaySource::Configured => "configured",
             GatewaySource::Dhcp => "dhcp",
             GatewaySource::Inferred => "inferred",
+            GatewaySource::Route => "route",
         }
     }
 
@@ -72,7 +101,8 @@ impl GatewaySource {
             GatewaySource::Unknown => 0,
             GatewaySource::Inferred => 1,
             GatewaySource::Dhcp => 2,
-            GatewaySource::Configured => 3,
+            GatewaySource::Route => 3,
+            GatewaySource::Configured => 4,
         }
     }
 }
@@ -83,6 +113,16 @@ impl GatewaySource {
 /// never from this set, so a full set costs visibility and nothing else. A
 /// router proxying for two or three VLANs is well inside it.
 const MAX_PROXIED: usize = 256;
+
+/// The capture host's own default route: the gateway it sends through and the
+/// interface it leaves by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultRoute {
+    /// The next hop of the default route.
+    pub gateway: Ipv4Addr,
+    /// The interface the default route leaves by.
+    pub interface: String,
+}
 
 /// What is currently believed about the gateway.
 #[derive(Debug)]
@@ -129,6 +169,52 @@ impl GatewayTracker {
     pub const fn with_proxy_arp(mut self, proxy_arp: bool) -> Self {
         self.proxy_arp = proxy_arp;
         self
+    }
+
+    /// Seeds the belief from the capture host's own default route, builder
+    /// style.
+    ///
+    /// The route counts only when it leaves by one of the `captured`
+    /// interfaces: that is when its gateway is the gateway of the LAN being
+    /// watched. With no route, or one that leaves by some other interface (a
+    /// router running the daemon routes out of its WAN), nothing changes and
+    /// the belief is learned from the wire as before. A configured gateway
+    /// still wins, by rank.
+    ///
+    /// Only the address comes from the route. The MAC is still learned from
+    /// the wire, under the rules `set_mac` enforces, which this does not relax.
+    #[must_use]
+    pub fn with_default_route(mut self, route: Option<&DefaultRoute>, captured: &[String]) -> Self {
+        self.apply_default_route(route, captured);
+        self
+    }
+
+    /// [`with_default_route`](Self::with_default_route), in place.
+    pub fn apply_default_route(&mut self, route: Option<&DefaultRoute>, captured: &[String]) {
+        let Some(route) = route else {
+            tracing::info!(
+                "the host has no default route; the gateway will be learned from the wire"
+            );
+            return;
+        };
+        let gateway = route.gateway;
+        if gateway.is_unspecified()
+            || gateway.is_broadcast()
+            || gateway.is_multicast()
+            || gateway.is_loopback()
+        {
+            tracing::info!(%gateway, interface = %route.interface, "the host's default route has no usable next hop; ignored");
+            return;
+        }
+        if !captured.contains(&route.interface) {
+            tracing::info!(
+                %gateway,
+                interface = %route.interface,
+                "the host's default route does not leave by a captured interface; the gateway will be learned from the wire"
+            );
+            return;
+        }
+        self.set_ip(gateway, GatewaySource::Route);
     }
 
     /// Addresses the gateway has been seen proxy-ARPing for.
@@ -278,8 +364,11 @@ impl GatewayTracker {
         );
     }
 
-    /// Records that a MAC asked about an address, promoting the address to
-    /// gateway once enough distinct MACs have asked.
+    /// Records that a MAC asked about an address, and elects the address the
+    /// most distinct MACs have asked about once it has at least the quorum.
+    ///
+    /// An address takes over from the current belief only with strictly more
+    /// askers, so two addresses tied on the count do not flap.
     fn record_asker(&mut self, target: Ipv4Addr, asker: MacAddr) {
         if target.is_unspecified() || target.is_broadcast() || target.is_multicast() {
             return;
@@ -296,10 +385,18 @@ impl GatewayTracker {
             return;
         }
         let askers = self.askers.entry(target).or_default();
-        if !askers.contains(&asker) {
+        if !askers.contains(&asker) && askers.len() < MAX_ASKERS {
             askers.push(asker);
         }
-        if askers.len() >= INFERENCE_QUORUM {
+        let count = askers.len();
+        if count < INFERENCE_QUORUM || self.ip == Some(target) {
+            return;
+        }
+        let leading = self
+            .ip
+            .and_then(|ip| self.askers.get(&ip))
+            .map_or(0, Vec::len);
+        if count > leading {
             self.set_ip(target, GatewaySource::Inferred);
         }
     }
@@ -319,7 +416,11 @@ impl GatewayTracker {
         }
         self.ip = Some(ip);
         self.ip_source = source;
-        self.askers.clear();
+        // The tallies are only worth keeping while popularity is still what
+        // decides; see `record_asker`.
+        if source.rank() > GatewaySource::Inferred.rank() {
+            self.askers.clear();
+        }
     }
 
     /// Sets the hardware address, refusing to be talked out of one it already
@@ -696,5 +797,168 @@ mod tests {
         let mut tracker = GatewayTracker::new(None, Some(mac("b8:27:eb:44:55:66")));
         tracker.set_ip(Ipv4Addr::new(10, 0, 0, 1), GatewaySource::Dhcp);
         assert_eq!(tracker.mac(), Some(mac("b8:27:eb:44:55:66")));
+    }
+
+    /// The C1 router, a Routerboard at 10.20.0.1 that proxy-ARPs.
+    const C1_ROUTER: &str = "4c:5e:0c:10:20:01";
+    /// The capture host's own address on the LAN in the C1 run.
+    const C1_HOST: [u8; 4] = [10, 20, 229, 200];
+
+    fn c1_route() -> DefaultRoute {
+        DefaultRoute {
+            gateway: Ipv4Addr::new(10, 20, 0, 1),
+            interface: "en1".to_string(),
+        }
+    }
+
+    fn c1_captured() -> Vec<String> {
+        ["en1", "bridge100", "bridge101"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn the_host_route_names_the_gateway_however_popular_the_capture_host_is() {
+        // The C1 run: three hosts ARP for the capture host within a second,
+        // which on main elected the capture host as the gateway.
+        let gateway = Ipv4Addr::new(10, 20, 0, 1);
+        let mut tracker =
+            GatewayTracker::new(None, None).with_default_route(Some(&c1_route()), &c1_captured());
+        assert_eq!(tracker.ip(), Some(gateway), "the route is known at startup");
+
+        for who in [
+            "3c:22:fb:00:00:01",
+            "3c:22:fb:00:00:02",
+            "3c:22:fb:00:00:03",
+        ] {
+            tracker.observe(&request(who, C1_HOST, at(0)));
+            assert_eq!(tracker.ip(), Some(gateway), "never the capture host");
+            assert!(!tracker.is_gateway_ip(Ipv4Addr::from(C1_HOST)));
+        }
+
+        // The router answers for its own address, which is how its MAC is
+        // learned from the wire.
+        tracker.observe(&reply(C1_ROUTER, [10, 20, 0, 1], at(1)));
+        assert_eq!(tracker.mac(), Some(mac(C1_ROUTER)));
+
+        // Then it proxy-ARPs for the capture host and for two other hosts.
+        for claimed in [C1_HOST, [10, 20, 1, 10], [10, 20, 1, 11]] {
+            let observation = reply(C1_ROUTER, claimed, at(1));
+            assert_eq!(
+                tracker.proxy_arp_for(&observation),
+                Some(Ipv4Addr::from(claimed)),
+                "the router answering for {claimed:?} is proxy ARP"
+            );
+            tracker.observe(&observation);
+            assert_eq!(tracker.ip(), Some(gateway));
+        }
+        assert_eq!(tracker.proxied().len(), 3);
+    }
+
+    #[test]
+    fn the_host_route_ranks_below_configuration_and_above_dhcp() {
+        // Configuration wins.
+        let tracker = GatewayTracker::new(Some(Ipv4Addr::new(10, 20, 0, 254)), None)
+            .with_default_route(Some(&c1_route()), &c1_captured());
+        assert_eq!(tracker.ip(), Some(Ipv4Addr::new(10, 20, 0, 254)));
+        assert_eq!(tracker.ip_source(), GatewaySource::Configured);
+
+        // A DHCP Offer on the wire, which may be for somebody else, does not
+        // move what the host itself routes through.
+        let mut tracker =
+            GatewayTracker::new(None, None).with_default_route(Some(&c1_route()), &c1_captured());
+        assert_eq!(tracker.ip_source(), GatewaySource::Route);
+        let offer = dhcp::parse_frame(&fixtures::dhcp_offer(), "eth0", at(0)).expect("parsed");
+        tracker.observe(&offer);
+        assert_eq!(tracker.ip(), Some(Ipv4Addr::new(10, 20, 0, 1)));
+        assert_eq!(tracker.ip_source(), GatewaySource::Route);
+    }
+
+    #[test]
+    fn a_forged_reply_cannot_replace_a_mac_learned_under_the_host_route() {
+        let mut tracker =
+            GatewayTracker::new(None, None).with_default_route(Some(&c1_route()), &c1_captured());
+        tracker.observe(&reply(C1_ROUTER, [10, 20, 0, 1], at(0)));
+        assert_eq!(tracker.mac(), Some(mac(C1_ROUTER)));
+        for n in 0..100 {
+            tracker.observe(&reply("02:de:ad:be:ef:01", [10, 20, 0, 1], at(n)));
+        }
+        assert_eq!(tracker.mac(), Some(mac(C1_ROUTER)));
+        assert!(!tracker.is_gateway(mac("02:de:ad:be:ef:01")));
+    }
+
+    #[test]
+    fn without_a_usable_host_route_the_address_everybody_asks_about_is_still_learned() {
+        // The router deployment: the daemon runs on the gateway itself, whose
+        // own default route leaves by the WAN, which is not captured; or there
+        // is no default route at all.
+        let wan = DefaultRoute {
+            gateway: Ipv4Addr::new(203, 0, 113, 1),
+            interface: "wan0".to_string(),
+        };
+        for route in [None, Some(&wan)] {
+            let mut tracker =
+                GatewayTracker::new(None, None).with_default_route(route, &["lan0".to_string()]);
+            assert_eq!(tracker.ip(), None, "nothing is known yet");
+            for who in [
+                "3c:22:fb:00:00:01",
+                "3c:22:fb:00:00:02",
+                "3c:22:fb:00:00:03",
+            ] {
+                tracker.observe(&request(who, [192, 168, 1, 1], at(0)));
+            }
+            assert_eq!(tracker.ip(), Some(Ipv4Addr::new(192, 168, 1, 1)));
+            assert_eq!(tracker.ip_source(), GatewaySource::Inferred);
+        }
+    }
+
+    #[test]
+    fn a_quorum_for_a_less_asked_about_address_does_not_unseat_the_leader() {
+        // The module doc promises the address the most distinct MACs asked
+        // about. Five hosts ask for the gateway; later three others ask for a
+        // file server. Three is a quorum, but it is not the most.
+        let mut tracker = GatewayTracker::new(None, None);
+        for n in 1..=5u8 {
+            tracker.observe(&request(
+                &format!("3c:22:fb:00:00:{n:02x}"),
+                [10, 20, 0, 1],
+                at(i64::from(n)),
+            ));
+        }
+        assert_eq!(tracker.ip(), Some(Ipv4Addr::new(10, 20, 0, 1)));
+        for n in 0x10..=0x12u8 {
+            tracker.observe(&request(
+                &format!("3c:22:fb:00:00:{n:02x}"),
+                [10, 20, 5, 5],
+                at(10),
+            ));
+        }
+        assert_eq!(
+            tracker.ip(),
+            Some(Ipv4Addr::new(10, 20, 0, 1)),
+            "three askers do not outvote five"
+        );
+    }
+
+    #[test]
+    fn a_later_address_more_asked_about_overtakes_an_early_quorum() {
+        // What corrects a wrong first election without a route or DHCP: the
+        // capture host reaches the quorum first, the real gateway is then asked
+        // about by more distinct MACs and takes the lead.
+        let mut tracker = GatewayTracker::new(None, None);
+        for n in 1..=3u8 {
+            tracker.observe(&request(&format!("3c:22:fb:00:00:{n:02x}"), C1_HOST, at(0)));
+        }
+        assert_eq!(tracker.ip(), Some(Ipv4Addr::from(C1_HOST)));
+        for n in 1..=4u8 {
+            tracker.observe(&request(
+                &format!("3c:22:fb:00:01:{n:02x}"),
+                [10, 20, 0, 1],
+                at(5),
+            ));
+        }
+        assert_eq!(tracker.ip(), Some(Ipv4Addr::new(10, 20, 0, 1)));
+        assert_eq!(tracker.ip_source(), GatewaySource::Inferred);
     }
 }

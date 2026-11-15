@@ -15,7 +15,7 @@
 
 pub mod persist;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -541,6 +541,35 @@ struct Attributed {
     unattributed: u64,
 }
 
+/// The capture host's own hardware addresses, read from the operating system
+/// and never from the wire; see [`crate::host`].
+///
+/// A host capturing on several interfaces transmits on each of them from that
+/// interface's own MAC: its Wi-Fi, and every container or VM bridge it is the
+/// gateway of. Without this, each of those became a device of its own, and the
+/// Mac in the C1 run was seven of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureHost {
+    /// The MAC the capture host is recorded under: the one on the interface
+    /// its default route leaves by, or on the first capture interface when it
+    /// has no such route.
+    pub primary: MacAddr,
+    /// Its other capture interfaces' MACs. Frames from these never create a
+    /// device and never change the host's recorded address.
+    pub aliases: Vec<MacAddr>,
+}
+
+impl CaptureHost {
+    /// Describes a capture host.
+    #[must_use]
+    pub fn new(primary: MacAddr, aliases: impl IntoIterator<Item = MacAddr>) -> Self {
+        CaptureHost {
+            primary,
+            aliases: aliases.into_iter().filter(|m| *m != primary).collect(),
+        }
+    }
+}
+
 /// The MAC-keyed device table and the transitions over it.
 pub struct Manager {
     devices: HashMap<MacAddr, Entry>,
@@ -557,6 +586,9 @@ pub struct Manager {
     /// rather than guessed at. Published in the runtime status so that an
     /// operator can see a responder answering for hosts this daemon cannot see.
     unattributed_claims: u64,
+    /// The capture host's MACs other than the one it is recorded under; see
+    /// [`Manager::set_capture_host`].
+    host_aliases: HashSet<MacAddr>,
 }
 
 impl Manager {
@@ -570,7 +602,31 @@ impl Manager {
             learning,
             reclassifications: Vec::new(),
             unattributed_claims: 0,
+            host_aliases: HashSet::new(),
         }
+    }
+
+    /// Tells the manager which MACs are the capture host's own, builder style.
+    #[must_use]
+    pub fn with_capture_host(mut self, host: CaptureHost) -> Self {
+        self.set_capture_host(host);
+        self
+    }
+
+    /// Tells the manager which MACs are the capture host's own.
+    ///
+    /// Frames from an alias are left out of the device table entirely: they
+    /// create no device, touch no address and count toward nothing. The
+    /// primary is an ordinary device. The analyzer chain is fed separately and
+    /// still sees every frame. A row an earlier run wrote for an alias is left
+    /// alone; nothing refreshes it, so it goes offline like any silent device.
+    pub fn set_capture_host(&mut self, host: CaptureHost) {
+        tracing::info!(
+            primary = %host.primary,
+            aliases = ?host.aliases.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "the capture host is one device; frames from its other interfaces' MACs are not devices"
+        );
+        self.host_aliases = host.aliases.into_iter().collect();
     }
 
     /// How much naming evidence has been kept as an observation rather than
@@ -833,6 +889,13 @@ impl Manager {
         // already reject them, so reaching here means a new source got it wrong.
         if obs.mac.is_group() || obs.mac.is_zero() {
             tracing::debug!(mac = %obs.mac, source = obs.source, "ignoring a non-device MAC");
+            return Vec::new();
+        }
+
+        // The capture host transmitting from another of its own interfaces. It
+        // is already a device, under its primary MAC.
+        if self.host_aliases.contains(&obs.mac) {
+            tracing::trace!(mac = %obs.mac, interface = %obs.interface, "frame from the capture host's own alias MAC");
             return Vec::new();
         }
 
@@ -2339,5 +2402,70 @@ mod tests {
             current_location: None,
             owner_item_id: None,
         }
+    }
+
+    /// The C1 capture host: Wi-Fi on the LAN as `en1` with a private MAC, and
+    /// two OrbStack bridges each with a MAC of its own. Constructed, not
+    /// captured.
+    mod capture_host {
+        pub const EN1: &str = "9a:3b:5c:7d:20:c8";
+        pub const BRIDGE100: &str = "36:e6:8a:a1:7b:64";
+        pub const BRIDGE101: &str = "36:e6:8a:a1:7b:65";
+        /// A VM on the first bridge.
+        pub const VM: &str = "0e:7a:3c:11:22:33";
+    }
+
+    fn on(
+        m: &str,
+        ip: &str,
+        interface: &str,
+        source: &'static str,
+        when: DateTime<Utc>,
+    ) -> Observation {
+        Observation::new(
+            mac(m),
+            Some(ip.parse().expect("test ip")),
+            interface,
+            source,
+            ObservationKind::Announcement,
+            when,
+        )
+    }
+
+    #[test]
+    fn the_capture_host_is_one_device_however_many_interfaces_it_captures_on() {
+        use capture_host::{BRIDGE100, BRIDGE101, EN1, VM};
+        let host = CaptureHost::new(mac(EN1), [mac(BRIDGE100), mac(BRIDGE101)]);
+        let mut m = Manager::new(config(), false).with_capture_host(host);
+
+        let mut effects = Vec::new();
+        for round in 0..3 {
+            let t = at(round * 60);
+            effects.extend(m.observe(&on(EN1, "10.20.229.200", "en1", "mdns", t)));
+            effects.extend(m.observe(&on(BRIDGE100, "192.168.138.1", "bridge100", "mdns", t)));
+            effects.extend(m.observe(&on(BRIDGE101, "192.168.139.1", "bridge101", "arp", t)));
+        }
+        let kinds = events(&effects);
+        assert_eq!(
+            kinds.iter().filter(|k| **k == EventType::NewDevice).count(),
+            1,
+            "one new_device for the capture host: {kinds:?}"
+        );
+        assert!(
+            !kinds.contains(&EventType::IpChanged),
+            "no ip_changed between the host's own interface addresses: {kinds:?}"
+        );
+        assert_eq!(m.len(), 1, "the capture host is one device");
+        let host = m
+            .devices
+            .get(&mac(EN1))
+            .expect("recorded under its en1 MAC");
+        assert_eq!(host.last_ip.as_deref(), Some("10.20.229.200"));
+        assert_eq!(host.last_interface.as_deref(), Some("en1"));
+
+        // A VM on the bridge is somebody else, and is its own device.
+        let vm = m.observe(&on(VM, "192.168.138.2", "bridge100", "arp", at(200)));
+        assert_eq!(events(&vm), vec![EventType::NewDevice]);
+        assert_eq!(m.len(), 2);
     }
 }

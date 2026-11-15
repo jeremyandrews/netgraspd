@@ -59,10 +59,12 @@ pub trait CaptureSource: Send {
     ///
     /// The returned handle resolves when every interface thread has stopped,
     /// which happens when `shutdown` goes true or when a capture handle fails
-    /// unrecoverably.
+    /// unrecoverably. A thread that fails is reported on `failures` the moment
+    /// it ends, while the others keep running; the handle does not repeat it.
     fn run(
         self: Box<Self>,
         tx: mpsc::Sender<Observation>,
+        failures: mpsc::Sender<CaptureFailure>,
         shutdown: watch::Receiver<bool>,
     ) -> JoinHandle<Result<()>>;
 }
@@ -110,50 +112,142 @@ impl CaptureSource for PcapSource {
     fn run(
         self: Box<Self>,
         tx: mpsc::Sender<Observation>,
+        failures: mpsc::Sender<CaptureFailure>,
         shutdown: watch::Receiver<bool>,
     ) -> JoinHandle<Result<()>> {
         tokio::spawn(async move {
-            let mut handles = Vec::with_capacity(self.interfaces.len());
+            let mut tasks = Vec::with_capacity(self.interfaces.len());
             for interface in self.interfaces.clone() {
                 let tx = tx.clone();
                 let shutdown = shutdown.clone();
                 let (name, filter, parser) = (self.name, self.filter, self.parser);
                 let (snaplen, buffer_size) = (self.snaplen, self.buffer_size);
-                handles.push(tokio::task::spawn_blocking(move || {
-                    capture_loop(
-                        name,
-                        filter,
-                        parser,
-                        &interface,
-                        snaplen,
-                        buffer_size,
-                        &tx,
-                        &shutdown,
-                    )
+                let thread = tokio::task::spawn_blocking({
+                    let interface = interface.clone();
+                    move || {
+                        capture_loop(
+                            name,
+                            filter,
+                            parser,
+                            &interface,
+                            snaplen,
+                            buffer_size,
+                            &tx,
+                            &shutdown,
+                        )
+                    }
+                });
+                tasks.push((interface, async move {
+                    thread
+                        .await
+                        .unwrap_or_else(|err| Err(anyhow!("capture thread panicked: {err}")))
                 }));
             }
-
-            let mut first_error = None;
-            for handle in handles {
-                match handle.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => {
-                        tracing::error!(source = self.name, %err, "capture thread failed");
-                        first_error.get_or_insert(err);
-                    }
-                    Err(err) => {
-                        tracing::error!(source = self.name, %err, "capture thread panicked");
-                        first_error
-                            .get_or_insert_with(|| anyhow!("capture thread panicked: {err}"));
-                    }
-                }
-            }
-            match first_error {
-                Some(err) => Err(err),
-                None => Ok(()),
-            }
+            supervise(self.name, tasks, failures).await
         })
     }
+}
+
+/// One interface's capture thread ending in failure, as reported to the daemon
+/// and recorded in the runtime status file.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CaptureFailure {
+    /// The capture source, for example `arp`.
+    pub source: String,
+    /// The interface the thread was capturing on.
+    pub interface: String,
+    /// What went wrong.
+    pub error: String,
+    /// When the thread ended.
+    pub at: DateTime<Utc>,
+}
+
+/// Supervises one source's per-interface tasks, reporting each failure the
+/// moment it happens.
+///
+/// The tasks run concurrently and are collected in the order they **finish**,
+/// not the order they were started. That is the whole fix for the C1 run,
+/// where the ARP filter was rejected on eleven `utun` interfaces at startup and
+/// nothing was said until shutdown: the tasks used to be awaited in spawn
+/// order, so a failure on a later interface waited behind an earlier one that
+/// ran until SIGTERM.
+///
+/// Each failure is logged at `error` with the source, the interface and the
+/// error, and sent on `failures` for the daemon to record in the runtime
+/// status file. A task that stops cleanly is not reported. The other tasks keep
+/// running either way.
+///
+/// Generic over the task so it can be tested with plain futures, without a
+/// capture handle.
+///
+/// # Errors
+///
+/// None at present: every failure has already been reported on `failures`
+/// by the time this returns, so the result is `Ok` and the caller does not log
+/// it a second time. The `Result` keeps the shape [`CaptureSource::run`]
+/// returns.
+pub async fn supervise<F>(
+    source: &'static str,
+    tasks: Vec<(String, F)>,
+    failures: mpsc::Sender<CaptureFailure>,
+) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    let mut running = tokio::task::JoinSet::new();
+    let mut interfaces = std::collections::HashMap::new();
+    for (interface, task) in tasks {
+        let handle = running.spawn(task);
+        interfaces.insert(handle.id(), interface);
+    }
+    while let Some(joined) = running.join_next_with_id().await {
+        let (id, outcome) = match joined {
+            Ok((id, outcome)) => (id, outcome),
+            Err(err) => (err.id(), Err(anyhow!("capture task panicked: {err}"))),
+        };
+        let interface = interfaces.remove(&id).unwrap_or_default();
+        match outcome {
+            Ok(()) => tracing::debug!(source, interface, "capture thread stopped"),
+            Err(err) => {
+                let error = format!("{err:#}");
+                tracing::error!(
+                    source,
+                    interface,
+                    err = %error,
+                    "capture thread failed; the source's other interfaces keep running"
+                );
+                // A closed channel means the daemon is already gone, and the
+                // log line above is all that is left to say.
+                let _ = failures
+                    .send(CaptureFailure {
+                        source: source.to_string(),
+                        interface,
+                        error,
+                        at: Utc::now(),
+                    })
+                    .await;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Compiles and installs a BPF filter on a capture handle.
+///
+/// The error names the interface as well as the filter, because the same
+/// filter is installed on every interface a source captures on and only some
+/// of them may reject it.
+///
+/// # Errors
+///
+/// Returns an error when libpcap rejects the filter.
+pub fn apply_filter<T: pcap::Activated + ?Sized>(
+    cap: &mut pcap::Capture<T>,
+    filter: &str,
+    interface: &str,
+) -> Result<()> {
+    cap.filter(filter, true)
+        .with_context(|| format!("BPF filter {filter:?} was rejected on {interface}"))
 }
 
 /// Blocking per-interface capture loop.
@@ -202,8 +296,7 @@ fn capture_loop(
         .setnonblock()
         .with_context(|| format!("could not set non-blocking mode on {interface}"))?;
 
-    cap.filter(filter, true)
-        .with_context(|| format!("BPF filter {filter:?} was rejected"))?;
+    apply_filter(&mut cap, filter, interface)?;
 
     tracing::info!(source, interface, filter, "capture started");
 
@@ -562,6 +655,7 @@ impl CaptureSource for StubSource {
     fn run(
         self: Box<Self>,
         _tx: mpsc::Sender<Observation>,
+        _failures: mpsc::Sender<CaptureFailure>,
         mut shutdown: watch::Receiver<bool>,
     ) -> JoinHandle<Result<()>> {
         tokio::spawn(async move {
@@ -864,5 +958,70 @@ mod tests {
         };
         assert_eq!(interface.exclusion_before_link_type(), None);
         assert_eq!(interface.exclusion(), Some("link layer could not be read"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_interface_is_reported_while_the_others_still_run() {
+        use std::future::Future;
+        use std::pin::Pin;
+        type Task = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (failures_tx, mut failures_rx) = mpsc::channel(8);
+
+        // en1 runs until shutdown, as a healthy capture thread does. It is
+        // listed first, which is the order that used to hide utun0's failure
+        // behind it.
+        let mut until_shutdown = shutdown_rx.clone();
+        let en1: Task = Box::pin(async move {
+            while !*until_shutdown.borrow() {
+                if until_shutdown.changed().await.is_err() {
+                    break;
+                }
+            }
+            Ok(())
+        });
+        let utun0: Task = Box::pin(async {
+            Err(anyhow!(
+                "BPF filter \"arp\" was rejected on utun0: arp not supported"
+            ))
+        });
+        let supervisor = tokio::spawn(supervise(
+            "arp",
+            vec![("en1".to_string(), en1), ("utun0".to_string(), utun0)],
+            failures_tx,
+        ));
+
+        let failure = tokio::time::timeout(std::time::Duration::from_secs(2), failures_rx.recv())
+            .await
+            .expect("the failure is reported when it happens, not at shutdown")
+            .expect("a failure");
+        assert!(!*shutdown_rx.borrow(), "shutdown has not been asked for");
+        assert_eq!(failure.source, "arp");
+        assert_eq!(failure.interface, "utun0");
+        assert!(failure.error.contains("rejected"), "{}", failure.error);
+        assert!(!supervisor.is_finished(), "en1 is still capturing");
+
+        shutdown_tx.send(true).expect("the supervisor is listening");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), supervisor)
+            .await
+            .expect("the supervisor stops with its tasks");
+        assert!(
+            failures_rx.recv().await.is_none(),
+            "utun0 is reported once, and en1 stopping cleanly is not a failure"
+        );
+    }
+
+    #[test]
+    fn a_rejected_filter_names_the_interface() {
+        // A raw IPv4 link has no Ethernet header, so "arp" cannot compile on
+        // it, which is what happened on every utun in C1. A dead handle needs
+        // no capture permission.
+        let mut cap = pcap::Capture::dead(pcap::Linktype::IPV4).expect("a dead handle");
+        let err = apply_filter(&mut cap, "arp", "utun0")
+            .expect_err("arp does not compile on a raw IP link");
+        let text = format!("{err:#}");
+        assert!(text.contains("\"arp\""), "{text}");
+        assert!(text.contains("utun0"), "the interface is named: {text}");
     }
 }
