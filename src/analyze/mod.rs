@@ -220,6 +220,18 @@ impl Chain {
         }
     }
 
+    /// Seeds the gateway belief from the capture host's own default route,
+    /// builder style. Red-commit stub: ignores the route, which is `main`'s
+    /// behaviour.
+    #[must_use]
+    pub fn with_default_route(
+        self,
+        _route: Option<&gateway::DefaultRoute>,
+        _captured: &[String],
+    ) -> Self {
+        self
+    }
+
     /// Names of the analyzers that are running.
     #[must_use]
     pub fn names(&self) -> Vec<&'static str> {
@@ -419,5 +431,174 @@ mod tests {
             at(0),
             std::time::Duration::from_secs(30)
         ));
+    }
+
+    /// The C1 network, as the chain saw it on 2026-11-14: a Routerboard at
+    /// 10.20.0.1 that proxy-ARPs, the capture host at 10.20.229.200, and the
+    /// ordinary hosts around them.
+    mod c1 {
+        use super::*;
+        use crate::analyze::gateway::DefaultRoute;
+        use crate::types::{
+            ArpDetail, ArpOp, DhcpDetail, DhcpMessageType, EventType, ObservationKind,
+            ProtocolDetail,
+        };
+        use std::net::{IpAddr, Ipv4Addr};
+
+        pub const ROUTER: &str = "4c:5e:0c:10:20:01";
+        pub const STUDIO: &str = "9a:3b:5c:7d:20:c8";
+        pub const ROUTER_IP: Ipv4Addr = Ipv4Addr::new(10, 20, 0, 1);
+        pub const STUDIO_IP: Ipv4Addr = Ipv4Addr::new(10, 20, 229, 200);
+        /// Three ordinary hosts, each with an address of its own.
+        pub const HOSTS: [(&str, Ipv4Addr); 3] = [
+            ("3c:22:fb:00:00:01", Ipv4Addr::new(10, 20, 1, 10)),
+            ("3c:22:fb:00:00:02", Ipv4Addr::new(10, 20, 1, 11)),
+            ("3c:22:fb:00:00:03", Ipv4Addr::new(10, 20, 1, 12)),
+        ];
+
+        fn mac(s: &str) -> MacAddr {
+            s.parse().expect("test mac")
+        }
+
+        fn arp(
+            op: ArpOp,
+            from: &str,
+            sender: Ipv4Addr,
+            target: Ipv4Addr,
+            secs: i64,
+        ) -> Observation {
+            Observation::new(
+                mac(from),
+                Some(IpAddr::V4(sender)),
+                "en1",
+                "arp",
+                if op == ArpOp::Request {
+                    ObservationKind::Request
+                } else {
+                    ObservationKind::Reply
+                },
+                at(secs),
+            )
+            .with_detail(ProtocolDetail::Arp(ArpDetail {
+                op,
+                sender_mac: mac(from),
+                sender_ip: Some(sender),
+                target_ip: target,
+                gratuitous: false,
+            }))
+        }
+
+        /// The sequence, ending with the DHCP Ack that corrected the belief at
+        /// minute 8.5.
+        pub fn sequence() -> Vec<Observation> {
+            let mut out = Vec::new();
+            // One host asks for the gateway and the router answers: on a
+            // settled network that is about as much as the gateway is asked.
+            out.push(arp(ArpOp::Request, HOSTS[0].0, HOSTS[0].1, ROUTER_IP, 0));
+            out.push(arp(ArpOp::Reply, ROUTER, ROUTER_IP, HOSTS[0].1, 0));
+            // Three hosts ask for the capture host within a second, and it
+            // answers for itself.
+            for (who, address) in HOSTS {
+                out.push(arp(ArpOp::Request, who, address, STUDIO_IP, 1));
+            }
+            out.push(arp(ArpOp::Reply, STUDIO, STUDIO_IP, HOSTS[0].1, 1));
+            // The router proxy-ARPs for the capture host and for two hosts.
+            out.push(arp(ArpOp::Reply, ROUTER, STUDIO_IP, HOSTS[2].1, 2));
+            out.push(arp(ArpOp::Reply, ROUTER, HOSTS[0].1, HOSTS[2].1, 2));
+            out.push(arp(ArpOp::Reply, ROUTER, HOSTS[1].1, HOSTS[2].1, 2));
+            // Everybody carries on using their own address.
+            out.push(arp(ArpOp::Reply, STUDIO, STUDIO_IP, HOSTS[1].1, 3));
+            out.push(arp(ArpOp::Request, HOSTS[0].0, HOSTS[0].1, HOSTS[1].1, 3));
+            out.push(arp(ArpOp::Request, HOSTS[1].0, HOSTS[1].1, HOSTS[0].1, 3));
+            // A DHCP Ack from the router, carrying option 3.
+            out.push(
+                Observation::new(
+                    mac(ROUTER),
+                    Some(IpAddr::V4(ROUTER_IP)),
+                    "en1",
+                    "dhcp",
+                    ObservationKind::Reply,
+                    at(510),
+                )
+                .with_detail(ProtocolDetail::Dhcp(DhcpDetail {
+                    message_type: DhcpMessageType::Ack,
+                    client_mac: Some(mac(HOSTS[2].0)),
+                    assigned_ip: Some(HOSTS[2].1),
+                    router: Some(ROUTER_IP),
+                })),
+            );
+            out
+        }
+
+        pub fn route() -> DefaultRoute {
+            DefaultRoute {
+                gateway: ROUTER_IP,
+                interface: "en1".to_string(),
+            }
+        }
+
+        pub fn captured() -> Vec<String> {
+            ["en1", "bridge100", "bridge101"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        }
+
+        /// Every `ip_conflict` and `arp_spoof` alert, as (type, MAC, address).
+        pub fn address_alerts(chain: &mut Chain) -> Vec<(EventType, String, Option<String>)> {
+            let mut alerts = Vec::new();
+            for observation in sequence() {
+                for alert in chain.observe(&observation) {
+                    if matches!(
+                        alert.event_type,
+                        EventType::IpConflict | EventType::ArpSpoof
+                    ) {
+                        alerts.push((alert.event_type, alert.mac.to_string(), alert.ip));
+                    }
+                }
+            }
+            alerts
+        }
+    }
+
+    #[test]
+    fn with_the_host_route_the_c1_sequence_raises_no_address_alerts() {
+        let mut chain = Chain::new(&SecurityConfig::default())
+            .with_default_route(Some(&c1::route()), &c1::captured());
+        let alerts = c1::address_alerts(&mut chain);
+        assert_eq!(alerts, Vec::new(), "no ip_conflict and no arp_spoof");
+        assert_eq!(chain.gateway().ip(), Some(c1::ROUTER_IP));
+        assert_eq!(
+            chain.gateway().mac(),
+            Some(c1::ROUTER.parse().expect("mac"))
+        );
+    }
+
+    /// Characterization, not a goal: with no host route to read, the
+    /// popularity fallback still elects the capture host on this sequence, and
+    /// the router's proxy replies then read as an impersonation and as
+    /// conflicts until something stronger says otherwise. This is what main did
+    /// in C1, and it is the path a daemon on an isolated segment still takes.
+    #[test]
+    fn without_a_host_route_the_c1_sequence_is_what_main_did() {
+        let mut chain = Chain::new(&SecurityConfig::default());
+        let alerts = c1::address_alerts(&mut chain);
+        let router = c1::ROUTER.to_string();
+        assert!(
+            alerts.contains(&(
+                EventType::ArpSpoof,
+                router.clone(),
+                Some(c1::STUDIO_IP.to_string())
+            )),
+            "{alerts:?}"
+        );
+        assert!(
+            alerts
+                .iter()
+                .any(|(kind, mac, _)| *kind == EventType::IpConflict && *mac == router),
+            "{alerts:?}"
+        );
+        // The DHCP Ack at the end corrects the belief, as it did at minute 8.5.
+        assert_eq!(chain.gateway().ip(), Some(c1::ROUTER_IP));
     }
 }

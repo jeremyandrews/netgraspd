@@ -156,6 +156,73 @@ impl CaptureSource for PcapSource {
     }
 }
 
+/// One interface's capture thread ending in failure, as reported to the daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureFailure {
+    /// The capture source, for example `arp`.
+    pub source: String,
+    /// The interface the thread was capturing on.
+    pub interface: String,
+    /// What went wrong.
+    pub error: String,
+    /// When the thread ended.
+    pub at: DateTime<Utc>,
+}
+
+/// Supervises one source's per-interface tasks, reporting each failure.
+///
+/// Red-commit stub: awaits the tasks in the order given and reports a failure
+/// only once every task before it has ended, which is `main`'s behaviour.
+///
+/// # Errors
+///
+/// Returns the first failure, as `main` did.
+pub async fn supervise<F>(
+    source: &'static str,
+    tasks: Vec<(String, F)>,
+    failures: mpsc::Sender<CaptureFailure>,
+) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    let mut first_error = None;
+    for (interface, task) in tasks {
+        if let Err(err) = task.await {
+            tracing::error!(source, %err, "capture thread failed");
+            let _ = failures
+                .send(CaptureFailure {
+                    source: source.to_string(),
+                    interface,
+                    error: format!("{err:#}"),
+                    at: Utc::now(),
+                })
+                .await;
+            first_error.get_or_insert(err);
+        }
+    }
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+/// Compiles and installs a BPF filter on a capture handle.
+///
+/// Red-commit stub: the error names the filter but not the interface, which is
+/// `main`'s message.
+///
+/// # Errors
+///
+/// Returns an error when libpcap rejects the filter.
+pub fn apply_filter<T: pcap::Activated + ?Sized>(
+    cap: &mut pcap::Capture<T>,
+    filter: &str,
+    _interface: &str,
+) -> Result<()> {
+    cap.filter(filter, true)
+        .with_context(|| format!("BPF filter {filter:?} was rejected"))
+}
+
 /// Blocking per-interface capture loop.
 ///
 /// Runs on the blocking pool, so `blocking_send` is the correct way to hand
@@ -202,8 +269,7 @@ fn capture_loop(
         .setnonblock()
         .with_context(|| format!("could not set non-blocking mode on {interface}"))?;
 
-    cap.filter(filter, true)
-        .with_context(|| format!("BPF filter {filter:?} was rejected"))?;
+    apply_filter(&mut cap, filter, interface)?;
 
     tracing::info!(source, interface, filter, "capture started");
 
@@ -864,5 +930,70 @@ mod tests {
         };
         assert_eq!(interface.exclusion_before_link_type(), None);
         assert_eq!(interface.exclusion(), Some("link layer could not be read"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_interface_is_reported_while_the_others_still_run() {
+        use std::future::Future;
+        use std::pin::Pin;
+        type Task = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (failures_tx, mut failures_rx) = mpsc::channel(8);
+
+        // en1 runs until shutdown, as a healthy capture thread does. It is
+        // listed first, which is the order that used to hide utun0's failure
+        // behind it.
+        let mut until_shutdown = shutdown_rx.clone();
+        let en1: Task = Box::pin(async move {
+            while !*until_shutdown.borrow() {
+                if until_shutdown.changed().await.is_err() {
+                    break;
+                }
+            }
+            Ok(())
+        });
+        let utun0: Task = Box::pin(async {
+            Err(anyhow!(
+                "BPF filter \"arp\" was rejected on utun0: arp not supported"
+            ))
+        });
+        let supervisor = tokio::spawn(supervise(
+            "arp",
+            vec![("en1".to_string(), en1), ("utun0".to_string(), utun0)],
+            failures_tx,
+        ));
+
+        let failure = tokio::time::timeout(std::time::Duration::from_secs(2), failures_rx.recv())
+            .await
+            .expect("the failure is reported when it happens, not at shutdown")
+            .expect("a failure");
+        assert!(!*shutdown_rx.borrow(), "shutdown has not been asked for");
+        assert_eq!(failure.source, "arp");
+        assert_eq!(failure.interface, "utun0");
+        assert!(failure.error.contains("rejected"), "{}", failure.error);
+        assert!(!supervisor.is_finished(), "en1 is still capturing");
+
+        shutdown_tx.send(true).expect("the supervisor is listening");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), supervisor)
+            .await
+            .expect("the supervisor stops with its tasks");
+        assert!(
+            failures_rx.recv().await.is_none(),
+            "utun0 is reported once, and en1 stopping cleanly is not a failure"
+        );
+    }
+
+    #[test]
+    fn a_rejected_filter_names_the_interface() {
+        // A raw IPv4 link has no Ethernet header, so "arp" cannot compile on
+        // it, which is what happened on every utun in C1. A dead handle needs
+        // no capture permission.
+        let mut cap = pcap::Capture::dead(pcap::Linktype::IPV4).expect("a dead handle");
+        let err = apply_filter(&mut cap, "arp", "utun0")
+            .expect_err("arp does not compile on a raw IP link");
+        let text = format!("{err:#}");
+        assert!(text.contains("\"arp\""), "{text}");
+        assert!(text.contains("utun0"), "the interface is named: {text}");
     }
 }
