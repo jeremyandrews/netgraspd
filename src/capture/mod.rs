@@ -19,6 +19,7 @@ pub mod mdns;
 pub mod names;
 pub mod nbns;
 pub mod ndp;
+pub mod sample;
 pub mod ssdp;
 
 use anyhow::{Context, Result, anyhow, bail};

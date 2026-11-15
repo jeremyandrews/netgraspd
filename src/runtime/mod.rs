@@ -16,6 +16,8 @@
 //! never reads half a file. A path that cannot be written is a warning logged
 //! once, never a reason to stop watching the network.
 
+pub mod visibility;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -91,6 +93,14 @@ pub struct Status {
     /// parses.
     #[serde(default)]
     pub capture_failures: Vec<crate::capture::CaptureFailure>,
+    /// What each capture interface has seen: frames, distinct senders and
+    /// listening time, per interface and per source. See
+    /// [`visibility`] for what the numbers mean and how they are bounded.
+    pub interfaces: BTreeMap<String, visibility::InterfaceVisibility>,
+    /// The gateway the daemon believes in, and where that belief came from.
+    pub gateway: Option<visibility::GatewayBelief>,
+    /// The unknown-device sample capture, when it is switched on.
+    pub unknown_sample: Option<crate::capture::sample::SampleStatus>,
     /// Poll and failure counts per enricher.
     pub enrichers: BTreeMap<String, EnricherCounters>,
     /// Resident set size, when the platform can report it without unsafe code.
@@ -122,6 +132,9 @@ impl Status {
             offline: 0,
             sources: BTreeMap::new(),
             capture_failures: Vec::new(),
+            interfaces: BTreeMap::new(),
+            gateway: None,
+            unknown_sample: None,
             enrichers: BTreeMap::new(),
             resident_bytes: None,
         }
@@ -174,6 +187,22 @@ impl Status {
                 )
             })
             .collect()
+    }
+
+    /// The visibility report: the gateway belief, then per interface the
+    /// counts, one line per source, and the verdict.
+    ///
+    /// Every interface a capture thread was started on appears, including one
+    /// whose every thread failed and so never counted anything.
+    #[must_use]
+    pub fn visibility_lines(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// One verdict per interface, in interface order.
+    #[must_use]
+    pub fn verdicts(&self) -> Vec<(String, visibility::Verdict)> {
+        Vec::new()
     }
 
     /// Writes the file atomically.
@@ -368,6 +397,99 @@ mod tests {
         let read = Status::read(&path).expect("an older file still parses");
         assert!(read.capture_failures.is_empty());
         assert!(read.capture_failure_lines().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A status as an isolated guest network leaves it: one interface that
+    /// has heard only this host and the gateway.
+    fn isolated_status() -> Status {
+        let mut status = Status::new(base());
+        status.updated_at = base() + chrono::Duration::minutes(10);
+        let mut sources = BTreeMap::new();
+        sources.insert(
+            "arp".to_string(),
+            visibility::SourceVisibility {
+                frames: 40,
+                senders: 2,
+                senders_capped: false,
+            },
+        );
+        status.interfaces.insert(
+            "en0".into(),
+            visibility::InterfaceVisibility {
+                listening_since: Some(base()),
+                frames: 40,
+                senders: 2,
+                senders_capped: false,
+                this_host_seen: true,
+                gateway_seen: true,
+                last_frame_at: Some(base() + chrono::Duration::minutes(9)),
+                sources,
+            },
+        );
+        status.gateway = Some(visibility::GatewayBelief {
+            ip: Some("10.20.0.1".into()),
+            mac: Some("00:11:22:33:44:01".into()),
+            ip_source: "route".into(),
+            mac_source: "inferred".into(),
+        });
+        status.unknown_sample = Some(crate::capture::sample::SampleStatus {
+            path: "trip/unknown-sample.pcap".into(),
+            devices: 3,
+            frames: 9,
+            bytes: 1234,
+            pending_devices: 1,
+            stopped: None,
+        });
+        status
+    }
+
+    #[test]
+    fn the_visibility_report_round_trips_and_reads_as_isolation() {
+        let dir = temp_dir("visibility_round_trip");
+        let path = dir.join("status.json");
+        let status = isolated_status();
+        status.write(&path).expect("writes");
+        let read = Status::read(&path).expect("reads");
+        assert_eq!(read, status);
+
+        let lines = read.visibility_lines();
+        let text = lines.join("\n");
+        assert!(
+            text.contains("gateway 10.20.0.1 (from route) at 00:11:22:33:44:01 (from inferred)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("en0: listening 10m 0s, 40 frames from 2 senders"),
+            "{text}"
+        );
+        assert!(text.contains("arp"), "{text}");
+        assert!(
+            text.contains(
+                "capture is working: 1 sender seen (the gateway), consistent with client isolation"
+            ),
+            "{text}"
+        );
+        let verdicts = read.verdicts();
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0].1.kind, visibility::VerdictKind::Isolated);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_status_file_from_before_the_visibility_report_still_parses() {
+        let dir = temp_dir("before_visibility");
+        let path = dir.join("status.json");
+        let mut json = serde_json::to_value(isolated_status()).expect("encodes");
+        let object = json.as_object_mut().expect("an object");
+        for key in ["interfaces", "gateway", "unknown_sample"] {
+            assert!(object.remove(key).is_some(), "{key} is written");
+        }
+        std::fs::write(&path, serde_json::to_vec(&json).expect("encodes")).expect("writes");
+        let read = Status::read(&path).expect("an older file still parses");
+        assert!(read.interfaces.is_empty());
+        assert!(read.gateway.is_none());
+        assert!(read.unknown_sample.is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 

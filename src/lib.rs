@@ -45,6 +45,7 @@ pub mod db;
 pub mod device;
 pub mod enrich;
 pub mod events;
+pub mod export;
 pub mod host;
 pub mod identity;
 pub mod location;

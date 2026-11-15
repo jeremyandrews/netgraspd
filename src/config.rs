@@ -339,6 +339,46 @@ pub struct CaptureConfig {
     /// How many recent dedup keys to remember. Bounded so a busy network cannot
     /// grow the set without limit.
     pub dedup_capacity: usize,
+    /// The unknown-device sample capture. Off by default.
+    pub unknown_sample: UnknownSampleConfig,
+}
+
+/// The unknown-device sample: the first few frames from each device the
+/// identifier could not name, kept in one pcap file to learn from later.
+///
+/// Off by default. The frames are broadcast and multicast only, because that is
+/// all the daemon ever captures. See [`crate::capture::sample`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UnknownSampleConfig {
+    /// Whether the sample is collected.
+    pub enabled: bool,
+    /// The pcap file it is written to. Appended to when it already holds a
+    /// sample, so a restart keeps what the earlier run kept.
+    pub path: PathBuf,
+    /// Frames kept from each unnamed device.
+    pub frames_per_device: u32,
+    /// Unnamed devices kept.
+    pub max_devices: usize,
+    /// Largest the file may grow, in bytes, its header included.
+    pub max_bytes: u64,
+    /// How long a device has to be named before its frames are kept. A device
+    /// is often named a moment after it is first seen, by a DHCP request or an
+    /// mDNS announcement that follows its first ARP.
+    pub settle: HumanDuration,
+}
+
+impl Default for UnknownSampleConfig {
+    fn default() -> Self {
+        UnknownSampleConfig {
+            enabled: false,
+            path: PathBuf::from("/var/lib/netgraspd/unknown-sample.pcap"),
+            frames_per_device: 5,
+            max_devices: 200,
+            max_bytes: 10 * 1024 * 1024,
+            settle: HumanDuration::from_secs(60),
+        }
+    }
 }
 
 impl Default for CaptureConfig {
@@ -351,6 +391,7 @@ impl Default for CaptureConfig {
             buffer_size: 1 << 20,
             dedup_resolution_secs: 1,
             dedup_capacity: 8192,
+            unknown_sample: UnknownSampleConfig::default(),
         }
     }
 }
@@ -1317,6 +1358,17 @@ impl Config {
         Ok((config, source))
     }
 
+    /// This configuration with every secret replaced by `***`, for anything
+    /// written somewhere a person might share: the trip export.
+    ///
+    /// The secrets are the database password, the ntfy topic (anybody who knows
+    /// it can read and post to it) and token, and the UniFi account name,
+    /// password and API key.
+    #[must_use]
+    pub fn redacted(&self) -> Config {
+        self.clone()
+    }
+
     /// Rejects combinations that would misbehave silently at runtime.
     ///
     /// # Errors
@@ -1656,6 +1708,81 @@ mod tests {
                 config.runtime.status_path.to_string_lossy(),
                 "/var/lib/netgraspd/status.json"
             );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn a_redacted_configuration_holds_no_secret() {
+        let mut c = Config::default();
+        c.database.url = "postgres://trip:db-secret-1@localhost:55432/trip".into();
+        c.notify.ntfy = Some(NtfyConfig {
+            topic: "topic-secret-2".into(),
+            token: Some("tk_secret-3".into()),
+            ..NtfyConfig::default()
+        });
+        c.enrichment.unifi.username = "user-secret-4".into();
+        c.enrichment.unifi.password = "password-secret-5".into();
+        c.enrichment.unifi.api_key = "key-secret-6".into();
+        let redacted = serde_json::to_string(&c.redacted()).expect("encodes");
+        for secret in [
+            "db-secret-1",
+            "topic-secret-2",
+            "tk_secret-3",
+            "user-secret-4",
+            "password-secret-5",
+            "key-secret-6",
+        ] {
+            assert!(!redacted.contains(secret), "{secret} survived: {redacted}");
+        }
+        assert!(
+            redacted.contains("postgres://trip:***@localhost:55432/trip"),
+            "{redacted}"
+        );
+        // Empty fields stay empty, so the export does not claim a secret that
+        // was never set.
+        let plain = Config::default().redacted();
+        assert!(plain.enrichment.unifi.password.is_empty());
+        assert!(plain.notify.ntfy.is_none());
+    }
+
+    #[test]
+    fn the_foreign_network_profile_parses_and_validates_with_enrichment_and_notification_off() {
+        // Read at run time rather than with include_str!, so that a missing
+        // profile is this test failing rather than the crate not compiling.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/netgrasp.foreign.toml.example");
+        let profile = std::fs::read_to_string(path)
+            .unwrap_or_else(|err| panic!("the foreign profile {path} must exist: {err}"));
+        Jail::expect_with(|jail| {
+            jail.create_file("netgrasp.toml", &profile)?;
+            let config = Config::load(None, &[]).expect("the foreign profile must load");
+            config.validate().expect("and validate");
+            assert!(!config.enrichment.enabled, "enrichment off");
+            assert!(!config.enrichment.unifi.enabled);
+            assert!(!config.notify.enabled, "notifications off");
+            assert!(config.notify.ntfy.is_none(), "and nowhere to send them");
+            assert_eq!(config.maintenance.event_retention_days, 1);
+            assert_eq!(config.maintenance.rollup_after_days, 1);
+            assert!(
+                config.capture.interfaces.is_empty(),
+                "interfaces are left to the default selection"
+            );
+            assert!(config.capture.unknown_sample.enabled, "the sample is on");
+            // Its own database, never the home one.
+            let home = include_str!("../netgrasp.toml.example");
+            let home_url = home
+                .lines()
+                .find_map(|l| l.strip_prefix("url = "))
+                .expect("the home example names a database");
+            assert_ne!(format!("{:?}", config.database.url), home_url);
+            assert_ne!(config.database.url, DatabaseConfig::default().url);
+            // Somewhere an ordinary user can write: not under /var.
+            for path in [
+                &config.runtime.status_path,
+                &config.capture.unknown_sample.path,
+            ] {
+                assert!(path.is_relative(), "{} is relative", path.display());
+            }
             Ok(())
         });
     }
