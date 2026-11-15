@@ -16,7 +16,10 @@ url = "postgres://netgrasp:netgrasp@localhost:5432/netgrasp"
 pool_size = 4
 
 [capture]
-# Empty means every non-loopback interface that is up and has an address.
+# Empty means every interface that is up with carrier, not loopback, Ethernet
+# (Wi-Fi counts) and holds an IPv4 address. That leaves out tunnels (utun*,
+# tailscale0), link-local-only links (awdl0, llw0, veth*) and unplugged ports.
+# List interfaces here, or pass -i, to choose them yourself.
 interfaces = []
 
 # All six are implemented. The default is the two that cover an IPv4 LAN on

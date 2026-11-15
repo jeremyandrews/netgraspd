@@ -81,8 +81,8 @@ pub enum Command {
 /// Arguments to `run`.
 #[derive(Debug, Args)]
 pub struct RunArgs {
-    /// Interface to capture on. Repeatable. Defaults to every non-loopback
-    /// interface that is up.
+    /// Interface to capture on. Repeatable. Defaults to every interface that
+    /// is up with carrier, Ethernet and IPv4-addressed, loopback excepted.
     #[arg(short, long, value_name = "NAME")]
     pub interface: Vec<String>,
 

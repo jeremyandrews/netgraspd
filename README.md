@@ -209,17 +209,82 @@ unit grants `CAP_NET_RAW` through `AmbientCapabilities`, which survives an
 upgrade and takes every other capability away. See
 [Deploying](#deploying).
 
-**macOS.** There is no `setcap`. `/dev/bpf*` is root-only out of the box, so
-either run under `sudo`, or install Wireshark's ChmodBPF helper so that members
-of the `access_bpf` group can open it. macOS is a development platform for this
-daemon; Linux is the deployment target, and each capture source needs verifying
-per protocol on macOS because the BPF behaviour differs.
+**macOS.** See [Capturing on macOS](#capturing-on-macos).
 
 **In a container.** Capture needs `--network=host` *and* `--cap-add=NET_RAW`.
 Without host networking the container sees the Docker bridge rather than your
 LAN, so the daemon starts, captures nothing, and looks exactly like it is
 working. See the comments at the top of `Dockerfile` for why the binary is
 deliberately not `setcap`-ed in the image.
+
+### Capturing on macOS
+
+macOS has no `setcap`. Capture goes through `/dev/bpf*`, which is `root:wheel`
+mode 600 out of the box, so either run the daemon under `sudo` or give a group
+read and write on the BPF devices. There are two ways to do that, and both
+need an administrator once:
+
+- **Permanently: Wireshark's ChmodBPF.** `brew install --cask
+  wireshark-chmodbpf` installs a launch daemon that runs at every boot, creates
+  every BPF device the kernel allows (`sysctl debug.bpf_maxdevices`, 256 on
+  current macOS), and gives the `access_bpf` group read and write on all of
+  them. Check with `id` that you are in `access_bpf` (`sudo dseditgroup -o
+  edit -a "$USER" -t user access_bpf` if not), then log out and in again.
+- **Until the next reboot: the `admin` group.** An administrator account is
+  already in `admin`, so:
+
+  ```sh
+  sudo chgrp admin /dev/bpf*
+  sudo chmod g+rw /dev/bpf*
+  ```
+
+  This only covers the devices that exist when you run it. macOS creates BPF
+  devices on demand, one per open capture handle, and a device created later is
+  `root:wheel` 600 again. The daemon opens one handle per source per interface
+  (42 for six sources on seven interfaces), so on a freshly booted Mac it can
+  need more devices than exist; the reboot also undoes the change. Use it to
+  try the daemon, and ChmodBPF to keep it.
+
+Either way the daemon then runs as you, with no `sudo`. If it still cannot
+capture, it says so on startup and names both routes.
+
+**Which interfaces it captures on.** With `capture.interfaces` empty and no
+`-i`, the daemon keeps an interface only when it is up with carrier, not
+loopback, has an Ethernet link layer (Wi-Fi counts) and holds an IPv4 address.
+A Mac lists dozens of interfaces, and most of them are not the LAN: `awdl0`
+and `llw0` (AirDrop and its low-latency link), `utun*` (VPNs, Tailscale, iCloud
+Private Relay), `anpi*`, `ap1`, and every unplugged Thunderbolt or Ethernet
+port. Each of those used to get a pcap handle per source, and on a `utun` the
+ARP filter does not compile, because a tunnel has no Ethernet header. The same
+rule applies on Linux, where it leaves out `lo`, `veth*`, a `docker0` with no
+containers and `tailscale0`.
+
+An addressed bridge with carrier is kept. On a Mac that runs OrbStack, Docker
+Desktop or another hypervisor, that is its host networks (`bridge100` and up),
+and the daemon will record the Mac's own address on each of them as a device;
+on Linux it is `cni0` or a `docker0` with containers. Nothing about the
+interface tells such a bridge apart from a router's LAN bridge. If you do not
+want them, name your LAN interface:
+
+```sh
+netgraspd run -i en1                # or en0; `route -n get default` says which
+```
+
+or set `capture.interfaces = ["en1"]`. An explicit list is used as given, and a
+name that does not exist is an error. Start with `--log info,netgraspd::capture=debug`
+to see why each interface was left out.
+
+**Resident memory.** `netgraspd stats` prints "resident memory unavailable on
+this platform" on macOS. The daemon reads its own resident size from
+`/proc/self/status`, which only Linux has, and the macOS equivalent is a libc
+call that the crate's `#![forbid(unsafe_code)]` rules out. Measure it from
+outside: `ps -o rss= -p $(pgrep netgraspd)`.
+
+**Not in a container.** No container runtime on macOS can capture the Mac's
+own network. Docker Desktop, OrbStack, Colima, Podman and Apple's `container`
+all run Linux in a virtual machine, so `--network=host` is the VM's network: the
+daemon would start, capture the VM's virtual segment, and look as if it worked.
+On a Mac, run the binary.
 
 ## Database
 
@@ -491,6 +556,13 @@ because each is a pcap handle with a kernel buffer. One interface with all six
 sources measured 15 MB; the same daemon on a Docker host with twenty-three
 interfaces measured 185 MB. On anything with more interfaces than you care
 about, list the ones you want with `capture.interfaces` or `-i`.
+
+That is Linux, where a capture handle's ring buffer is mapped into the process.
+On macOS the BPF buffer stays in the kernel, so resident size barely moves with
+the handle count: measured with `ps` on a Mac Studio, 115 handles (six sources
+on twenty-one interfaces, under the previous default selection) held 23.8 MB and 42 handles
+held 21.7 MB. `stats` cannot report it there; see
+[Capturing on macOS](#capturing-on-macos).
 
 ## Deploying
 
@@ -772,6 +844,16 @@ but the access point and room columns depends on it.
   from real traffic. Clean shutdown on SIGTERM was verified there too, which is
   what the systemd unit's `TimeoutStopSec` depends on. That was a container
   host's own segment over a few minutes.
+- All six sources on macOS, as an ordinary user, on 2026-11-14: a Mac Studio's
+  Wi-Fi interface `en1` on the same home LAN, for fifteen minutes, as `jandrews`
+  through group read and write on `/dev/bpf*`, with no `sudo`. The default
+  interface selection chose `en1` and six OrbStack host bridges (42 handles);
+  every source captured: per second, ARP 1.36, mDNS 8.33, DHCP 0.01, SSDP 0.13,
+  NDP 0.12 and NetBIOS 0.05. 52 devices, 24 of them named by mDNS, NetBIOS or
+  DHCP. Resident memory 21.2 to 21.7 MB by `ps`, flat after the first minute;
+  SIGTERM to exit in 0.13 seconds. Seven of the 52 were the Mac itself, once per
+  bridge, and the run reproduced issues #10, #11 and #12 on this network rather
+  than finding anything specific to macOS.
 
 **Exercised against a real database:** the schema, every migration, the rollup,
 the retention, the location history invariants, the people state machine and the
@@ -792,9 +874,8 @@ session mid-poll and an unreachable controller.
 - An unattended run on a real network: no week-long soak, no Raspberry Pi left
   running, no nightly maintenance fired on real data. The aarch64 image is built
   and runs; nothing has been left on a Pi.
-- The NDP and NetBIOS sources on a real network, and every source on macOS
-  except the four the 2026-09-17 run enabled. `/dev/bpf*` is root-only there, and
-  each protocol needs verifying separately.
+- The NDP and NetBIOS sources on any network but the one above, for longer than
+  fifteen minutes.
 - Months of real elapsed time. The rollup evidence is a synthetic six-month
   dataset compacted in one run, not six months of a daemon running.
 - The release artifacts themselves until the first tag: the binary downloaded
