@@ -19,6 +19,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use netgraspd::cli::DevicesArgs;
 use netgraspd::config::Config;
 use netgraspd::db::Db;
+use netgraspd::db::queries;
 use netgraspd::db::schema::{self, EXPECTED};
 
 /// The server's message for a database error.
@@ -925,4 +926,76 @@ async fn at_most_one_location_stay_is_open_per_device() {
         )
         .await
         .expect("a summary is not an open stay");
+}
+
+#[tokio::test]
+async fn ng_people_carries_epoch_twins_of_its_arrival_and_departure_times() {
+    let Some(db) = common::test_db().await else {
+        return;
+    };
+    // Every other daemon table gives the plugin a bigint beside each
+    // timestamptz, because the kernel's db host decodes a timestamptz as null.
+    // ng_people did not, so the plugin's ng_people_presence view recomputed
+    // them. These are the same generated twins, on the table itself.
+    let client = db.client().await;
+    let arrived = queries::ensure_person(&client, "Jeremy", true, true)
+        .await
+        .expect("a person");
+    let _never = queries::ensure_person(&client, "Jamie", false, false)
+        .await
+        .expect("a person who has never arrived");
+    queries::update_person(&client, &arrived, "home", None, Some(at(100)), Some(at(50)))
+        .await
+        .expect("the daemon records an arrival");
+
+    for (source, epoch) in [
+        ("last_arrived_at", "last_arrived_at_epoch"),
+        ("last_departed_at", "last_departed_at_epoch"),
+    ] {
+        assert_eq!(
+            db.scalar(&format!(
+                "SELECT COUNT(*) FROM ng_people
+                  WHERE {source} IS NOT NULL
+                    AND {epoch} IS DISTINCT FROM EXTRACT(EPOCH FROM {source})::bigint"
+            ))
+            .await,
+            0,
+            "ng_people.{epoch} disagrees with {source}"
+        );
+        assert_eq!(
+            db.scalar(&format!(
+                "SELECT COUNT(*) FROM ng_people WHERE ({source} IS NULL) <> ({epoch} IS NULL)"
+            ))
+            .await,
+            0,
+            "ng_people.{epoch} does not carry null through from {source}"
+        );
+    }
+    assert_eq!(
+        db.scalar(&format!(
+            "SELECT last_arrived_at_epoch FROM ng_people WHERE item_id = '{arrived}'::uuid"
+        ))
+        .await,
+        at(100).timestamp(),
+    );
+    assert_eq!(
+        db.scalar(&format!(
+            "SELECT last_departed_at_epoch FROM ng_people WHERE item_id = '{arrived}'::uuid"
+        ))
+        .await,
+        at(50).timestamp(),
+    );
+
+    let err = client
+        .execute(
+            "UPDATE ng_people SET last_arrived_at_epoch = 1 WHERE item_id = $1::text::uuid",
+            &[&arrived],
+        )
+        .await
+        .expect_err("a generated column must refuse a direct write");
+    let message = db_message(&err);
+    assert!(
+        message.contains("generated column") || message.contains("can only be updated"),
+        "{message}"
+    );
 }
