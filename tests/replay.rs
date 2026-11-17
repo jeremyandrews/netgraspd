@@ -22,10 +22,11 @@
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use jiff::SignedDuration;
 use netgraspd::analyze::Chain;
 use netgraspd::capture::fixtures::build::{dns_name, ethernet, ipv4, mdns_response, udp};
 use netgraspd::capture::{ObservationDedup, arp, mdns};
+use netgraspd::clock::Timestamp;
 use netgraspd::config::{HumanDuration, SecurityConfig, StateConfig};
 use netgraspd::device::{Effect, Manager};
 use netgraspd::types::Observation;
@@ -58,11 +59,9 @@ const NODES: [([u8; 6], Ipv4Addr, Ipv4Addr); 2] = [
 /// How long the replay runs.
 const HOURS: i64 = 6;
 
-fn at(second: i64) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 11, 17, 12, 0, 0)
-        .single()
-        .expect("valid time")
-        + Duration::seconds(second)
+fn at(second: i64) -> Timestamp {
+    Timestamp::from_utc(2026, 11, 17, 12, 0, 0).expect("valid time")
+        + SignedDuration::from_secs(second)
 }
 
 fn arp_frame(op: u16, src: [u8; 6], sender: Ipv4Addr, target: Ipv4Addr) -> Vec<u8> {

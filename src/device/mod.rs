@@ -285,7 +285,7 @@ struct Entry {
     last_ipv6: Option<String>,
     /// Every IPv4 address the device has used recently and when it last did;
     /// see [`ADDRESS_HOLD`]. `last_ip` is one of them.
-    held: Vec<(Ipv4Addr, DateTime<Utc>)>,
+    held: Vec<(Ipv4Addr, Timestamp)>,
     last_interface: Option<String>,
     /// Every stored signal, most recently confirmed first, which is the order
     /// the scorer breaks ties in.
@@ -422,15 +422,16 @@ impl Entry {
 
     /// True when the device used this IPv4 address within [`ADDRESS_HOLD`] of
     /// `now`.
-    fn held_at(&self, address: Ipv4Addr, now: DateTime<Utc>) -> bool {
-        let hold = chrono::Duration::from_std(ADDRESS_HOLD).unwrap_or(chrono::Duration::MAX);
+    fn held_at(&self, address: Ipv4Addr, now: Timestamp) -> bool {
+        let hold =
+            jiff::SignedDuration::try_from(ADDRESS_HOLD).unwrap_or(jiff::SignedDuration::MAX);
         self.held
             .iter()
-            .any(|(held, seen)| *held == address && now.signed_duration_since(*seen) <= hold)
+            .any(|(held, seen)| *held == address && now.since(*seen) <= hold)
     }
 
     /// Records that the device used this IPv4 address at `now`.
-    fn note_held(&mut self, address: Ipv4Addr, now: DateTime<Utc>) {
+    fn note_held(&mut self, address: Ipv4Addr, now: Timestamp) {
         if let Some((_, seen)) = self.held.iter_mut().find(|(held, _)| *held == address) {
             if now > *seen {
                 *seen = now;
@@ -677,7 +678,7 @@ pub struct Manager {
     host_aliases: HashSet<MacAddr>,
     /// When each MAC last sent mDNS proving it speaks for other hosts; see
     /// [`SPOKE_FOR_OTHERS_MEMORY`].
-    spoke_for_others: HashMap<MacAddr, DateTime<Utc>>,
+    spoke_for_others: HashMap<MacAddr, Timestamp>,
 }
 
 impl Manager {
@@ -779,13 +780,13 @@ impl Manager {
             .iter()
             .any(|claim| !claim.addresses.is_empty() && !claim.matches(&sender));
         out.spoke_for_others = proves_it;
-        let memory =
-            chrono::Duration::from_std(SPOKE_FOR_OTHERS_MEMORY).unwrap_or(chrono::Duration::MAX);
+        let memory = jiff::SignedDuration::try_from(SPOKE_FOR_OTHERS_MEMORY)
+            .unwrap_or(jiff::SignedDuration::MAX);
         let speaks_for_others = proves_it
             || self
                 .spoke_for_others
                 .get(&obs.mac)
-                .is_some_and(|last| obs.observed_at.signed_duration_since(*last) <= memory);
+                .is_some_and(|last| obs.observed_at.since(*last) <= memory);
 
         for claim in &obs.claims {
             if claim.signal.value.trim().is_empty() {
@@ -1764,11 +1765,11 @@ mod tests {
             .unwrap_or_default()
     }
 
-    fn arp_frame(frame: &[u8], when: DateTime<Utc>) -> Observation {
+    fn arp_frame(frame: &[u8], when: Timestamp) -> Observation {
         crate::capture::arp::parse_frame(frame, "eth0", when).expect("an ARP frame")
     }
 
-    fn mdns_frame(frame: &[u8], when: DateTime<Utc>) -> Observation {
+    fn mdns_frame(frame: &[u8], when: Timestamp) -> Observation {
         crate::capture::mdns::parse_frame(frame, "eth0", when).expect("an mDNS frame")
     }
 
