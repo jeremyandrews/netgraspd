@@ -511,7 +511,7 @@ pub async fn run(
             _ = learning_tick.tick(), if manager.is_learning() => {
                 if Instant::now() >= learning_deadline {
                     manager.end_learning();
-                    finish_learning(&db, &manager).await;
+                    finish_learning(&db, &manager, &config.notify).await;
                 } else if show_table {
                     print_learning_progress(&manager, learning_deadline);
                 }
@@ -1376,18 +1376,37 @@ fn print_learning_progress(manager: &Manager, deadline: Instant) {
 }
 
 /// Prints the learning-mode completion summary.
-async fn finish_learning(db: &Db, manager: &Manager) {
+async fn finish_learning(db: &Db, manager: &Manager, notify: &crate::config::NotifyConfig) {
     let (online, idle, offline) = manager.state_counts();
     println!(
         "\r\u{1b}[KLearning complete: {} devices on the baseline ({online} online, {idle} idle, {offline} offline).",
         manager.len()
     );
-    println!("New devices from now on will notify.");
+    println!("{}", after_learning_notice(notify));
     if let Ok(client) = db.client().await
         && let Ok(recorded) =
             queries::count_events_of_type(&client, crate::types::EventType::NewDevice).await
     {
         println!("{recorded} discovery events were recorded during the window (none notified).");
+    }
+}
+
+/// What the end of the learning window means for new devices, given the
+/// notification settings.
+///
+/// The window exists so that the baseline does not notify; saying that new
+/// devices "will notify" afterwards is only true when something would deliver
+/// a `new_device` notification. Each reason it would not is named, so that the
+/// line points at the setting to change.
+fn after_learning_notice(notify: &crate::config::NotifyConfig) -> &'static str {
+    if !notify.enabled {
+        "New devices from now on are recorded; notifications are off (notify.enabled = false)."
+    } else if notify.ntfy.is_none() {
+        "New devices from now on are recorded; no notifier is configured to deliver them."
+    } else if !notify.event_types.iter().any(|t| t == "new_device") {
+        "New devices from now on are recorded; new_device is not in notify.event_types."
+    } else {
+        "New devices from now on will notify."
     }
 }
 
@@ -1431,6 +1450,32 @@ mod tests {
         let opts = RunOptions::default();
         assert!(!opts.learn);
         assert!(!opts.no_table);
+    }
+
+    #[test]
+    fn the_learning_notice_says_notify_only_when_something_would() {
+        use crate::config::{NotifyConfig, NtfyConfig};
+        let mut notify = NotifyConfig {
+            ntfy: Some(NtfyConfig::default()),
+            ..NotifyConfig::default()
+        };
+        assert_eq!(
+            after_learning_notice(&notify),
+            "New devices from now on will notify."
+        );
+
+        notify.event_types = vec!["returned".into()];
+        assert!(after_learning_notice(&notify).contains("not in notify.event_types"));
+
+        notify.event_types = vec!["new_device".into()];
+        notify.ntfy = None;
+        assert!(after_learning_notice(&notify).contains("no notifier"));
+
+        // The foreign network profile: off, and nowhere to send them either.
+        notify.enabled = false;
+        let notice = after_learning_notice(&notify);
+        assert!(notice.contains("notifications are off"), "{notice}");
+        assert!(!notice.contains("will notify"), "{notice}");
     }
 
     #[test]

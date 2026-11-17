@@ -403,7 +403,7 @@ fn permission_error(interface: &str, err: &pcap::Error) -> anyhow::Error {
             "cannot capture on {interface}: {text}\n\n\
              Packet capture needs raw socket access. Either run netgraspd as root, or grant \
              the capability once:\n\n    \
-             sudo setcap cap_net_raw,cap_net_admin+ep $(which netgraspd)\n\n\
+             sudo setcap cap_net_raw+ep $(which netgraspd)\n\n\
              On macOS there is no setcap: run under sudo, or give a group access to \
              /dev/bpf*. Permanently, install Wireshark's ChmodBPF helper (brew install --cask \
              wireshark-chmodbpf) so that members of the access_bpf group can open it; until \
@@ -693,10 +693,10 @@ pub fn build_tapped_sources(
 
 /// A capture source that is not implemented yet.
 ///
-/// Every protocol in [`SOURCES`] is now real. This remains for the next one that
-/// is not: the `CaptureSource` trait leaves a slot for passive Bluetooth
-/// scanning, and when that arrives it can be nameable in config and present in
-/// the startup path before it can capture anything.
+/// Every protocol `capture.sources` can name is now real. This remains for the
+/// next one that is not: the `CaptureSource` trait leaves a slot for passive
+/// Bluetooth scanning, and when that arrives it can be nameable in config and
+/// present in the startup path before it can capture anything.
 pub struct StubSource {
     name: &'static str,
     milestone: &'static str,
@@ -766,9 +766,36 @@ mod tests {
             &pcap::Error::PcapError("Permission denied".to_string()),
         );
         let text = err.to_string();
-        assert!(text.contains("setcap cap_net_raw"), "{text}");
+        assert!(text.contains("setcap cap_net_raw+ep"), "{text}");
+        assert!(!text.contains("cap_net_admin"), "{text}");
         assert!(text.contains("ChmodBPF"), "{text}");
         assert!(text.contains("chgrp admin /dev/bpf*"), "{text}");
+    }
+
+    #[test]
+    fn the_systemd_unit_grants_cap_net_raw_and_nothing_else() {
+        // CAP_NET_RAW is enough because no capture handle is ever promiscuous:
+        // an AF_PACKET socket needs CAP_NET_RAW, and only changing an
+        // interface's flags would need CAP_NET_ADMIN. The Kubernetes pod runs
+        // with NET_RAW alone and captures, which is the same claim in the field.
+        let unit = include_str!("../../packaging/netgraspd.service");
+        let directive = |key: &str| {
+            unit.lines()
+                .find_map(|line| line.strip_prefix(key))
+                .unwrap_or_else(|| panic!("the unit has no {key} line"))
+                .trim()
+                .to_string()
+        };
+        assert_eq!(directive("AmbientCapabilities="), "CAP_NET_RAW");
+        assert_eq!(directive("CapabilityBoundingSet="), "CAP_NET_RAW");
+
+        // The needles are assembled so that this test's own text is not
+        // counted among the handles.
+        let source = include_str!("mod.rs");
+        let opens = source.matches(&[".promisc", "("].concat()).count();
+        let off = source.matches(&[".promisc", "(false)"].concat()).count();
+        assert!(opens > 0, "the capture handles set promiscuity explicitly");
+        assert_eq!(opens, off, "every capture handle is non-promiscuous");
     }
 
     #[test]

@@ -76,6 +76,21 @@ createuser netgrasp --pwprompt
 createdb netgrasp --owner netgrasp
 ```
 
+`createuser` and `createdb` connect to a server on the local socket. When
+Postgres runs in a container or on another host, run the same two steps as SQL
+over a superuser connection instead:
+
+```sh
+psql "postgresql://postgres:…@127.0.0.1:5432/postgres" \
+    -c "create role netgrasp login password '…'"
+psql "postgresql://postgres:…@127.0.0.1:5432/postgres" \
+    -c "create database netgrasp owner netgrasp"
+```
+
+and point `database.url` at it:
+`postgres://netgrasp:…@127.0.0.1:5432/netgrasp`. The same holds wherever
+`createuser` or `createdb` appears below.
+
 ### The image
 
 ```sh
@@ -124,7 +139,23 @@ sudo systemctl daemon-reload && sudo systemctl enable --now netgraspd
 
 The binary is built on Debian 13 (trixie) and is dynamically linked against its
 glibc and libpcap, so it wants a comparably recent distribution. On an older
-one, run the image instead. The unit grants the capture capability itself, so
+one, run the image instead.
+
+It links libpcap by Debian's soname, `libpcap.so.0.8`, which is what the
+`libpcap0.8` package installs. Other distributions ship the same libpcap 1.x
+as `libpcap.so.1`, and the binary will not start there (`error while loading
+shared libraries: libpcap.so.0.8`). Debian's `libpcap0.8` is itself libpcap
+1.10 under the old name, and every `pcap_*` symbol the binary uses is
+unversioned and present in libpcap 1.x, so a link to the installed library is
+enough. On Fedora and other RPM distributions:
+
+```sh
+sudo dnf install libpcap
+sudo ln -s libpcap.so.1 /usr/lib64/libpcap.so.0.8 && sudo ldconfig
+```
+
+(the library directory is `/usr/lib` on some distributions; `ldconfig -p |
+grep libpcap` says where it is). Or run the image, which carries its own. The unit grants the capture capability itself, so
 the binary needs no `setcap`; see [Deploying](#deploying).
 
 If you run the Trovato plugin as well, read [Compatibility](#compatibility)
@@ -169,7 +200,7 @@ $EDITOR netgrasp.toml          # at minimum, database.url
 
 # 3. Build, and grant the one capability capture needs.
 cargo build --release
-sudo setcap cap_net_raw,cap_net_admin+ep target/release/netgraspd
+sudo setcap cap_net_raw+ep target/release/netgraspd
 
 # 4. Watch. The first run on an empty database spends five minutes learning.
 ./target/release/netgraspd run
@@ -201,7 +232,7 @@ tells you which of the following you need.
 root:
 
 ```sh
-sudo setcap cap_net_raw,cap_net_admin+ep /usr/local/bin/netgraspd
+sudo setcap cap_net_raw+ep /usr/local/bin/netgraspd
 ```
 
 This has to be reapplied after every upgrade. Under systemd, don't: the shipped
@@ -731,16 +762,25 @@ as root, and survives an upgrade in a way that `setcap` on the binary does not.
 docker build -t netgraspd .
 
 # Capture: host networking to see the LAN, one capability, nothing else.
+# database.url comes from the mounted file.
 docker run -d --name netgraspd \
     --network=host --cap-drop=ALL --cap-add=NET_RAW --user root \
-    -e NETGRASP_DATABASE__URL=postgres://netgrasp:netgrasp@localhost:5432/netgrasp \
     -v /etc/netgrasp.toml:/etc/netgrasp.toml:ro \
     -v netgraspd-state:/var/lib/netgraspd \
     netgraspd run --config /etc/netgrasp.toml --no-table
 
-# Everything else needs neither, and runs as the image's unprivileged user.
-docker run --rm netgraspd stats
+# Everything else needs no capability, and runs as the image's unprivileged
+# user. It still needs the same configuration, the same network to reach a
+# database on the host's loopback, and the state volume the status file is in.
+docker run --rm --network=host \
+    -v /etc/netgrasp.toml:/etc/netgrasp.toml:ro \
+    -v netgraspd-state:/var/lib/netgraspd \
+    netgraspd --config /etc/netgrasp.toml stats
 ```
+
+An environment variable overrides the file: `-e
+NETGRASP_DATABASE__URL=…` would replace the mounted `database.url`, credentials
+and all. Use one or the other, not both.
 
 Build the Raspberry Pi image with `--platform linux/arm64`.
 

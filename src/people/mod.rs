@@ -573,7 +573,7 @@ impl Registry {
 
     /// A device moved to a different access point.
     ///
-    /// `movement` is what [`LocationMap::movement`] made of the crossing. It is
+    /// `movement` is what [`crate::location::LocationMap::movement`] made of the crossing. It is
     /// passed in rather than recomputed so that the device event and the person
     /// event can never disagree about what happened.
     #[must_use]

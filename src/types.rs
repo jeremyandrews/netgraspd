@@ -162,7 +162,7 @@ impl ObservationKind {
 /// recognise as the device's name and compete for the display identity at their
 /// weight. **Classifying** kinds carry evidence about what the device *is*
 /// rather than what it is called; they weigh zero, never compete for the display
-/// name, and exist because [`crate::identity::classify`] needs them.
+/// name, and exist because [`crate::identity::classify()`] needs them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SignalKind {
