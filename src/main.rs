@@ -56,13 +56,20 @@ async fn main() -> Result<()> {
 ///
 /// `RUST_LOG` wins over `--log` when it is set, which is the convention every
 /// Rust operator already expects. Logs go to stderr so that the live table on
-/// stdout stays readable.
+/// stdout stays readable, and they are coloured only when stderr is a terminal
+/// and `NO_COLOR` is not set.
 fn init_tracing(default_filter: &str) {
+    use std::io::IsTerminal;
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
+    let colour = cli::log_colour(
+        std::io::stderr().is_terminal(),
+        std::env::var_os("NO_COLOR").as_deref(),
+    );
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_ansi(colour)
         .with_writer(std::io::stderr)
         .init();
 }
