@@ -496,6 +496,7 @@ async fn an_empty_database_passes_the_plugin_first_check() {
     db.execute(
         "DROP TABLE IF EXISTS ng_people, ng_location_history, ng_ip_history, ng_events,
                               ng_presence, ng_device_signals, ng_devices,
+                              ng_notify_status, ng_notify_requests,
                               refinery_schema_history CASCADE",
     )
     .await;
@@ -548,7 +549,10 @@ async fn a_read_command_against_an_under_migrated_database_names_the_version() {
         let err = result.expect_err("an under-migrated database must be refused");
         let text = format!("{err:#}");
         assert!(text.contains("migrated to V2"), "{name}: {text}");
-        assert!(text.contains("through V3"), "{name}: {text}");
+        // Whatever this build ships, named as such. It was V3 when this test
+        // was written; V4 added the notify tables.
+        let shipped = format!("through V{}", netgraspd::db::embedded_max_version());
+        assert!(text.contains(&shipped), "{name}: {text}");
         assert!(
             !text.contains("does not exist"),
             "{name} still leaked the raw catalog error: {text}"
@@ -603,6 +607,7 @@ async fn migrate_builds_the_schema_on_an_empty_database_and_maintain_does_not() 
     db.execute(
         "DROP TABLE IF EXISTS ng_people, ng_location_history, ng_ip_history, ng_events,
                               ng_presence, ng_device_signals, ng_devices,
+                              ng_notify_status, ng_notify_requests,
                               refinery_schema_history CASCADE",
     )
     .await;
@@ -644,6 +649,7 @@ async fn a_read_command_against_an_empty_database_names_the_command_that_fixes_i
     db.execute(
         "DROP TABLE IF EXISTS ng_people, ng_location_history, ng_ip_history, ng_events,
                               ng_presence, ng_device_signals, ng_devices,
+                              ng_notify_status, ng_notify_requests,
                               refinery_schema_history CASCADE",
     )
     .await;

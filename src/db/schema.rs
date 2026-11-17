@@ -193,6 +193,32 @@ pub const EXPECTED: &[(&str, &[ExpectedColumn])] = &[
             null("last_departed_at", TS),
         ],
     ),
+    (
+        "ng_notify_status",
+        &[
+            not_null("id", "bigint"),
+            not_null("notify_configured", "boolean"),
+            null("notify_backend", "text"),
+            null("last_delivery_ok", "boolean"),
+            null("last_delivery_at", TS),
+            not_null("updated_at", TS),
+            null("last_delivery_at_epoch", "bigint"),
+            null("updated_at_epoch", "bigint"),
+        ],
+    ),
+    (
+        "ng_notify_requests",
+        &[
+            not_null("id", "bigint"),
+            not_null("kind", "text"),
+            null("requested_by", "text"),
+            not_null("requested_at", TS),
+            null("handled_at", TS),
+            null("outcome", "text"),
+            null("requested_at_epoch", "bigint"),
+            null("handled_at_epoch", "bigint"),
+        ],
+    ),
 ];
 
 /// The name refinery records applied migrations under.
@@ -633,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn the_seven_tables_the_plugin_reads_are_all_covered() {
+    fn the_nine_tables_the_plugin_reads_are_all_covered() {
         let names: Vec<&str> = EXPECTED.iter().map(|(t, _)| *t).collect();
         for required in [
             "ng_devices",
@@ -643,10 +669,12 @@ mod tests {
             "ng_ip_history",
             "ng_location_history",
             "ng_people",
+            "ng_notify_status",
+            "ng_notify_requests",
         ] {
             assert!(names.contains(&required), "{required} is not in EXPECTED");
         }
-        assert_eq!(names.len(), 7, "an unexpected table joined the contract");
+        assert_eq!(names.len(), 9, "an unexpected table joined the contract");
     }
 
     #[test]

@@ -22,7 +22,13 @@ shipped rather than a release that was tagged at the time.
 
 ## [Unreleased]
 
+### Changed
+
+- **Arrival and departure alerts are one sentence on the local clock**: "Jamie is home: Jamie's iPhone joined at 18:42" and "Jamie left: last seen 07:55", where they were "Jamie arrived" and "Jamie left" with a UTC time in the body. Person events now carry `device_name` and `last_seen_at` in `details`.
+
 ### Added
+
+- **Delivery status and a test alert the web side can ask for**, schema V4 (additive). `ng_notify_status` is one daemon-owned row: whether delivery is configured, by which transport, and whether the last attempt was accepted and when. The plugin inserts into `ng_notify_requests` to ask for a test; the daemon answers on its reconcile tick with one test alert for however many requests are waiting, and marks each `sent`, `failed` or `not_configured`. Neither table holds the topic, the server or the token, and an outcome is never the transport's error text, because that names the URL.
 
 - **A profile for a network you do not own**, `netgrasp.foreign.toml.example`. It is an ordinary configuration file, not a mode. Notifications, enrichment and reverse DNS are off; all six sources are on; events and rollup are kept for one day; the unknown-device sample is on. It names its own database, and its status file and sample are relative paths an ordinary user can write. The image ships it beside the home example ([#18](https://github.com/jeremyandrews/netgraspd/pull/18)).
 - **The visibility report**, in the status file and in `netgraspd stats`. For each interface and each source it gives frames delivered, distinct source MACs (at most 4096 kept per set, then reported as "at least"), and how long the interface has been listening. It also gives the gateway the daemon believes in and where that belief came from. Each interface then gets one plain verdict, so an isolated guest network ("capture is working: 1 sender seen (the gateway), consistent with client isolation") no longer looks like broken capture ("nothing received on en0 in 10m: capture may be broken"). The new status fields are defaulted on read, so an older status file still parses ([#18](https://github.com/jeremyandrews/netgraspd/pull/18)).
@@ -31,6 +37,7 @@ shipped rather than a release that was tagged at the time.
 
 ### Fixed
 
+- **An arrival alert is no longer swallowed by its own device's alert.** A phone coming home is `returned` and then `person_arrived` for the same MAC in the same instant, and the per-device debounce was keyed by MAC alone, so with the default `event_types` the arrival was always counted as debounced and nobody was told. Found on the demo stack with the daemon pointed at a request logger: "Back online: Jamie's iPhone" arrived, "Jamie is home" did not. Person events now have a debounce of their own per device.
 - **Log lines carry colour only on a terminal.** The tracing subscriber kept its default of ANSI on whatever stderr was, so under systemd and `docker logs`, where it is a pipe, every line reached the journal with escape bytes in it. Colour is now on only when stderr is a terminal and `NO_COLOR` is unset or empty ([#13](https://github.com/jeremyandrews/netgraspd/issues/13)).
 - **The systemd unit grants `CAP_NET_RAW` alone**, as its comment and the README always said. It also granted `CAP_NET_ADMIN`, which nothing uses: every capture handle is non-promiscuous, so the daemon never changes an interface's flags, and the Kubernetes pod captures with `NET_RAW` only. The `setcap` lines in the README and in the permission message drop it too ([#9](https://github.com/jeremyandrews/netgraspd/issues/9)).
 - **"New devices from now on will notify" is printed only when something would.** The end of the learning window printed it unconditionally, including under the foreign network profile with `notify.enabled = false`. It now names the reason a new device would not notify: notifications off, no notifier, or `new_device` not in `notify.event_types`.

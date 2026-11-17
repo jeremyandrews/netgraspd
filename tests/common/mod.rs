@@ -97,7 +97,8 @@ pub async fn test_db() -> Option<TestDb> {
         client
             .batch_execute(
                 "TRUNCATE ng_events, ng_ip_history, ng_presence, ng_location_history,
-                          ng_people, ng_device_signals, ng_devices
+                          ng_people, ng_device_signals, ng_devices,
+                          ng_notify_status, ng_notify_requests
                  RESTART IDENTITY CASCADE",
             )
             .await
@@ -149,6 +150,7 @@ pub async fn rebuild_schema(db: &TestDb) {
     db.execute(
         "DROP TABLE IF EXISTS ng_people, ng_location_history, ng_ip_history, ng_events,
                               ng_presence, ng_device_signals, ng_devices,
+                              ng_notify_status, ng_notify_requests,
                               refinery_schema_history CASCADE",
     )
     .await;

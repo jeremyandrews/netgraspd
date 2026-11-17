@@ -1252,9 +1252,19 @@ fn spawn_notifier(
     let mut rx = bus.subscribe();
     let db = db.clone();
     let mut shutdown_rx = shutdown;
+    let enabled = config.notify.enabled;
+    let reconcile_interval = config.state.reconcile_interval.get();
 
     tokio::spawn(async move {
         let mut tick = ticker(DISPATCH_TICK);
+        // Test alerts the web side asked for are answered on the reconcile
+        // cadence, the same one that picks up every other change made there.
+        let mut requests = ticker(reconcile_interval);
+        if let Err(err) =
+            crate::notify::publish_status(&db, &notifiers, enabled, Timestamp::now()).await
+        {
+            tracing::warn!(%err, "could not publish the notify status");
+        }
         loop {
             let deliveries = tokio::select! {
                 biased;
@@ -1280,6 +1290,14 @@ fn spawn_notifier(
                     }
                 },
                 _ = tick.tick() => dispatcher.tick(Timestamp::now()),
+                _ = requests.tick() => {
+                    if let Err(err) = crate::notify::handle_test_requests(
+                        &db, &notifiers, enabled, Timestamp::now(),
+                    ).await {
+                        tracing::warn!(%err, "could not answer test alert requests");
+                    }
+                    Vec::new()
+                }
             };
             send_all(&notifiers, &db, &deliveries).await;
         }
@@ -1297,6 +1315,11 @@ async fn send_all(
         let mut delivered = false;
         for notifier in notifiers {
             delivered |= deliver(notifier.as_ref(), delivery).await;
+        }
+        if !notifiers.is_empty()
+            && let Err(err) = crate::notify::record_delivery(db, delivered, Timestamp::now()).await
+        {
+            tracing::warn!(%err, "could not record the delivery outcome");
         }
         if !delivered {
             continue;

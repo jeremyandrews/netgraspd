@@ -377,6 +377,7 @@ Who owns which column:
 |---|---|---|
 | `ng_devices` | identity, state, addresses, location | `display_name`, `notes`, `hidden`, `notify`, `owner_item_id`, `trovato_item_id` |
 | `ng_people` | `state`, `current_location`, `last_arrived_at`, `last_departed_at` | `item_id`, `name`, `notes`, `notify_arrive`, `notify_depart` |
+| `ng_notify_requests` | `handled_at`, `outcome` | inserts the row (`requested_by`, `requested_at`) |
 | everything else | all of it | nothing |
 
 Ownership runs in both directions, on two different clocks. The daemon writes
@@ -949,6 +950,29 @@ Two categories skip the `notify.event_types` allowlist because they are governed
 elsewhere: security events by `[security.notifications]`, and person events by
 `notify_arrive` and `notify_depart` on the person row. Requiring them in two
 places would make a silent misconfiguration look like a working setup.
+
+Arriving and leaving are one sentence each, with the time on the local clock:
+
+- `Jamie is home: Jamie's iPhone joined at 18:42`
+- `Jamie left: last seen 07:55`
+
+They use the person's name and the device's, never a pronoun. A departure gives
+the time the device was last heard from, not the time the offline timeout
+declared it gone.
+
+**What the web side can see.** The plugin cannot read this file and has no
+outbound HTTP, so two tables carry what it needs, and neither ever holds the
+topic, the server or the token:
+
+- `ng_notify_status`, one row: `notify_configured` (a notifier is built and
+  `notify.enabled` is on), `notify_backend` (`ntfy`), and `last_delivery_ok` and
+  `last_delivery_at` for the most recent attempt, an alert or a test.
+- `ng_notify_requests`: the plugin inserts a row to ask for a test alert. Every
+  `state.reconcile_interval` the daemon sends one test for however many rows are
+  waiting ("Netgrasp test alert": "Alerts from netgraspd reach this device. Sent
+  at 18:43.") and marks each one handled with an `outcome` of `sent`, `failed`
+  or `not_configured`. The outcome is a word and never the transport's error,
+  because that error names the URL and the URL contains the topic.
 
 ## Security analyzers
 

@@ -80,7 +80,7 @@ jobs:
         run: |
           cargo test --test pipeline --test security --test schema \
                      --test location --test maintenance --test unifi \
-                     --test export \
+                     --test export --test notify \
                      -- --nocapture 2>&1 | tee integration.log
           if grep -q "skipping:" integration.log; then
             echo "::error::an integration test skipped itself; the database was not reachable"

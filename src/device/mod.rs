@@ -1305,6 +1305,14 @@ impl Manager {
     #[must_use]
     pub fn person_event(&self, event: &crate::people::PersonEvent) -> Vec<Effect> {
         let entry = self.devices.get(&event.mac);
+        // The alert names the device as well as the person ("Jamie is home:
+        // Jamie's iPhone joined at 18:42") and a departure says when the device
+        // was last heard from, which is earlier than when it was declared gone.
+        let mut details = event.details.clone();
+        if let (Some(entry), Some(object)) = (entry, details.as_object_mut()) {
+            object.insert("device_name".into(), json!(entry.snapshot().display()));
+            object.insert("last_seen_at".into(), json!(entry.last_seen_at));
+        }
         vec![Effect::Event(Box::new(DeviceEvent {
             event_type: event.event_type,
             mac: event.mac,
@@ -1319,7 +1327,7 @@ impl Manager {
             during_learning: false,
             notify: event.notify,
             priority: EventPriority::Normal,
-            details: event.details.clone(),
+            details,
         }))]
     }
 
@@ -2500,5 +2508,50 @@ mod tests {
         let vm = m.observe(&on(VM, "192.168.138.2", "bridge100", "arp", at(200)));
         assert_eq!(events(&vm), vec![EventType::NewDevice]);
         assert_eq!(m.len(), 2);
+    }
+    #[test]
+    fn a_person_event_names_the_device_and_when_it_was_last_seen() {
+        // The alert reads "Jamie is home: Jamie's iPhone joined at 18:42", so the
+        // event has to carry the device's name as well as the person's.
+        let mut m = Manager::new(config(), false);
+        let _ = m.observe(&claiming(
+            "3c:22:fb:00:00:01",
+            Some("192.168.1.40"),
+            base(),
+            vec![named("Jamie's iPhone", "192.168.1.40")],
+        ));
+        let effects = m.person_event(&crate::people::PersonEvent {
+            event_type: EventType::PersonArrived,
+            item_id: "person-1".into(),
+            name: "Jamie".into(),
+            mac: mac("3c:22:fb:00:00:01"),
+            at: at(5),
+            notify: true,
+            details: json!({ "person": "Jamie", "device": "3c:22:fb:00:00:01" }),
+        });
+        let e = event(&effects, EventType::PersonArrived);
+        assert_eq!(e.display_name, "Jamie", "the person, not the device");
+        assert_eq!(e.details["person"], "Jamie", "existing details survive");
+        assert_eq!(e.details["device_name"], "Jamie's iPhone");
+        assert_eq!(
+            e.details["last_seen_at"],
+            serde_json::to_value(base()).expect("serialises")
+        );
+    }
+
+    #[test]
+    fn a_person_event_for_a_device_never_seen_has_no_device_name_to_give() {
+        let m = Manager::new(config(), false);
+        let effects = m.person_event(&crate::people::PersonEvent {
+            event_type: EventType::PersonDeparted,
+            item_id: "person-1".into(),
+            name: "Jamie".into(),
+            mac: mac("3c:22:fb:00:00:09"),
+            at: at(5),
+            notify: true,
+            details: json!({ "person": "Jamie" }),
+        });
+        let e = event(&effects, EventType::PersonDeparted);
+        assert!(e.details.get("device_name").is_none(), "{}", e.details);
     }
 }

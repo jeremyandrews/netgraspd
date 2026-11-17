@@ -25,6 +25,9 @@
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use jiff::tz::TimeZone;
+
+use crate::clock::Timestamp;
 
 use crate::config::NtfyConfig;
 use crate::device::DeviceEvent;
@@ -38,16 +41,29 @@ pub struct NtfyNotifier {
     token: Option<String>,
     priority: u8,
     urgent_priority: u8,
+    /// Where "18:42" is measured. A person reads the time on their own clock.
+    time_zone: TimeZone,
 }
 
 impl NtfyNotifier {
-    /// Builds a notifier from configuration.
+    /// Builds a notifier from configuration, telling times in the machine's
+    /// own time zone.
     ///
     /// # Errors
     ///
     /// Returns an error when the topic is empty or the HTTP client cannot be
     /// built.
     pub fn new(cfg: &NtfyConfig) -> Result<Self> {
+        NtfyNotifier::with_time_zone(cfg, TimeZone::system())
+    }
+
+    /// Builds a notifier that tells times in `time_zone`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the topic is empty or the HTTP client cannot be
+    /// built.
+    pub fn with_time_zone(cfg: &NtfyConfig, time_zone: TimeZone) -> Result<Self> {
         let topic = cfg.topic.trim();
         if topic.is_empty() {
             bail!("notify.ntfy.topic is empty, so there is nowhere to publish");
@@ -63,6 +79,7 @@ impl NtfyNotifier {
             token: cfg.token.clone(),
             priority: cfg.priority,
             urgent_priority: cfg.urgent_priority,
+            time_zone,
         })
     }
 
@@ -118,8 +135,8 @@ impl Notifier for NtfyNotifier {
 
     async fn send(&self, event: &DeviceEvent) -> Result<()> {
         self.post(
-            &title_for(event),
-            &body_for(event),
+            &title_in(event, &self.time_zone),
+            &body_in(event, &self.time_zone),
             tags_for(event.event_type),
             self.header_priority(event.priority),
         )
@@ -152,6 +169,36 @@ impl Notifier for NtfyNotifier {
     fn supports_priority(&self) -> bool {
         true
     }
+
+    async fn send_test(&self, at: Timestamp) -> Result<()> {
+        self.post(
+            TEST_TITLE,
+            &test_body(at, &self.time_zone),
+            "test_tube",
+            self.priority,
+        )
+        .await
+    }
+}
+
+/// Title of the test alert.
+pub const TEST_TITLE: &str = "Netgrasp test alert";
+
+/// Body of the test alert: what it proves, and when it was sent.
+#[must_use]
+pub fn test_body(at: Timestamp, time_zone: &TimeZone) -> String {
+    format!(
+        "Alerts from netgraspd reach this device. Sent at {}.",
+        clock_time(at, time_zone)
+    )
+}
+
+/// "18:42": the hour and minute, on the reader's clock.
+fn clock_time(at: Timestamp, time_zone: &TimeZone) -> String {
+    at.as_jiff()
+        .to_zoned(time_zone.clone())
+        .strftime("%H:%M")
+        .to_string()
 }
 
 /// The longest an RFC 2047 encoded word may be, including its delimiters.
@@ -253,6 +300,18 @@ fn base64(input: &[u8]) -> String {
 /// the part that decides whether somebody gets out of bed.
 #[must_use]
 pub fn title_for(event: &DeviceEvent) -> String {
+    title_in(event, &TimeZone::UTC)
+}
+
+/// Notification title for one event, with any time of day told in
+/// `time_zone`.
+///
+/// A person event is one sentence: "Jamie is home: Jamie's iPhone joined at
+/// 18:42", or "Jamie left: last seen 07:55". It uses the person's name and the
+/// device's, never a pronoun, because netgrasp stores no pronouns and must not
+/// guess them.
+#[must_use]
+pub fn title_in(event: &DeviceEvent, time_zone: &TimeZone) -> String {
     match event.event_type {
         EventType::NewDevice => format!("New device: {}", event.display_name),
         EventType::Returned => format!("Back online: {}", event.display_name),
@@ -267,10 +326,24 @@ pub fn title_for(event: &DeviceEvent) -> String {
         EventType::IdentityChange => format!("Device changed identity: {}", event.display_name),
         EventType::DeviceLocationChanged => format!("Moved: {}", event.display_name),
         // A person event leads with the name rather than a label, because
-        // "Jeremy arrived" is the entire message and prefixing it would only
-        // push the name out of the three words a lock screen shows.
-        EventType::PersonArrived => format!("{} arrived", event.display_name),
-        EventType::PersonDeparted => format!("{} left", event.display_name),
+        // "Jamie is home" is what matters and prefixing it would only push the
+        // name out of the three words a lock screen shows.
+        EventType::PersonArrived => format!(
+            "{} is home: {} joined at {}",
+            event.display_name,
+            detail(event, "device_name").unwrap_or_else(|| event.mac.to_string()),
+            clock_time(event.at, time_zone)
+        ),
+        EventType::PersonDeparted => {
+            let last_seen = detail(event, "last_seen_at")
+                .and_then(|text| text.parse::<Timestamp>().ok())
+                .unwrap_or(event.at);
+            format!(
+                "{} left: last seen {}",
+                event.display_name,
+                clock_time(last_seen, time_zone)
+            )
+        }
         EventType::PersonLocationChanged => format!("{} moved", event.display_name),
     }
 }
@@ -282,8 +355,14 @@ pub fn title_for(event: &DeviceEvent) -> String {
 /// address, MAC, and when it turned up.
 #[must_use]
 pub fn body_for(event: &DeviceEvent) -> String {
+    body_in(event, &TimeZone::UTC)
+}
+
+/// Notification body for one event, with person events told in `time_zone`.
+#[must_use]
+pub fn body_in(event: &DeviceEvent, time_zone: &TimeZone) -> String {
     if event.event_type.is_person() {
-        return person_body(event);
+        return person_body(event, time_zone);
     }
     let mut lines = vec![event.display_name.clone()];
     if let Some(vendor) = &event.vendor {
@@ -311,17 +390,20 @@ pub fn body_for(event: &DeviceEvent) -> String {
 /// Body for an event about a person rather than a device.
 ///
 /// Reads the place and the way in from `details` rather than listing the MAC and
-/// the vendor. "Jeremy arrived, through the Driveway" is what somebody wants on a
-/// lock screen; the hardware address of the phone that proved it is not.
-fn person_body(event: &DeviceEvent) -> String {
-    let text = |key: &str| {
-        event
-            .details
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-    };
+/// the vendor. "Jamie is home: Jamie's iPhone joined at 18:42" and the room is
+/// what somebody wants on a lock screen; the hardware address is not.
+fn person_body(event: &DeviceEvent, time_zone: &TimeZone) -> String {
+    let text = |key: &str| detail(event, key);
     let mut lines = Vec::new();
+    // Arriving and leaving are one sentence, and the sentence is the message:
+    // a client that shows only the body still says who and when.
+    let sentence = matches!(
+        event.event_type,
+        EventType::PersonArrived | EventType::PersonDeparted
+    );
+    if sentence {
+        lines.push(title_in(event, time_zone));
+    }
     match (text("location"), text("via")) {
         (Some(location), Some(via)) => lines.push(format!("In the {location}, via the {via}")),
         (Some(location), None) => lines.push(format!("In the {location}")),
@@ -333,11 +415,22 @@ fn person_body(event: &DeviceEvent) -> String {
     {
         lines.push(format!("Was in the {previous}"));
     }
-    lines.push(format!(
-        "At: {}",
-        event.at.strftime("%Y-%m-%d %H:%M:%S UTC")
-    ));
+    if !sentence {
+        lines.push(format!(
+            "At: {}",
+            event.at.strftime("%Y-%m-%d %H:%M:%S UTC")
+        ));
+    }
     lines.join("\n")
+}
+
+/// One text value from an event's `details`.
+fn detail(event: &DeviceEvent, key: &str) -> Option<String> {
+    event
+        .details
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 /// Body for a collapsed summary.
@@ -456,6 +549,87 @@ mod tests {
         assert!(!body.contains("Vendor:"), "{body}");
         assert!(!body.contains("IP:"), "{body}");
         assert!(body.contains("MAC: 3c:22:fb:9a:1b:2c"), "{body}");
+    }
+
+    fn rome() -> jiff::tz::TimeZone {
+        jiff::tz::TimeZone::fixed(jiff::tz::Offset::from_seconds(3600).expect("offset"))
+    }
+
+    fn jamie(kind: EventType, details: serde_json::Value) -> DeviceEvent {
+        DeviceEvent {
+            display_name: "Jamie".into(),
+            // 17:42 UTC is 18:42 in Rome in November.
+            at: Timestamp::from_utc(2026, 11, 17, 17, 42, 0).expect("valid time"),
+            details,
+            ..event(kind)
+        }
+    }
+
+    #[test]
+    fn an_arrival_names_the_person_and_the_device_at_local_time() {
+        let e = jamie(
+            EventType::PersonArrived,
+            serde_json::json!({ "person": "Jamie", "device_name": "Jamie's iPhone" }),
+        );
+        assert_eq!(
+            title_in(&e, &rome()),
+            "Jamie is home: Jamie's iPhone joined at 18:42"
+        );
+        assert_eq!(
+            body_in(&e, &rome()),
+            "Jamie is home: Jamie's iPhone joined at 18:42"
+        );
+    }
+
+    #[test]
+    fn an_arrival_with_a_place_says_where_after_the_sentence() {
+        let e = jamie(
+            EventType::PersonArrived,
+            serde_json::json!({
+                "device_name": "Jamie's iPhone",
+                "location": "Kitchen",
+                "via": "Driveway",
+            }),
+        );
+        assert_eq!(
+            body_in(&e, &rome()),
+            "Jamie is home: Jamie's iPhone joined at 18:42\nIn the Kitchen, via the Driveway"
+        );
+    }
+
+    #[test]
+    fn an_arrival_recorded_before_device_names_falls_back_to_the_mac() {
+        let e = jamie(EventType::PersonArrived, serde_json::json!({}));
+        assert_eq!(
+            title_in(&e, &rome()),
+            "Jamie is home: 3c:22:fb:9a:1b:2c joined at 18:42"
+        );
+    }
+
+    #[test]
+    fn a_departure_gives_the_last_time_the_device_was_seen() {
+        let e = jamie(
+            EventType::PersonDeparted,
+            serde_json::json!({ "last_seen_at": "2026-11-17T06:55:00Z" }),
+        );
+        assert_eq!(title_in(&e, &rome()), "Jamie left: last seen 07:55");
+        assert_eq!(body_in(&e, &rome()), "Jamie left: last seen 07:55");
+    }
+
+    #[test]
+    fn a_departure_without_a_last_seen_time_uses_the_event_time() {
+        let e = jamie(EventType::PersonDeparted, serde_json::Value::Null);
+        assert_eq!(title_in(&e, &rome()), "Jamie left: last seen 18:42");
+    }
+
+    #[test]
+    fn the_test_alert_says_what_it_is_and_when() {
+        let at = Timestamp::from_utc(2026, 11, 17, 17, 43, 0).expect("valid time");
+        assert_eq!(TEST_TITLE, "Netgrasp test alert");
+        assert_eq!(
+            test_body(at, &rome()),
+            "Alerts from netgraspd reach this device. Sent at 18:43."
+        );
     }
 
     #[test]

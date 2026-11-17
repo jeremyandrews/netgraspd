@@ -1127,6 +1127,98 @@ pub async fn event_span(client: &Client) -> Result<(Option<Timestamp>, Option<Ti
     Ok((row.try_get(0)?, row.try_get(1)?))
 }
 
+/// Publishes whether delivery is configured, and by which transport.
+///
+/// Leaves `last_delivery_ok` and `last_delivery_at` as they were: a restart
+/// does not make the last delivery any less true.
+///
+/// # Errors
+///
+/// Returns an error when the write fails.
+pub async fn publish_notify_status(
+    client: &Client,
+    configured: bool,
+    backend: Option<&str>,
+    now: Timestamp,
+) -> Result<()> {
+    client
+        .execute(
+            "INSERT INTO ng_notify_status (id, notify_configured, notify_backend, updated_at)
+             VALUES (1, $1, $2, $3)
+             ON CONFLICT (id) DO UPDATE
+                SET notify_configured = EXCLUDED.notify_configured,
+                    notify_backend = EXCLUDED.notify_backend,
+                    updated_at = EXCLUDED.updated_at",
+            &[&configured, &backend, &now],
+        )
+        .await
+        .context("publishing the notify status failed")?;
+    Ok(())
+}
+
+/// Records the outcome of a delivery attempt, an alert or a test.
+///
+/// Creates the status row if the notifier task has not published one yet, with
+/// `notify_configured` true, because something was just delivered.
+///
+/// # Errors
+///
+/// Returns an error when the write fails.
+pub async fn record_notify_delivery(client: &Client, ok: bool, at: Timestamp) -> Result<()> {
+    client
+        .execute(
+            "INSERT INTO ng_notify_status
+                    (id, notify_configured, last_delivery_ok, last_delivery_at, updated_at)
+             VALUES (1, TRUE, $1, $2, $2)
+             ON CONFLICT (id) DO UPDATE
+                SET last_delivery_ok = EXCLUDED.last_delivery_ok,
+                    last_delivery_at = EXCLUDED.last_delivery_at,
+                    updated_at = EXCLUDED.updated_at",
+            &[&ok, &at],
+        )
+        .await
+        .context("recording a delivery failed")?;
+    Ok(())
+}
+
+/// The ids of every test request nobody has answered yet, oldest first.
+///
+/// # Errors
+///
+/// Returns an error when the query fails.
+pub async fn pending_notify_requests(client: &Client) -> Result<Vec<i64>> {
+    let rows = client
+        .query(
+            "SELECT id FROM ng_notify_requests WHERE handled_at IS NULL ORDER BY id",
+            &[],
+        )
+        .await
+        .context("reading test requests failed")?;
+    Ok(rows.iter().map(|r| r.get(0)).collect())
+}
+
+/// Marks test requests handled with one outcome word.
+///
+/// # Errors
+///
+/// Returns an error when the write fails.
+pub async fn complete_notify_requests(
+    client: &Client,
+    ids: &[i64],
+    outcome: &str,
+    at: Timestamp,
+) -> Result<()> {
+    client
+        .execute(
+            "UPDATE ng_notify_requests SET handled_at = $2, outcome = $3
+              WHERE id = ANY($1) AND handled_at IS NULL",
+            &[&ids, &at, &outcome],
+        )
+        .await
+        .context("marking test requests handled failed")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
