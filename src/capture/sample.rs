@@ -56,7 +56,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, TimeDelta, Utc};
+use crate::clock::Timestamp;
+use jiff::SignedDuration;
 use serde::{Deserialize, Serialize};
 
 use crate::types::MacAddr;
@@ -86,7 +87,7 @@ pub struct Frame {
     /// The Ethernet source address.
     pub sender: MacAddr,
     /// When it was captured.
-    pub at: DateTime<Utc>,
+    pub at: Timestamp,
     /// The captured bytes, at most the snapshot length.
     pub data: Vec<u8>,
     /// The frame's length on the wire, which is more than `data` when the
@@ -105,7 +106,7 @@ impl Frame {
     /// ARP replies to it, unicast mDNS answers), and those are this host's own
     /// conversations, not something to keep in a file meant for sharing.
     #[must_use]
-    pub fn from_ethernet(data: &[u8], wire_len: u32, at: DateTime<Utc>) -> Option<Frame> {
+    pub fn from_ethernet(data: &[u8], wire_len: u32, at: Timestamp) -> Option<Frame> {
         if data.first().is_none_or(|first| first & 0x01 == 0) {
             return None;
         }
@@ -134,7 +135,7 @@ pub struct SampleLimits {
     /// Bytes written, file header included.
     pub max_bytes: u64,
     /// How long a sender has to be named before its frames are kept.
-    pub settle: TimeDelta,
+    pub settle: SignedDuration,
 }
 
 /// Which bound stopped something.
@@ -207,7 +208,7 @@ impl SampleStatus {
 pub struct UnknownSampler {
     path: PathBuf,
     limits: SampleLimits,
-    pending: HashMap<MacAddr, (DateTime<Utc>, Vec<Frame>)>,
+    pending: HashMap<MacAddr, (Timestamp, Vec<Frame>)>,
     written: HashMap<MacAddr, u32>,
     frames: u64,
     bytes: u64,
@@ -289,8 +290,8 @@ impl UnknownSampler {
 
     /// Decides every sender held for at least the settle time, asking `named`
     /// about each.
-    pub fn settle(&mut self, now: DateTime<Utc>, named: impl Fn(MacAddr) -> Option<bool>) {
-        let mut due: Vec<(DateTime<Utc>, MacAddr)> = self
+    pub fn settle(&mut self, now: Timestamp, named: impl Fn(MacAddr) -> Option<bool>) {
+        let mut due: Vec<(Timestamp, MacAddr)> = self
             .pending
             .iter()
             .filter(|(_, (first, _))| now - *first >= self.limits.settle)
@@ -459,8 +460,8 @@ const HEADER_SNAPLEN: u32 = 65_535;
 /// One pcap record: its header and the frame's bytes.
 fn record(frame: &Frame) -> Vec<u8> {
     let mut out = Vec::with_capacity(16 + frame.data.len());
-    let secs = u32::try_from(frame.at.timestamp().max(0)).unwrap_or(u32::MAX);
-    let micros = frame.at.timestamp_subsec_micros().min(999_999);
+    let secs = u32::try_from(frame.at.unix_seconds().max(0)).unwrap_or(u32::MAX);
+    let micros = frame.at.subsec_micros().min(999_999);
     let caplen = u32::try_from(frame.data.len()).unwrap_or(u32::MAX);
     out.extend_from_slice(&secs.to_ne_bytes());
     out.extend_from_slice(&micros.to_ne_bytes());
@@ -524,13 +525,10 @@ impl Drop for UnknownSampler {
 mod tests {
     use super::*;
     use crate::capture::fixtures;
-    use chrono::TimeZone;
 
-    fn at(seconds: i64) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 11, 14, 9, 0, 0)
-            .single()
-            .expect("valid time")
-            + TimeDelta::seconds(seconds)
+    fn at(seconds: i64) -> Timestamp {
+        Timestamp::from_utc(2026, 11, 14, 9, 0, 0).expect("valid time")
+            + SignedDuration::from_secs(seconds)
     }
 
     fn temp_dir(test: &str) -> PathBuf {
@@ -548,7 +546,7 @@ mod tests {
             frames_per_device,
             max_devices,
             max_bytes,
-            settle: TimeDelta::seconds(60),
+            settle: SignedDuration::from_secs(60),
         }
     }
 

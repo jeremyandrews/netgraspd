@@ -46,7 +46,7 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use chrono::{DateTime, Utc};
+use crate::clock::Timestamp;
 
 use crate::capture::dns;
 use crate::capture::ethernet::{
@@ -68,11 +68,7 @@ const MDNS_PORT: u16 = 5353;
 /// Returns `None` when the frame is not mDNS, when the source MAC cannot
 /// identify a device, or when the DNS payload is unreadable.
 #[must_use]
-pub fn parse_frame(
-    bytes: &[u8],
-    interface: &str,
-    observed_at: DateTime<Utc>,
-) -> Option<Observation> {
+pub fn parse_frame(bytes: &[u8], interface: &str, observed_at: Timestamp) -> Option<Observation> {
     let frame = parse_ethernet(bytes)?;
     let ip = match frame.ethertype {
         ETHERTYPE_IPV4 => parse_ipv4(frame.payload)?,
@@ -394,10 +390,8 @@ mod tests {
     use super::*;
     use crate::capture::fixtures;
 
-    fn ts() -> DateTime<Utc> {
-        chrono::TimeZone::timestamp_opt(&Utc, 1_770_000_000, 0)
-            .single()
-            .expect("valid timestamp")
+    fn ts() -> Timestamp {
+        Timestamp::from_unix(1_770_000_000, 0).expect("valid timestamp")
     }
 
     fn names(obs: &Observation, kind: SignalKind) -> Vec<&str> {

@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use crate::clock::Timestamp;
 use serde_json::json;
 
 use crate::analyze::SecurityAlert;
@@ -46,7 +46,7 @@ pub enum Effect {
         /// The evidence.
         signal: Signal,
         /// When it was seen.
-        at: DateTime<Utc>,
+        at: Timestamp,
     },
     /// An address the device is holding.
     Address {
@@ -57,7 +57,7 @@ pub enum Effect {
         /// Interface it was seen on.
         interface: String,
         /// When it was seen.
-        at: DateTime<Utc>,
+        at: Timestamp,
     },
     /// A presence session started.
     PresenceOpened {
@@ -68,14 +68,14 @@ pub enum Effect {
         /// Address at the time the session opened.
         ip: Option<String>,
         /// When it opened.
-        at: DateTime<Utc>,
+        at: Timestamp,
     },
     /// A presence session ended.
     PresenceClosed {
         /// Which device.
         mac: MacAddr,
         /// When it ended.
-        at: DateTime<Utc>,
+        at: Timestamp,
     },
     /// A device is somewhere new. Closes the open location stay and opens
     /// another, which is one effect rather than two so that the "at most one
@@ -88,7 +88,7 @@ pub enum Effect {
         /// The place that access point is in.
         location: String,
         /// When it moved.
-        at: DateTime<Utc>,
+        at: Timestamp,
     },
     /// A device is no longer anywhere: it went offline, so its stay ends and no
     /// new one opens until an enricher places it again.
@@ -96,7 +96,7 @@ pub enum Effect {
         /// Which device.
         mac: MacAddr,
         /// When the stay ended.
-        at: DateTime<Utc>,
+        at: Timestamp,
     },
 }
 
@@ -116,7 +116,7 @@ pub struct DeviceEvent {
     /// Interface, when known.
     pub interface: Option<String>,
     /// When it happened.
-    pub at: DateTime<Utc>,
+    pub at: Timestamp,
     /// True when the device belongs to the learned baseline, which suppresses
     /// the notification but never the record.
     pub baseline: bool,
@@ -171,7 +171,7 @@ pub struct Reclassification {
     /// Interface it was last seen on.
     pub interface: Option<String>,
     /// When the change happened.
-    pub at: DateTime<Utc>,
+    pub at: Timestamp,
 }
 
 /// The daemon-owned view of a device, used for flushes and for the CLI table.
@@ -188,9 +188,9 @@ pub struct DeviceSnapshot {
     /// Interface last seen on.
     pub last_interface: Option<String>,
     /// First sighting.
-    pub first_seen_at: DateTime<Utc>,
+    pub first_seen_at: Timestamp,
     /// Most recent sighting.
-    pub last_seen_at: DateTime<Utc>,
+    pub last_seen_at: Timestamp,
     /// Learned during a baseline window.
     pub baseline: bool,
     /// Name the scorer picked.
@@ -240,8 +240,8 @@ impl DeviceSnapshot {
 struct Entry {
     mac: MacAddr,
     state: DeviceState,
-    first_seen_at: DateTime<Utc>,
-    last_seen_at: DateTime<Utc>,
+    first_seen_at: Timestamp,
+    last_seen_at: Timestamp,
     last_ip: Option<String>,
     last_ipv6: Option<String>,
     last_interface: Option<String>,
@@ -251,7 +251,7 @@ struct Entry {
     identity: Identity,
     /// An equal-rank candidate waiting out the settle window, and when it first
     /// won. See `rescore`.
-    pending_identity: Option<(Identity, DateTime<Utc>)>,
+    pending_identity: Option<(Identity, Timestamp)>,
     classification: Classification,
     display_name: Option<String>,
     current_ap: Option<String>,
@@ -319,15 +319,15 @@ impl Entry {
 
     /// True when the device has been continuously present long enough for that
     /// to mean something.
-    fn always_on(&self, now: DateTime<Utc>) -> bool {
+    fn always_on(&self, now: Timestamp) -> bool {
         self.offline_transitions == 0
             && self.state != DeviceState::Offline
-            && (now - self.first_seen_at).num_hours() >= ALWAYS_ON_HOURS
+            && (now - self.first_seen_at).as_hours() >= ALWAYS_ON_HOURS
     }
 
     /// Recomputes the device type and OS family, returning the previous
     /// classification when anything changed.
-    fn reclassify(&mut self, now: DateTime<Utc>) -> Option<Classification> {
+    fn reclassify(&mut self, now: Timestamp) -> Option<Classification> {
         let vendor = self.best(SignalKind::Vendor);
         let candidate = identity::classify(&ClassifyInput {
             mac: self.mac,
@@ -424,7 +424,7 @@ impl Entry {
     /// the signal list. Adopting each turn is what produced 385 `name_updated`
     /// events in thirty minutes; a rival that alternates never settles, and a
     /// device somebody genuinely renamed settles once and emits one event.
-    fn rescore(&mut self, now: DateTime<Utc>) -> Option<Identity> {
+    fn rescore(&mut self, now: Timestamp) -> Option<Identity> {
         let candidate = identity::resolve(&identity::IdentityInput {
             mac: self.mac,
             signals: &self.signals,
@@ -876,7 +876,7 @@ impl Manager {
     /// whether the device is online and when it was last heard from, and
     /// handing it anything more invites a second source of truth.
     #[must_use]
-    pub fn state_of(&self, mac: MacAddr) -> Option<(DeviceState, DateTime<Utc>)> {
+    pub fn state_of(&self, mac: MacAddr) -> Option<(DeviceState, Timestamp)> {
         self.devices
             .get(&mac)
             .map(|entry| (entry.state, entry.last_seen_at))
@@ -1163,7 +1163,7 @@ impl Manager {
     /// Returns nothing for an unknown MAC: a signal about a device the state
     /// machine has never seen is a bug elsewhere, not a device.
     #[must_use]
-    pub fn add_signal(&mut self, mac: MacAddr, signal: &Signal, at: DateTime<Utc>) -> Vec<Effect> {
+    pub fn add_signal(&mut self, mac: MacAddr, signal: &Signal, at: Timestamp) -> Vec<Effect> {
         if signal.value.trim().is_empty() {
             return Vec::new();
         }
@@ -1239,7 +1239,7 @@ impl Manager {
         place: &crate::location::Place,
         movement: crate::location::Movement,
         telemetry: Option<serde_json::Value>,
-        at: DateTime<Utc>,
+        at: Timestamp,
     ) -> Vec<Effect> {
         let learning = self.learning;
         let Some(entry) = self.devices.get_mut(&mac) else {
@@ -1372,15 +1372,13 @@ impl Manager {
 
     /// Applies timeouts, moving quiet devices to idle and silent ones offline.
     #[must_use]
-    pub fn sweep(&mut self, now: DateTime<Utc>) -> Vec<Effect> {
+    pub fn sweep(&mut self, now: Timestamp) -> Vec<Effect> {
         let mut effects = Vec::new();
         for entry in self.devices.values_mut() {
             if entry.state == DeviceState::Offline {
                 continue;
             }
-            let silence = (now - entry.last_seen_at)
-                .to_std()
-                .unwrap_or(Duration::ZERO);
+            let silence = Duration::try_from(now - entry.last_seen_at).unwrap_or(Duration::ZERO);
             let device_type = entry.classification.device_type.as_deref();
             let offline_after = self.config.offline_timeout_for(device_type);
             let idle_after = self.config.idle_timeout_for(device_type);
@@ -1507,16 +1505,14 @@ mod tests {
     use super::*;
     use crate::config::{HumanDuration, StateConfig};
     use crate::types::{NameClaim, ObservationKind};
-    use chrono::TimeZone;
+    use jiff::SignedDuration;
 
-    fn base() -> DateTime<Utc> {
-        Utc.timestamp_opt(1_770_000_000, 0)
-            .single()
-            .expect("valid timestamp")
+    fn base() -> Timestamp {
+        Timestamp::from_unix(1_770_000_000, 0).expect("valid timestamp")
     }
 
-    fn at(offset_secs: i64) -> DateTime<Utc> {
-        base() + chrono::Duration::seconds(offset_secs)
+    fn at(offset_secs: i64) -> Timestamp {
+        base() + SignedDuration::from_secs(offset_secs)
     }
 
     fn config() -> StateConfig {
@@ -1531,7 +1527,7 @@ mod tests {
         s.parse().expect("test mac")
     }
 
-    fn obs_at(m: &str, ip: Option<&str>, when: DateTime<Utc>) -> Observation {
+    fn obs_at(m: &str, ip: Option<&str>, when: Timestamp) -> Observation {
         Observation::new(
             mac(m),
             ip.map(|s| s.parse().expect("test ip")),
@@ -1563,12 +1559,7 @@ mod tests {
     }
 
     /// An observation carrying mDNS-shaped claims.
-    fn claiming(
-        m: &str,
-        ip: Option<&str>,
-        when: DateTime<Utc>,
-        claims: Vec<NameClaim>,
-    ) -> Observation {
+    fn claiming(m: &str, ip: Option<&str>, when: Timestamp, claims: Vec<NameClaim>) -> Observation {
         let mut obs = Observation::new(
             mac(m),
             ip.map(|s| s.parse().expect("test ip")),
@@ -2462,7 +2453,7 @@ mod tests {
         ip: &str,
         interface: &str,
         source: &'static str,
-        when: DateTime<Utc>,
+        when: Timestamp,
     ) -> Observation {
         Observation::new(
             mac(m),

@@ -166,10 +166,8 @@ pub const SETTLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(30
 /// `since` is when this same rival first won. A rival that loses even once
 /// resets it, so alternating candidates never settle and never produce an event.
 #[must_use]
-pub fn settled(since: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::Utc>) -> bool {
-    now.signed_duration_since(since)
-        .to_std()
-        .is_ok_and(|elapsed| elapsed >= SETTLE_WINDOW)
+pub fn settled(since: crate::clock::Timestamp, now: crate::clock::Timestamp) -> bool {
+    std::time::Duration::try_from(now.since(since)).is_ok_and(|elapsed| elapsed >= SETTLE_WINDOW)
 }
 
 /// True when `candidate` is a strictly better identity than `current`.

@@ -34,7 +34,7 @@
 //! `ng_device_signals` to no purpose. `urn:dial-multiscreen-org:service:dial` is
 //! the one service URN kept, because in practice it means "television".
 
-use chrono::{DateTime, Utc};
+use crate::clock::Timestamp;
 
 use crate::capture::ethernet::{
     ETHERTYPE_IPV4, ETHERTYPE_IPV6, IPPROTO_UDP, parse_ethernet, parse_ipv4, parse_ipv6, parse_udp,
@@ -83,11 +83,7 @@ pub struct SsdpMessage {
 /// Returns `None` when the frame is not SSDP, when the source MAC cannot
 /// identify a device, or when the payload is not a recognisable SSDP message.
 #[must_use]
-pub fn parse_frame(
-    bytes: &[u8],
-    interface: &str,
-    observed_at: DateTime<Utc>,
-) -> Option<Observation> {
+pub fn parse_frame(bytes: &[u8], interface: &str, observed_at: Timestamp) -> Option<Observation> {
     let frame = parse_ethernet(bytes)?;
     let ip = match frame.ethertype {
         ETHERTYPE_IPV4 => parse_ipv4(frame.payload)?,
@@ -262,10 +258,8 @@ mod tests {
     use super::*;
     use crate::capture::fixtures;
 
-    fn ts() -> DateTime<Utc> {
-        chrono::TimeZone::timestamp_opt(&Utc, 1_770_000_000, 0)
-            .single()
-            .expect("valid timestamp")
+    fn ts() -> Timestamp {
+        Timestamp::from_unix(1_770_000_000, 0).expect("valid timestamp")
     }
 
     fn signal(obs: &Observation, kind: SignalKind) -> Option<&str> {

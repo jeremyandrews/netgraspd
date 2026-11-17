@@ -36,10 +36,11 @@
 //! database's `now()`. That is what lets a test seed six months of synthetic
 //! history and roll it up without waiting six months.
 
+use jiff::SignedDuration;
 use std::time::{Duration, Instant};
 
+use crate::clock::Timestamp;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Timelike, Utc};
 
 use crate::config::MaintenanceConfig;
 use crate::db::queries::Client;
@@ -111,9 +112,8 @@ impl Report {
 /// This is the only place a cutoff is computed, so "never touch the current day"
 /// is one function rather than a rule four queries have to remember.
 #[must_use]
-pub fn cutoff(now: DateTime<Utc>, days: u32) -> DateTime<Utc> {
-    now.date_naive().and_time(chrono::NaiveTime::MIN).and_utc()
-        - chrono::TimeDelta::days(i64::from(days))
+pub fn cutoff(now: Timestamp, days: u32) -> Timestamp {
+    now.start_of_utc_day() - SignedDuration::from_hours(24 * i64::from(days))
 }
 
 /// Runs every job, in order.
@@ -123,11 +123,7 @@ pub fn cutoff(now: DateTime<Utc>, days: u32) -> DateTime<Utc> {
 /// Returns an error when any statement fails. The jobs are independent, so a
 /// failure leaves the earlier ones applied; each is its own transaction and none
 /// half-applies.
-pub async fn run(
-    client: &Client,
-    config: &MaintenanceConfig,
-    now: DateTime<Utc>,
-) -> Result<Report> {
+pub async fn run(client: &Client, config: &MaintenanceConfig, now: Timestamp) -> Result<Report> {
     let started = Instant::now();
     let rollup_before = cutoff(now, config.rollup_after_days);
     let events_before = cutoff(now, config.event_retention_days);
@@ -171,7 +167,7 @@ pub async fn run(
 /// # Errors
 ///
 /// Returns an error when the statement fails.
-pub async fn roll_up_presence(client: &Client, before: DateTime<Utc>) -> Result<(u64, u64)> {
+pub async fn roll_up_presence(client: &Client, before: Timestamp) -> Result<(u64, u64)> {
     let row = client
         .query_one(
             // One statement so the insert and the delete share a snapshot: the
@@ -225,10 +221,7 @@ pub async fn roll_up_presence(client: &Client, before: DateTime<Utc>) -> Result<
 /// # Errors
 ///
 /// Returns an error when the statement fails.
-pub async fn roll_up_location_history(
-    client: &Client,
-    before: DateTime<Utc>,
-) -> Result<(u64, u64)> {
+pub async fn roll_up_location_history(client: &Client, before: Timestamp) -> Result<(u64, u64)> {
     let row = client
         .query_one(
             "WITH victims AS (
@@ -269,7 +262,7 @@ pub async fn roll_up_location_history(
 /// # Errors
 ///
 /// Returns an error when the statement fails.
-pub async fn prune_events(client: &Client, before: DateTime<Utc>) -> Result<u64> {
+pub async fn prune_events(client: &Client, before: Timestamp) -> Result<u64> {
     client
         .execute("DELETE FROM ng_events WHERE \"timestamp\" < $1", &[&before])
         .await
@@ -352,24 +345,20 @@ pub async fn vacuum(client: &Client) -> Result<()> {
 #[must_use]
 pub fn is_due(
     config: &MaintenanceConfig,
-    now: DateTime<Utc>,
-    last_run: Option<DateTime<Utc>>,
-    offset: chrono::FixedOffset,
+    now: Timestamp,
+    last_run: Option<Timestamp>,
+    offset: jiff::tz::Offset,
 ) -> bool {
     if !config.enabled {
         return false;
     }
-    let local = now.with_timezone(&offset);
-    let minutes = local.hour() * 60 + local.minute();
+    let minutes = now.minute_of_day_at(offset);
     if minutes < config.run_at.minutes() {
         return false;
     }
     match last_run {
         // Once a day: the job has already run since the scheduled time today.
-        Some(last) => {
-            let last_local = last.with_timezone(&offset);
-            last_local.date_naive() != local.date_naive()
-        }
+        Some(last) => last.date_at(offset) != now.date_at(offset),
         None => true,
     }
 }
@@ -378,16 +367,13 @@ pub fn is_due(
 mod tests {
     use super::*;
     use crate::config::ClockTime;
-    use chrono::TimeZone;
 
-    fn utc() -> chrono::FixedOffset {
-        chrono::FixedOffset::east_opt(0).expect("utc")
+    fn utc() -> jiff::tz::Offset {
+        jiff::tz::Offset::from_seconds(0).expect("utc")
     }
 
-    fn stamp(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(y, m, d, h, min, 0)
-            .single()
-            .expect("valid time")
+    fn stamp(y: i16, m: i8, d: i8, h: i8, min: i8) -> Timestamp {
+        Timestamp::from_utc(y, m, d, h, min, 0).expect("valid time")
     }
 
     fn config() -> MaintenanceConfig {
@@ -474,7 +460,7 @@ mod tests {
             ..config()
         };
         // Rome in summer is UTC+2, so 02:00 UTC is 04:00 local and due.
-        let rome = chrono::FixedOffset::east_opt(2 * 3600).expect("offset");
+        let rome = jiff::tz::Offset::from_seconds(2 * 3600).expect("offset");
         assert!(is_due(&config, stamp(2026, 8, 14, 2, 0), None, rome));
         assert!(!is_due(&config, stamp(2026, 8, 14, 2, 0), None, utc()));
     }

@@ -19,11 +19,15 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0.104"
 async-trait = "0.1.91"
-chrono = { version = "0.4.45", features = ["serde"] }
+# The buffer type tokio-postgres writes parameters into, for `clock::Timestamp`.
+bytes = "1.12.1"
 clap = { version = "4.6.5", features = ["derive"] }
 deadpool-postgres = "0.14.1"
 figment = { version = "0.10.19", features = ["toml", "env", "test"] }
 hickory-resolver = { version = "0.26.1", features = ["tokio"] }
+# Time. Timestamps are wrapped in `clock::Timestamp`, which keeps the formats
+# chrono used to write, byte for byte.
+jiff = "0.2"
 # The capture host's own default route and interface hardware addresses, read
 # locally from the OS (netlink on Linux, the routing sysctl and getifaddrs on
 # macOS). Default features off: they pull in SystemConfiguration extras and
@@ -43,7 +47,7 @@ serde_json = "1.0.151"
 thiserror = "2.0.19"
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-postgres = { version = "0.7.18", features = [
-    "with-chrono-0_4",
+    "with-jiff-0_2",
     "with-serde_json-1",
 ] }
 tracing = "0.1.44"

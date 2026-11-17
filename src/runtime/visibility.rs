@@ -26,7 +26,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
 
-use chrono::{DateTime, TimeDelta, Utc};
+use crate::clock::Timestamp;
+use jiff::SignedDuration;
 use serde::{Deserialize, Serialize};
 
 use crate::types::MacAddr;
@@ -40,7 +41,7 @@ pub const MAX_TRACKED_SENDERS: usize = 4096;
 /// Two minutes. Any network with a router on it carries ARP and usually mDNS
 /// well inside that; an interface that has heard nothing at all for that long
 /// is not being delivered frames.
-pub const SILENCE_BEFORE_FAULT: TimeDelta = TimeDelta::minutes(2);
+pub const SILENCE_BEFORE_FAULT: SignedDuration = SignedDuration::from_mins(2);
 
 /// One source's view of one interface.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,7 +62,7 @@ pub struct InterfaceVisibility {
     /// When the first capture thread on this interface started listening.
     /// `None` when none ever did.
     #[serde(default)]
-    pub listening_since: Option<DateTime<Utc>>,
+    pub listening_since: Option<Timestamp>,
     /// Frames delivered, every source together.
     #[serde(default)]
     pub frames: u64,
@@ -81,7 +82,7 @@ pub struct InterfaceVisibility {
     pub gateway_seen: bool,
     /// When the most recent frame arrived.
     #[serde(default)]
-    pub last_frame_at: Option<DateTime<Utc>>,
+    pub last_frame_at: Option<Timestamp>,
     /// The same counts, per capture source.
     #[serde(default)]
     pub sources: BTreeMap<String, SourceVisibility>,
@@ -178,11 +179,11 @@ pub fn verdict(
     interface: &str,
     v: &InterfaceVisibility,
     failures: usize,
-    as_of: DateTime<Utc>,
+    as_of: Timestamp,
 ) -> Verdict {
     let listened = v
         .listening_since
-        .map(|since| (as_of - since).max(TimeDelta::zero()));
+        .map(|since| (as_of - since).max(SignedDuration::ZERO));
     let Some(listened) = listened else {
         let why = if failures == 0 {
             "no capture thread started".to_string()
@@ -268,10 +269,10 @@ impl Senders {
 /// Live counts for one interface.
 #[derive(Debug, Default)]
 struct InterfaceTally {
-    listening_since: Option<DateTime<Utc>>,
+    listening_since: Option<Timestamp>,
     frames: u64,
     senders: Senders,
-    last_frame_at: Option<DateTime<Utc>>,
+    last_frame_at: Option<Timestamp>,
     sources: BTreeMap<&'static str, (u64, Senders)>,
 }
 
@@ -286,7 +287,7 @@ pub struct Tally {
 
 impl Tally {
     /// Records that a capture thread on `interface` has started listening.
-    pub fn listening(&self, interface: &str, at: DateTime<Utc>) {
+    pub fn listening(&self, interface: &str, at: Timestamp) {
         let mut interfaces = self.lock();
         let entry = interfaces.entry(interface.to_string()).or_default();
         // The earliest start: a second source starting later does not reset it.
@@ -299,7 +300,7 @@ impl Tally {
         interface: &str,
         source: &'static str,
         sender: Option<MacAddr>,
-        at: DateTime<Utc>,
+        at: Timestamp,
     ) {
         let mut interfaces = self.lock();
         let entry = interfaces.entry(interface.to_string()).or_default();
@@ -379,13 +380,10 @@ pub fn ethernet_source(frame: &[u8]) -> Option<MacAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
-    fn at(minutes: i64) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 11, 14, 9, 0, 0)
-            .single()
-            .expect("valid time")
-            + TimeDelta::minutes(minutes)
+    fn at(minutes: i64) -> Timestamp {
+        Timestamp::from_utc(2026, 11, 14, 9, 0, 0).expect("valid time")
+            + SignedDuration::from_mins(minutes)
     }
 
     fn mac(last: u8) -> MacAddr {
@@ -450,7 +448,7 @@ mod tests {
     #[test]
     fn nothing_received_yet_is_too_early_to_call() {
         let v = listened(0, 0, false, false);
-        let verdict = verdict("en0", &v, 0, at(0) + TimeDelta::seconds(30));
+        let verdict = verdict("en0", &v, 0, at(0) + SignedDuration::from_secs(30));
         assert_eq!(verdict.kind, VerdictKind::TooEarly, "{verdict:?}");
         assert!(verdict.line.contains("too early"), "{}", verdict.line);
     }

@@ -17,7 +17,7 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use crate::clock::Timestamp;
 use serde_json::json;
 
 use crate::analyze::window::{BoundedMap, DistinctWindow};
@@ -35,7 +35,7 @@ const WINDOW_CAPACITY: usize = 512;
 #[derive(Debug)]
 struct Tracked {
     targets: DistinctWindow<std::net::Ipv4Addr>,
-    last_alert: Option<DateTime<Utc>>,
+    last_alert: Option<Timestamp>,
 }
 
 /// The `arp_scan` analyzer.
@@ -138,12 +138,9 @@ mod tests {
     use crate::capture::{arp, fixtures};
     use crate::config::HumanDuration;
     use crate::types::{EventPriority, Observation};
-    use chrono::TimeZone;
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(1_770_000_000 + secs, 0)
-            .single()
-            .expect("valid timestamp")
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::from_unix(1_770_000_000 + secs, 0).expect("valid timestamp")
     }
 
     fn mac(s: &str) -> MacAddr {
@@ -160,7 +157,7 @@ mod tests {
     }
 
     /// An ARP request from `from` asking about `target`.
-    fn request(from: &str, target: [u8; 4], when: DateTime<Utc>) -> Observation {
+    fn request(from: &str, target: [u8; 4], when: Timestamp) -> Observation {
         let mut frame = fixtures::arp_request();
         let source = mac(from).octets();
         frame[6..12].copy_from_slice(&source);

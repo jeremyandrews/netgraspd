@@ -14,7 +14,7 @@ mod common;
 
 use std::time::Instant;
 
-use chrono::{DateTime, TimeZone, Utc};
+use netgraspd::clock::Timestamp;
 use netgraspd::config::MaintenanceConfig;
 use netgraspd::maintenance;
 
@@ -33,10 +33,8 @@ const STAYS_PER_DAY: i32 = 6;
 /// Events per device per day.
 const EVENTS_PER_DAY: i32 = 3;
 
-fn now() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 14, 17, 0, 0)
-        .single()
-        .expect("valid time")
+fn now() -> Timestamp {
+    Timestamp::from_utc(2026, 8, 14, 17, 0, 0).expect("valid time")
 }
 
 fn config() -> MaintenanceConfig {
@@ -55,7 +53,7 @@ fn config() -> MaintenanceConfig {
 /// Written as set-based SQL rather than a loop of inserts because six months of
 /// history is a hundred thousand rows and a round trip each would make the test
 /// take minutes.
-async fn seed(db: &common::TestDb, end: DateTime<Utc>) {
+async fn seed(db: &common::TestDb, end: Timestamp) {
     let client = db.client().await;
 
     client
@@ -276,7 +274,7 @@ async fn six_months_of_synthetic_history_rolls_up_without_losing_anything() {
     assert_eq!(
         db.scalar(&format!(
             "SELECT COUNT(*) FROM ng_events WHERE \"timestamp\" < '{}'",
-            events_cutoff.format("%Y-%m-%d %H:%M:%S%:z")
+            events_cutoff.strftime("%Y-%m-%d %H:%M:%S%:z")
         ))
         .await,
         0
@@ -499,7 +497,7 @@ impl Counts {
             presence_today: db
                 .scalar(&format!(
                     "SELECT COUNT(*) FROM ng_presence WHERE started_at >= '{}'",
-                    maintenance::cutoff(now(), 0).format("%Y-%m-%d %H:%M:%S%:z")
+                    maintenance::cutoff(now(), 0).strftime("%Y-%m-%d %H:%M:%S%:z")
                 ))
                 .await,
             observation_total: db

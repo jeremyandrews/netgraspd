@@ -5,7 +5,7 @@
 //! function from data to a `String`, which keeps the formatting testable and
 //! keeps terminal handling out of it.
 
-use chrono::{DateTime, Utc};
+use crate::clock::Timestamp;
 
 use crate::db::queries::{DeviceRecord, EventRecord, PersonRecord};
 use crate::device::DeviceSnapshot;
@@ -82,8 +82,8 @@ fn truncate(s: &str, max: usize) -> String {
 
 /// Renders a duration as a compact "how long ago".
 #[must_use]
-pub fn ago(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
-    let secs = now.signed_duration_since(then).num_seconds();
+pub fn ago(then: Timestamp, now: Timestamp) -> String {
+    let secs = now.since(then).as_secs();
     if secs < 0 {
         // A packet timestamped in the future means clock skew, not time travel.
         return "just now".into();
@@ -99,7 +99,7 @@ pub fn ago(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
 
 /// Renders the live device table shown by `netgraspd run`.
 #[must_use]
-pub fn device_table(devices: &[DeviceSnapshot], now: DateTime<Utc>) -> String {
+pub fn device_table(devices: &[DeviceSnapshot], now: Timestamp) -> String {
     let rows: Vec<Vec<String>> = devices
         .iter()
         .map(|d| {
@@ -117,7 +117,7 @@ pub fn device_table(devices: &[DeviceSnapshot], now: DateTime<Utc>) -> String {
 
 /// Renders the one-shot table shown by `netgraspd devices`.
 #[must_use]
-pub fn device_record_table(devices: &[DeviceRecord], now: DateTime<Utc>) -> String {
+pub fn device_record_table(devices: &[DeviceRecord], now: Timestamp) -> String {
     let rows: Vec<Vec<String>> = devices
         .iter()
         .map(|d| {
@@ -139,7 +139,7 @@ pub fn device_record_table(devices: &[DeviceRecord], now: DateTime<Utc>) -> Stri
 
 /// Renders the table shown by `netgraspd events`.
 #[must_use]
-pub fn event_table(events: &[EventRecord], now: DateTime<Utc>) -> String {
+pub fn event_table(events: &[EventRecord], now: Timestamp) -> String {
     let rows: Vec<Vec<String>> = events
         .iter()
         .map(|e| {
@@ -164,7 +164,7 @@ pub fn event_table(events: &[EventRecord], now: DateTime<Utc>) -> String {
 /// Ordered home first, then by name, because the question somebody types this to
 /// answer is "who is in".
 #[must_use]
-pub fn people_table(people: &[PersonRecord], now: DateTime<Utc>) -> String {
+pub fn people_table(people: &[PersonRecord], now: Timestamp) -> String {
     let mut sorted: Vec<&PersonRecord> = people.iter().collect();
     sorted.sort_by(|a, b| {
         (a.state != "home")
@@ -251,12 +251,10 @@ mod tests {
     use super::*;
     use crate::identity::Identity;
     use crate::types::{DeviceState, SignalKind};
-    use chrono::TimeZone;
+    use jiff::SignedDuration;
 
-    fn now() -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 2, 2, 12, 0, 0)
-            .single()
-            .expect("valid time")
+    fn now() -> Timestamp {
+        Timestamp::from_utc(2026, 2, 2, 12, 0, 0).expect("valid time")
     }
 
     fn snapshot(name: &str, vendor: Option<&str>, ago_secs: i64) -> DeviceSnapshot {
@@ -267,7 +265,7 @@ mod tests {
             last_ipv6: None,
             last_interface: Some("eth0".into()),
             first_seen_at: now(),
-            last_seen_at: now() - chrono::Duration::seconds(ago_secs),
+            last_seen_at: now() - SignedDuration::from_secs(ago_secs),
             baseline: false,
             identity: Identity {
                 display_name: name.into(),
@@ -345,16 +343,16 @@ mod tests {
     fn relative_times_read_the_way_a_human_would_say_them() {
         let n = now();
         assert_eq!(ago(n, n), "just now");
-        assert_eq!(ago(n - chrono::Duration::seconds(30), n), "30s ago");
-        assert_eq!(ago(n - chrono::Duration::seconds(600), n), "10m ago");
-        assert_eq!(ago(n - chrono::Duration::seconds(7200), n), "2h ago");
-        assert_eq!(ago(n - chrono::Duration::seconds(200_000), n), "2d ago");
+        assert_eq!(ago(n - SignedDuration::from_secs(30), n), "30s ago");
+        assert_eq!(ago(n - SignedDuration::from_secs(600), n), "10m ago");
+        assert_eq!(ago(n - SignedDuration::from_secs(7200), n), "2h ago");
+        assert_eq!(ago(n - SignedDuration::from_secs(200_000), n), "2d ago");
     }
 
     #[test]
     fn a_future_timestamp_is_clock_skew_not_time_travel() {
         let n = now();
-        assert_eq!(ago(n + chrono::Duration::seconds(60), n), "just now");
+        assert_eq!(ago(n + SignedDuration::from_secs(60), n), "just now");
     }
 
     #[test]

@@ -20,7 +20,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use crate::clock::Timestamp;
 use serde_json::json;
 
 use crate::analyze::window::BoundedMap;
@@ -38,10 +38,10 @@ const COOLDOWN: Duration = Duration::from_secs(600);
 #[derive(Debug)]
 struct Users {
     /// The most recent user, and when.
-    latest: (MacAddr, DateTime<Utc>),
+    latest: (MacAddr, Timestamp),
     /// The previous distinct user, and when.
-    previous: Option<(MacAddr, DateTime<Utc>)>,
-    last_alert: Option<DateTime<Utc>>,
+    previous: Option<(MacAddr, Timestamp)>,
+    last_alert: Option<Timestamp>,
 }
 
 /// The `ip_conflict` analyzer.
@@ -108,8 +108,9 @@ impl Analyzer for IpConflict {
         users.previous = Some(displaced);
         users.latest = (mac, now);
 
-        let gap = now.signed_duration_since(displaced.1);
-        let simultaneous = gap.to_std().is_ok_and(|elapsed| elapsed <= active_within);
+        let gap = now.since(displaced.1);
+        let simultaneous =
+            std::time::Duration::try_from(gap).is_ok_and(|elapsed| elapsed <= active_within);
         if !simultaneous {
             return Vec::new();
         }
@@ -128,7 +129,7 @@ impl Analyzer for IpConflict {
                     "analyzer": "ip_conflict",
                     "address": address.to_string(),
                     "other_mac": displaced.0.to_string(),
-                    "seconds_apart": gap.num_seconds().max(0),
+                    "seconds_apart": gap.as_secs().max(0),
                     "active_within_secs": active_within.as_secs(),
                     "source": observation.source,
                 }),
@@ -145,12 +146,9 @@ mod tests {
     use crate::analyze::GatewayTracker;
     use crate::config::HumanDuration;
     use crate::types::{EventPriority, Observation, ObservationKind};
-    use chrono::TimeZone;
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(1_770_000_000 + secs, 0)
-            .single()
-            .expect("valid timestamp")
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::from_unix(1_770_000_000 + secs, 0).expect("valid timestamp")
     }
 
     fn mac(s: &str) -> MacAddr {
@@ -166,7 +164,7 @@ mod tests {
         }
     }
 
-    fn using(who: &str, address: &str, when: DateTime<Utc>) -> Observation {
+    fn using(who: &str, address: &str, when: Timestamp) -> Observation {
         Observation::new(
             mac(who),
             Some(address.parse().expect("test address")),
@@ -219,7 +217,7 @@ mod tests {
     }
 
     /// An ARP reply from `from` claiming `claimed`.
-    fn claim(from: &str, claimed: &str, when: DateTime<Utc>) -> Observation {
+    fn claim(from: &str, claimed: &str, when: Timestamp) -> Observation {
         let mut frame = crate::capture::fixtures::arp_reply();
         let source = mac(from).octets();
         let address: std::net::Ipv4Addr = claimed.parse().expect("test address");

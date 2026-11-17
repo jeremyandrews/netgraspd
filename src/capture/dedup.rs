@@ -79,7 +79,10 @@ impl ObservationDedup {
     }
 
     fn key(&self, obs: &Observation) -> u64 {
-        let bucket = obs.observed_at.timestamp().div_euclid(self.resolution_secs);
+        let bucket = obs
+            .observed_at
+            .unix_seconds()
+            .div_euclid(self.resolution_secs);
         let mut hasher = DefaultHasher::new();
         obs.mac.hash(&mut hasher);
         obs.kind.as_str().hash(&mut hasher);
@@ -91,16 +94,14 @@ impl ObservationDedup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::Timestamp;
     use crate::types::{MacAddr, ObservationKind};
-    use chrono::{DateTime, TimeZone, Utc};
 
-    fn at(secs: i64, millis: u32) -> DateTime<Utc> {
-        Utc.timestamp_opt(secs, millis * 1_000_000)
-            .single()
-            .expect("valid timestamp")
+    fn at(secs: i64, millis: u32) -> Timestamp {
+        Timestamp::from_unix(secs, millis * 1_000_000).expect("valid timestamp")
     }
 
-    fn obs(mac: &str, iface: &str, kind: ObservationKind, ts: DateTime<Utc>) -> Observation {
+    fn obs(mac: &str, iface: &str, kind: ObservationKind, ts: Timestamp) -> Observation {
         Observation::new(
             mac.parse::<MacAddr>().expect("mac"),
             None,

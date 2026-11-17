@@ -33,9 +33,10 @@
 //! This registry is pure and synchronous: devices and clock readings in, person
 //! events and rows-to-write out. Every rule above is therefore a plain test.
 
+use jiff::SignedDuration;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use chrono::{DateTime, Utc};
+use crate::clock::Timestamp;
 use serde_json::json;
 
 use crate::location::{Movement, Place};
@@ -59,7 +60,7 @@ use crate::types::{EventType, MacAddr};
 /// asking is not "did they cross an edge recently" but "did they cross an edge
 /// shortly before they stopped talking", so a departure measures the crossing
 /// against the device's own last activity instead.
-pub const EDGE_EVIDENCE_WINDOW: chrono::TimeDelta = chrono::TimeDelta::minutes(15);
+pub const EDGE_EVIDENCE_WINDOW: SignedDuration = SignedDuration::from_mins(15);
 
 /// Whether a person is in the house.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -115,9 +116,9 @@ pub struct Person {
     pub current_location: Option<String>,
     /// When they last arrived. Daemon owned, and the column the plugin orders
     /// its person listing by, so it is written on every arrival without fail.
-    pub last_arrived_at: Option<DateTime<Utc>>,
+    pub last_arrived_at: Option<Timestamp>,
     /// When they last left. Daemon owned.
-    pub last_departed_at: Option<DateTime<Utc>>,
+    pub last_departed_at: Option<Timestamp>,
 }
 
 /// The daemon-owned columns of one person, for writing back.
@@ -130,9 +131,9 @@ pub struct PersonUpdate {
     /// Where they are.
     pub current_location: Option<String>,
     /// When they last arrived.
-    pub last_arrived_at: Option<DateTime<Utc>>,
+    pub last_arrived_at: Option<Timestamp>,
     /// When they last left.
-    pub last_departed_at: Option<DateTime<Utc>>,
+    pub last_departed_at: Option<Timestamp>,
 }
 
 /// Something worth telling somebody about a person.
@@ -149,7 +150,7 @@ pub struct PersonEvent {
     /// per-device debounce has something to key on.
     pub mac: MacAddr,
     /// When it happened.
-    pub at: DateTime<Utc>,
+    pub at: Timestamp,
     /// Whether the person's notification flags allow delivery.
     pub notify: bool,
     /// Structured detail for `ng_events.details`.
@@ -181,9 +182,9 @@ struct DeviceView {
     location: Option<String>,
     /// When this device was last heard from, which is what decides whose
     /// location a person takes.
-    last_active: Option<DateTime<Utc>>,
+    last_active: Option<Timestamp>,
     /// The last edge access point this device crossed, and when.
-    last_edge: Option<(String, DateTime<Utc>)>,
+    last_edge: Option<(String, Timestamp)>,
 }
 
 /// One thing a reconcile changed about people or ownership.
@@ -449,7 +450,7 @@ impl Registry {
     ///
     /// Used at startup, when every device's state is read back from Postgres.
     /// A restart must not announce that the whole household just arrived.
-    pub fn restore_device(&mut self, mac: MacAddr, online: bool, at: DateTime<Utc>) {
+    pub fn restore_device(&mut self, mac: MacAddr, online: bool, at: Timestamp) {
         let view = self.devices.entry(mac).or_default();
         view.online = online;
         view.last_active = Some(at);
@@ -459,7 +460,7 @@ impl Registry {
     /// location a person takes.
     ///
     /// Produces no events on its own. Coming online is [`Registry::device_online`].
-    pub fn device_seen(&mut self, mac: MacAddr, at: DateTime<Utc>) {
+    pub fn device_seen(&mut self, mac: MacAddr, at: Timestamp) {
         if !self.owner.contains_key(&mac) {
             return;
         }
@@ -471,7 +472,7 @@ impl Registry {
 
     /// A device came online.
     #[must_use]
-    pub fn device_online(&mut self, mac: MacAddr, at: DateTime<Utc>) -> Outcome {
+    pub fn device_online(&mut self, mac: MacAddr, at: Timestamp) -> Outcome {
         let Some(item_id) = self.owner.get(&mac).cloned() else {
             return Outcome::default();
         };
@@ -519,7 +520,7 @@ impl Registry {
 
     /// A device went offline.
     #[must_use]
-    pub fn device_offline(&mut self, mac: MacAddr, at: DateTime<Utc>) -> Outcome {
+    pub fn device_offline(&mut self, mac: MacAddr, at: Timestamp) -> Outcome {
         let Some(item_id) = self.owner.get(&mac).cloned() else {
             return Outcome::default();
         };
@@ -581,7 +582,7 @@ impl Registry {
         mac: MacAddr,
         place: &Place,
         movement: Movement,
-        at: DateTime<Utc>,
+        at: Timestamp,
     ) -> Outcome {
         let Some(item_id) = self.owner.get(&mac).cloned() else {
             return Outcome::default();
@@ -620,7 +621,7 @@ impl Registry {
     /// `trigger` is only used to attribute the event to a device; the location
     /// itself always comes from whichever owned device was heard from most
     /// recently.
-    fn refresh_location(&mut self, item_id: &str, trigger: MacAddr, at: DateTime<Utc>) -> Outcome {
+    fn refresh_location(&mut self, item_id: &str, trigger: MacAddr, at: Timestamp) -> Outcome {
         let location = self.location_of_person(item_id);
         let Some(person) = self.people.get_mut(item_id) else {
             return Outcome::default();
@@ -687,7 +688,7 @@ impl Registry {
     }
 
     /// The edge access point one device crossed recently, if any.
-    fn edge_evidence(&self, mac: MacAddr, at: DateTime<Utc>) -> Option<String> {
+    fn edge_evidence(&self, mac: MacAddr, at: Timestamp) -> Option<String> {
         self.devices
             .get(&mac)
             .and_then(|view| view.last_edge.clone())
@@ -809,16 +810,13 @@ mod tests {
     use super::*;
     use crate::config::UnifiConfig;
     use crate::location::LocationMap;
-    use chrono::TimeZone;
 
-    fn base() -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 8, 14, 17, 0, 0)
-            .single()
-            .expect("valid time")
+    fn base() -> Timestamp {
+        Timestamp::from_utc(2026, 8, 14, 17, 0, 0).expect("valid time")
     }
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        base() + chrono::Duration::seconds(secs)
+    fn at(secs: i64) -> Timestamp {
+        base() + SignedDuration::from_secs(secs)
     }
 
     fn mac(s: &str) -> MacAddr {

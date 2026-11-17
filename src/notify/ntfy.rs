@@ -303,7 +303,7 @@ pub fn body_for(event: &DeviceEvent) -> String {
     };
     lines.push(format!(
         "{when}: {}",
-        event.at.format("%Y-%m-%d %H:%M:%S UTC")
+        event.at.strftime("%Y-%m-%d %H:%M:%S UTC")
     ));
     lines.join("\n")
 }
@@ -333,7 +333,10 @@ fn person_body(event: &DeviceEvent) -> String {
     {
         lines.push(format!("Was in the {previous}"));
     }
-    lines.push(format!("At: {}", event.at.format("%Y-%m-%d %H:%M:%S UTC")));
+    lines.push(format!(
+        "At: {}",
+        event.at.strftime("%Y-%m-%d %H:%M:%S UTC")
+    ));
     lines.join("\n")
 }
 
@@ -379,8 +382,8 @@ pub const fn tags_for(event_type: EventType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::Timestamp;
     use crate::config::HumanDuration;
-    use chrono::{TimeZone, Utc};
 
     fn cfg(topic: &str) -> NtfyConfig {
         NtfyConfig {
@@ -401,10 +404,7 @@ mod tests {
             vendor: Some("Apple, Inc.".into()),
             ip: Some("192.168.1.40".into()),
             interface: Some("eth0".into()),
-            at: Utc
-                .with_ymd_and_hms(2026, 2, 2, 14, 30, 0)
-                .single()
-                .expect("valid time"),
+            at: Timestamp::from_utc(2026, 2, 2, 14, 30, 0).expect("valid time"),
             baseline: false,
             during_learning: false,
             notify: true,

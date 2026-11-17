@@ -19,7 +19,7 @@
 //! server in `security.rogue_dhcp.known_servers` closes the window completely,
 //! and the analyzer says so in its own log line the first time it learns one.
 
-use chrono::{DateTime, Utc};
+use crate::clock::Timestamp;
 use serde_json::json;
 
 use crate::analyze::{Analyzer, Context, SecurityAlert, Stimulus, cooled_down};
@@ -43,7 +43,7 @@ pub struct RogueDhcp {
     /// The server learned from traffic, when nothing was configured.
     learned: Option<MacAddr>,
     /// When each rogue was last alerted about.
-    alerted: Vec<(MacAddr, DateTime<Utc>)>,
+    alerted: Vec<(MacAddr, Timestamp)>,
 }
 
 impl RogueDhcp {
@@ -71,7 +71,7 @@ impl RogueDhcp {
     }
 
     /// When this rogue was last alerted about.
-    fn last_alert(&self, mac: MacAddr) -> Option<DateTime<Utc>> {
+    fn last_alert(&self, mac: MacAddr) -> Option<Timestamp> {
         self.alerted
             .iter()
             .find(|(m, _)| *m == mac)
@@ -79,7 +79,7 @@ impl RogueDhcp {
     }
 
     /// Records that a rogue was alerted about.
-    fn record_alert(&mut self, mac: MacAddr, at: DateTime<Utc>) {
+    fn record_alert(&mut self, mac: MacAddr, at: Timestamp) {
         if let Some(slot) = self.alerted.iter_mut().find(|(m, _)| *m == mac) {
             slot.1 = at;
             return;
@@ -170,12 +170,9 @@ mod tests {
     use crate::analyze::GatewayTracker;
     use crate::capture::{dhcp, fixtures};
     use crate::types::{EventPriority, Observation};
-    use chrono::TimeZone;
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(1_770_000_000 + secs, 0)
-            .single()
-            .expect("valid timestamp")
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::from_unix(1_770_000_000 + secs, 0).expect("valid timestamp")
     }
 
     fn mac(s: &str) -> MacAddr {
@@ -192,14 +189,14 @@ mod tests {
     }
 
     /// A DHCP Offer sent by `from`.
-    fn offer(from: &str, when: DateTime<Utc>) -> Observation {
+    fn offer(from: &str, when: Timestamp) -> Observation {
         let mut frame = fixtures::dhcp_offer();
         frame[6..12].copy_from_slice(&mac(from).octets());
         dhcp::parse_frame(&frame, "eth0", when).expect("parsed")
     }
 
     /// A DHCP Discover, which a client sends and which is never a rogue.
-    fn discover(when: DateTime<Utc>) -> Observation {
+    fn discover(when: Timestamp) -> Observation {
         dhcp::parse_frame(&fixtures::dhcp_discover(), "eth0", when).expect("parsed")
     }
 

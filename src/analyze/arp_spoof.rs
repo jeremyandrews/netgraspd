@@ -26,7 +26,7 @@
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use crate::clock::Timestamp;
 use serde_json::json;
 
 use crate::analyze::window::BoundedMap;
@@ -44,8 +44,8 @@ const COOLDOWN: Duration = Duration::from_secs(300);
 #[derive(Debug)]
 struct Holder {
     mac: MacAddr,
-    last_claim: DateTime<Utc>,
-    last_alert: Option<DateTime<Utc>>,
+    last_claim: Timestamp,
+    last_alert: Option<Timestamp>,
 }
 
 /// The `arp_spoof` analyzer.
@@ -117,10 +117,9 @@ impl Analyzer for ArpSpoof {
         // the daemon started. Requiring a prior claim here was a real hole,
         // because the common case is that everybody already has the gateway
         // cached and it never has to answer.
-        let silence = held_by_someone_else.map(|(_, last)| now.signed_duration_since(last));
+        let silence = held_by_someone_else.map(|(_, last)| now.since(last));
         let still_active = silence.is_some_and(|gap| {
-            gap.to_std()
-                .is_ok_and(|elapsed| elapsed < self.grace_period)
+            std::time::Duration::try_from(gap).is_ok_and(|elapsed| elapsed < self.grace_period)
         });
 
         let mut alerts = Vec::new();
@@ -138,7 +137,7 @@ impl Analyzer for ArpSpoof {
                             "claimed_ip": claimed.to_string(),
                             "previous_holder": held_by_someone_else.map(|(h, _)| h.to_string()),
                             "previous_holder_silent_secs":
-                                silence.map(|gap| gap.num_seconds().max(0)),
+                                silence.map(|gap| gap.as_secs().max(0)),
                             "grace_period_secs": self.grace_period.as_secs(),
                             "gateway_impersonation": gateway_impersonation,
                             "forged_sender": forged_sender,
@@ -176,12 +175,9 @@ mod tests {
     use crate::capture::{arp, fixtures};
     use crate::config::HumanDuration;
     use crate::types::{EventPriority, Observation};
-    use chrono::TimeZone;
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(1_770_000_000 + secs, 0)
-            .single()
-            .expect("valid timestamp")
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::from_unix(1_770_000_000 + secs, 0).expect("valid timestamp")
     }
 
     fn mac(s: &str) -> MacAddr {
@@ -208,7 +204,7 @@ mod tests {
     }
 
     /// An ARP reply from `from` claiming `claimed`.
-    fn claim(from: &str, claimed: [u8; 4], when: DateTime<Utc>) -> Observation {
+    fn claim(from: &str, claimed: [u8; 4], when: Timestamp) -> Observation {
         let mut frame = fixtures::arp_reply();
         let source = mac(from).octets();
         frame[6..12].copy_from_slice(&source);

@@ -22,8 +22,8 @@ pub mod ndp;
 pub mod sample;
 pub mod ssdp;
 
+use crate::clock::Timestamp;
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, TimeZone, Utc};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
@@ -45,7 +45,7 @@ const POLL_TIMEOUT_MS: i32 = 250;
 const IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Turns one captured frame into an observation, or discards it.
-pub type FrameParser = fn(&[u8], &str, DateTime<Utc>) -> Option<Observation>;
+pub type FrameParser = fn(&[u8], &str, Timestamp) -> Option<Observation>;
 
 /// A source of observations.
 ///
@@ -107,7 +107,7 @@ impl Tap {
         interface: &str,
         source: &'static str,
         packet: &pcap::Packet<'_>,
-        at: DateTime<Utc>,
+        at: Timestamp,
     ) {
         self.tally.frame(
             interface,
@@ -210,7 +210,7 @@ pub struct CaptureFailure {
     /// What went wrong.
     pub error: String,
     /// When the thread ended.
-    pub at: DateTime<Utc>,
+    pub at: Timestamp,
 }
 
 /// Supervises one source's per-interface tasks, reporting each failure the
@@ -274,7 +274,7 @@ where
                         source: source.to_string(),
                         interface,
                         error,
-                        at: Utc::now(),
+                        at: Timestamp::now(),
                     })
                     .await;
             }
@@ -351,7 +351,7 @@ fn capture_loop(
     apply_filter(&mut cap, filter, interface)?;
 
     tracing::info!(source, interface, filter, "capture started");
-    tap.tally.listening(interface, Utc::now());
+    tap.tally.listening(interface, Timestamp::now());
 
     loop {
         if *shutdown.borrow() {
@@ -384,16 +384,14 @@ fn capture_loop(
 
 /// Converts a pcap packet timestamp into a UTC datetime, falling back to the
 /// current time if the kernel handed over something unrepresentable.
-fn packet_time(header: &pcap::PacketHeader) -> DateTime<Utc> {
+fn packet_time(header: &pcap::PacketHeader) -> Timestamp {
     // The libc timeval field widths differ by platform (tv_usec is i32 on macOS
     // and i64 on Linux), so these casts are load-bearing on one target and
     // redundant on the other.
     #[allow(clippy::unnecessary_cast)]
     let (secs, usecs) = (header.ts.tv_sec as i64, header.ts.tv_usec as i64);
     let nanos = u32::try_from(usecs.clamp(0, 999_999) * 1000).unwrap_or(0);
-    Utc.timestamp_opt(secs, nanos)
-        .single()
-        .unwrap_or_else(Utc::now)
+    Timestamp::from_unix(secs, nanos).unwrap_or_else(Timestamp::now)
 }
 
 /// Wraps a pcap open failure with actionable guidance when it looks like a
@@ -821,8 +819,8 @@ mod tests {
             len: 60,
         };
         let t = packet_time(&header);
-        assert_eq!(t.timestamp(), 1_770_000_000);
-        assert_eq!(t.timestamp_subsec_millis(), 500);
+        assert_eq!(t.unix_seconds(), 1_770_000_000);
+        assert_eq!(t.subsec_millis(), 500);
 
         // Nonsense from a broken driver must not panic.
         let header = pcap::PacketHeader {
