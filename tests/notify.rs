@@ -394,3 +394,34 @@ async fn an_arrival_reaches_ntfy_in_words() {
         "Jamie is home: Jamie's iPhone joined at 18:42"
     );
 }
+
+#[tokio::test]
+async fn notify_tables_the_plugin_created_first_do_not_stop_the_daemon_migrating() {
+    // The plugin ships a guarded copy of these two tables. A site that upgrades
+    // the plugin before the daemon has them already when V4 runs.
+    let Some(db) = common::test_db().await else {
+        return;
+    };
+    db.execute(
+        "INSERT INTO ng_notify_requests (requested_by) VALUES ('before the upgrade');
+         DELETE FROM refinery_schema_history WHERE version = 4;",
+    )
+    .await;
+    netgraspd::db::Db::migrate(&common::test_url())
+        .await
+        .expect("V4 applies over tables that already exist");
+    assert_eq!(
+        db.count("ng_notify_requests").await,
+        1,
+        "nothing was dropped"
+    );
+    assert_eq!(
+        db.scalar("SELECT COUNT(*) FROM refinery_schema_history WHERE version = 4")
+            .await,
+        1
+    );
+    let client = db.client().await;
+    netgraspd::db::schema::preflight(&client)
+        .await
+        .expect("the columns are the daemon's");
+}

@@ -8,6 +8,13 @@
 -- ng_events.notified and could never send a test. These two tables are the
 -- whole interface. Neither ever holds the ntfy topic, the server URL or the
 -- token: whoever can read the plugin's database must not learn where alerts go.
+--
+-- Guarded with IF NOT EXISTS, unlike V1 to V3, and on purpose. The plugin ships
+-- a byte-for-byte guarded copy of these two tables so that its Alerts page works
+-- on an install with no daemon, and a site that deploys the plugin before
+-- upgrading the daemon would otherwise have this migration fail on a table that
+-- is already there, exactly as the daemon would have created it. The preflight
+-- still compares every column after migrating, so a copy that differs is caught.
 
 -- ---------------------------------------------------------------------------
 -- ng_notify_status: one row about delivery
@@ -20,7 +27,7 @@
 -- last_delivery_ok   whether the most recent attempt, alert or test, was
 --                    accepted; null when nothing has been attempted yet
 -- last_delivery_at   when that attempt was made
-CREATE TABLE ng_notify_status (
+CREATE TABLE IF NOT EXISTS ng_notify_status (
     id                     BIGINT      PRIMARY KEY DEFAULT 1 CHECK (id = 1),
     notify_configured      BOOLEAN     NOT NULL,
     notify_backend         TEXT,
@@ -48,7 +55,7 @@ CREATE TABLE ng_notify_status (
 --   not_configured  there is nowhere to send it
 -- It is a word, never an error message: the transport's errors name the URL,
 -- and the URL contains the topic.
-CREATE TABLE ng_notify_requests (
+CREATE TABLE IF NOT EXISTS ng_notify_requests (
     id                 BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     kind               TEXT        NOT NULL DEFAULT 'test' CHECK (kind = 'test'),
     requested_by       TEXT,
@@ -60,5 +67,5 @@ CREATE TABLE ng_notify_requests (
     handled_at_epoch   BIGINT GENERATED ALWAYS AS
         (EXTRACT(EPOCH FROM (handled_at AT TIME ZONE 'UTC'))::bigint) STORED
 );
-CREATE INDEX ng_notify_requests_pending_idx ON ng_notify_requests (id)
+CREATE INDEX IF NOT EXISTS ng_notify_requests_pending_idx ON ng_notify_requests (id)
     WHERE handled_at IS NULL;
