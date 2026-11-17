@@ -125,6 +125,24 @@ impl Pipeline {
     fn alert_count(&self, kind: EventType) -> usize {
         self.alerts.iter().filter(|k| **k == kind).count()
     }
+
+    /// [`observe`](Self::observe), with the state machine told what the
+    /// gateway tracker believes, which is how `daemon.rs` now calls it.
+    async fn observe_knowing_the_gateway(
+        &mut self,
+        db: &common::TestDb,
+        observation: &Observation,
+    ) {
+        if self.dedup.admit(observation) {
+            let effects = self
+                .manager
+                .observe_with_gateway(observation, self.analyzers.gateway());
+            self.apply(db, &effects).await;
+        }
+        let alerts = self.analyzers.observe(observation);
+        self.record_alerts(db, alerts).await;
+        self.drain_reclassifications(db).await;
+    }
 }
 
 fn base() -> Timestamp {
@@ -841,4 +859,93 @@ async fn the_analyzers_never_write_a_row_per_packet_either() {
         security > 0,
         "half an hour of attack must produce something"
     );
+}
+
+#[tokio::test]
+async fn a_gateway_proxy_arping_for_a_vip_keeps_its_address_and_history_and_the_node_holds_both() {
+    // Issue #12, end to end: MetalLB's node answers for its own address and
+    // for the VIP, and the gateway answers for the VIP across the VLANs. Two
+    // minutes of it.
+    use netgraspd::capture::fixtures::lan;
+    let Some(db) = common::test_db().await else {
+        return;
+    };
+    let mut pipeline = Pipeline::new(SecurityConfig {
+        gateway_ip: lan::GATEWAY_IP.to_string(),
+        gateway_mac: MacAddr(lan::GATEWAY).to_string(),
+        ..SecurityConfig::default()
+    });
+    // Own addresses on even seconds and the VIP on odd ones: the deduplicator
+    // keeps one frame per MAC, kind and second, as it does on the wire.
+    for second in 0..120i64 {
+        let frames = if second % 2 == 0 {
+            [
+                lan::arp_reply(lan::GATEWAY, lan::GATEWAY_IP, lan::NODE, lan::NODE_IP),
+                lan::arp_reply(lan::NODE, lan::NODE_IP, lan::MACBOOK, lan::MACBOOK_IP),
+            ]
+        } else {
+            [
+                lan::arp_reply(lan::NODE, lan::VIP, lan::MACBOOK, lan::MACBOOK_IP),
+                lan::arp_reply(lan::GATEWAY, lan::VIP, lan::MACBOOK, lan::MACBOOK_IP),
+            ]
+        };
+        for frame in frames {
+            let observation = arp::parse_frame(&frame, "eth0", at(second)).expect("parsed");
+            pipeline
+                .observe_knowing_the_gateway(&db, &observation)
+                .await;
+        }
+    }
+    pipeline.flush(&db).await;
+
+    let gateway_history = db
+        .scalar(
+            "SELECT count(*) FROM ng_ip_history h JOIN ng_devices d ON d.id = h.device_id \
+             WHERE d.mac = '18:fd:74:39:e5:23'",
+        )
+        .await;
+    assert_eq!(
+        gateway_history, 1,
+        "the gateway's history is its own address"
+    );
+    let gateway_changes = db
+        .scalar(
+            "SELECT count(*) FROM ng_events e JOIN ng_devices d ON d.id = e.device_id \
+             WHERE d.mac = '18:fd:74:39:e5:23' AND e.event_type = 'ip_changed'",
+        )
+        .await;
+    assert_eq!(gateway_changes, 0, "the gateway did not move");
+    let gateway_ip = db
+        .scalar(
+            "SELECT count(*) FROM ng_devices \
+             WHERE mac = '18:fd:74:39:e5:23' AND last_ip = '10.20.0.1'",
+        )
+        .await;
+    assert_eq!(gateway_ip, 1);
+
+    let node_history = db
+        .scalar(
+            "SELECT count(*) FROM ng_ip_history h JOIN ng_devices d ON d.id = h.device_id \
+             WHERE d.mac = '9c:76:0e:30:aa:b0'",
+        )
+        .await;
+    assert_eq!(node_history, 2, "the node holds its address and the VIP");
+    let node_changes = db
+        .scalar(
+            "SELECT count(*) FROM ng_events e JOIN ng_devices d ON d.id = e.device_id \
+             WHERE d.mac = '9c:76:0e:30:aa:b0' AND e.event_type = 'ip_changed'",
+        )
+        .await;
+    assert!(
+        node_changes <= 1,
+        "{node_changes} ip_changed for a node holding two addresses"
+    );
+    for wire in [EventType::IpConflict, EventType::ArpSpoof] {
+        assert_eq!(
+            pipeline.alert_count(wire),
+            0,
+            "{wire} fired: {:?}",
+            pipeline.alerts
+        );
+    }
 }

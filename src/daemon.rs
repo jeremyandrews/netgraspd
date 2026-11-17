@@ -379,7 +379,11 @@ pub async fn run(
                 if dedup.admit(&observation) {
                     summary.observations += 1;
 
+                    // The gateway answering for somebody else's address is
+                    // not evidence of what the gateway is called.
+                    let proxied = analyzers.gateway().proxy_arp_for(&observation).is_some();
                     if let (Some(resolver), Some(ip)) = (resolver.as_ref(), observation.ip)
+                        && !proxied
                         && ip.is_ipv4()
                         && asked_for_rdns.insert(ip.to_string())
                     {
@@ -392,7 +396,7 @@ pub async fn run(
                     }
 
                     registry.device_seen(observation.mac, observation.observed_at);
-                    let effects = manager.observe(&observation);
+                    let effects = manager.observe_with_gateway(&observation, analyzers.gateway());
                     let (events, people) = apply_and_track(
                         &db, &mut persister, &bus, &mut manager, &mut registry, &effects,
                     ).await;

@@ -307,32 +307,32 @@ fn device_type_candidates(input: &ClassifyInput<'_>) -> Vec<(String, f64, String
         ));
     }
 
-    for urn in values(input.signals, SignalKind::SsdpDeviceType) {
+    // Within one rank the table decides, never the order the device last
+    // confirmed its signals in; see `by_table`.
+    for (index, urn) in by_table(input.signals, SignalKind::SsdpDeviceType, |urn| {
         let lower = urn.to_ascii_lowercase();
-        if let Some((_, device_type)) = SSDP_DEVICE_TYPES
+        SSDP_DEVICE_TYPES
             .iter()
-            .find(|(fragment, _)| lower.contains(fragment))
-        {
-            out.push((
-                (*device_type).to_string(),
-                CONF_SSDP_URN,
-                format!("SSDP device type {urn}"),
-            ));
-        }
+            .position(|(fragment, _)| lower.contains(fragment))
+    }) {
+        out.push((
+            SSDP_DEVICE_TYPES[index].1.to_string(),
+            CONF_SSDP_URN,
+            format!("SSDP device type {urn}"),
+        ));
     }
 
-    for service in values(input.signals, SignalKind::MdnsService) {
+    for (index, service) in by_table(input.signals, SignalKind::MdnsService, |service| {
         let lower = service.to_ascii_lowercase();
-        if let Some((_, device_type)) = MDNS_SERVICES
+        MDNS_SERVICES
             .iter()
-            .find(|(name, _)| lower.starts_with(name))
-        {
-            out.push((
-                (*device_type).to_string(),
-                CONF_MDNS_SERVICE,
-                format!("mDNS service {service}"),
-            ));
-        }
+            .position(|(name, _)| lower.starts_with(name))
+    }) {
+        out.push((
+            MDNS_SERVICES[index].1.to_string(),
+            CONF_MDNS_SERVICE,
+            format!("mDNS service {service}"),
+        ));
     }
 
     for list in values(input.signals, SignalKind::DhcpFingerprint) {
@@ -356,14 +356,14 @@ fn device_type_candidates(input: &ClassifyInput<'_>) -> Vec<(String, f64, String
         (SignalKind::MdnsModel, "mDNS model"),
         (SignalKind::SsdpServer, "SSDP server"),
     ] {
-        for text in values(input.signals, kind) {
-            if let Some(device_type) = match_fragment(text, &TEXT_DEVICE_TYPES) {
-                out.push((
-                    device_type.to_string(),
-                    CONF_TEXT,
-                    format!("{label} {text}"),
-                ));
-            }
+        for (index, text) in by_table(input.signals, kind, |text| {
+            fragment_index(text, &TEXT_DEVICE_TYPES)
+        }) {
+            out.push((
+                TEXT_DEVICE_TYPES[index].1.to_string(),
+                CONF_TEXT,
+                format!("{label} {text}"),
+            ));
         }
     }
 
@@ -418,10 +418,12 @@ fn os_family(input: &ClassifyInput<'_>) -> Option<String> {
         SignalKind::DhcpVendorClass,
         SignalKind::SsdpServer,
     ] {
-        for text in values(input.signals, kind) {
-            if let Some(os) = match_fragment(text, &TEXT_OS) {
-                return Some(os.to_string());
-            }
+        if let Some((index, _)) =
+            by_table(input.signals, kind, |text| fragment_index(text, &TEXT_OS))
+                .into_iter()
+                .next()
+        {
+            return Some(TEXT_OS[index].1.to_string());
         }
     }
     // A workgroup is a Windows networking concept, but Samba speaks it too, so
@@ -444,13 +446,42 @@ fn values(signals: &[Signal], kind: SignalKind) -> impl Iterator<Item = &str> {
         .filter(|v| !v.is_empty())
 }
 
-/// First table entry whose fragment appears in the text, case-insensitively.
-fn match_fragment<'t>(text: &str, table: &'t [(&'t str, &'t str)]) -> Option<&'t str> {
+/// Values of one signal kind that a table recognises, in the table's order.
+///
+/// Each value is paired with the index of the first table entry it matches,
+/// and the pairs are sorted by that index and then by the value. **The order
+/// the signals are stored in plays no part.** Signals are kept most recently
+/// confirmed first, and a device that advertises several services re-announces
+/// them one at a time, so reading them in stored order made the device type
+/// whichever service spoke last: an iMac advertising AirPlay and AFP was a
+/// media player and a NAS by turns, every hour, and each turn was an
+/// `identity_change` event. The tables are ordered most specific first, which
+/// is the precedence they were always documented to have.
+fn by_table(
+    signals: &[Signal],
+    kind: SignalKind,
+    index_of: impl Fn(&str) -> Option<usize>,
+) -> Vec<(usize, &str)> {
+    let mut hits: Vec<(usize, &str)> = values(signals, kind)
+        .filter_map(|value| index_of(value).map(|index| (index, value)))
+        .collect();
+    hits.sort_unstable();
+    hits.dedup();
+    hits
+}
+
+/// Index of the first table entry whose fragment appears in the text,
+/// case-insensitively.
+fn fragment_index(text: &str, table: &[(&str, &str)]) -> Option<usize> {
     let lower = text.to_ascii_lowercase();
     table
         .iter()
-        .find(|(fragment, _)| lower.contains(fragment))
-        .map(|(_, value)| *value)
+        .position(|(fragment, _)| lower.contains(fragment))
+}
+
+/// First table entry whose fragment appears in the text, case-insensitively.
+fn match_fragment<'t>(text: &str, table: &'t [(&'t str, &'t str)]) -> Option<&'t str> {
+    fragment_index(text, table).map(|index| table[index].1)
 }
 
 /// Case-insensitive substring test.
@@ -483,6 +514,47 @@ mod tests {
 
     fn signal(kind: SignalKind, value: &str) -> Signal {
         Signal::new(kind, value)
+    }
+
+    #[test]
+    fn the_device_type_does_not_depend_on_which_service_was_announced_last() {
+        // An iMac on the home LAN advertises AirPlay and AFP. Its signals are
+        // kept most recently confirmed first, and each re-announcement moves
+        // one service to the front. On 2026-11-17 that was 151 identity_change
+        // events in a week for this one machine, media_player and nas taking
+        // turns every hour. The table says which service decides; the order
+        // the device last said them in must not.
+        let airplay = signal(SignalKind::MdnsService, "_airplay._tcp");
+        let afp = signal(SignalKind::MdnsService, "_afpovertcp._tcp");
+        let smb = signal(SignalKind::MdnsService, "_smb._tcp");
+        let one = classify_with(&[airplay.clone(), afp.clone(), smb.clone()], None);
+        let two = classify_with(&[afp.clone(), smb.clone(), airplay.clone()], None);
+        let three = classify_with(&[smb, airplay, afp], None);
+        assert_eq!(one.device_type.as_deref(), Some("media_player"));
+        assert_eq!(two.device_type, one.device_type, "{two:?}");
+        assert_eq!(three.device_type, one.device_type, "{three:?}");
+        assert_eq!(two.reason, one.reason);
+    }
+
+    #[test]
+    fn the_device_type_does_not_depend_on_the_order_of_two_ssdp_urns_or_models() {
+        let renderer = signal(
+            SignalKind::SsdpDeviceType,
+            "urn:schemas-upnp-org:device:MediaRenderer:1",
+        );
+        let server = signal(
+            SignalKind::SsdpDeviceType,
+            "urn:schemas-upnp-org:device:MediaServer:1",
+        );
+        let a = classify_with(&[renderer.clone(), server.clone()], None);
+        let b = classify_with(&[server, renderer], None);
+        assert_eq!(a.device_type, b.device_type, "{a:?} {b:?}");
+
+        let tv = signal(SignalKind::MdnsModel, "AppleTV14,1");
+        let mac = signal(SignalKind::MdnsModel, "iMac21,1");
+        let a = classify_with(&[tv.clone(), mac.clone()], None);
+        let b = classify_with(&[mac, tv], None);
+        assert_eq!(a.device_type, b.device_type, "{a:?} {b:?}");
     }
 
     #[test]

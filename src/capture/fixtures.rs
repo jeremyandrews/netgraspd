@@ -198,6 +198,7 @@ pub fn all() -> Vec<(&'static str, Vec<u8>)> {
 }
 
 pub mod build;
+pub mod lan;
 
 #[cfg(test)]
 mod tests {
