@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde_json::Value as Json;
 use tokio::time::Instant;
 
@@ -129,13 +130,145 @@ pub trait Enricher: Send + Sync {
     async fn enrich(&self, devices: &[DeviceSnapshot]) -> Result<Vec<Enrichment>>;
 }
 
+/// Every enricher this build can run, by the name it reports.
+///
+/// `ng_enrichment_status` carries a row for each of these whether it is
+/// configured or not, so the web side can say "not configured" rather than
+/// guess from an absent row. Reverse DNS is configured under `identity` rather
+/// than `enrichment`, and is listed here because it is the other thing that
+/// asks somebody about a device.
+pub const KNOWN_ENRICHERS: &[&str] = &[unifi::SOURCE, REVERSE_DNS];
+
+/// The name reverse DNS reports under in [`KNOWN_ENRICHERS`].
+pub const REVERSE_DNS: &str = "reverse_dns";
+
+/// What an enricher is doing, as `ng_enrichment_status.state` spells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrichmentState {
+    /// Switched off in the configuration.
+    NotConfigured,
+    /// Configured and not asked yet.
+    Starting,
+    /// The last attempt succeeded.
+    Ok,
+    /// The last attempt failed.
+    Failing,
+}
+
+impl EnrichmentState {
+    /// The column value.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            EnrichmentState::NotConfigured => "not_configured",
+            EnrichmentState::Starting => "starting",
+            EnrichmentState::Ok => "ok",
+            EnrichmentState::Failing => "failing",
+        }
+    }
+}
+
+/// How one enricher has fared since the daemon started.
+///
+/// One row of `ng_enrichment_status`. Counts are since start, not lifetime: a
+/// restart is a fresh attempt, and an operator reading "3 of 3 failed" wants to
+/// know about the controller as it is now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnricherStatus {
+    /// The enricher's name, one of [`KNOWN_ENRICHERS`] for anything this build
+    /// ships.
+    pub name: String,
+    /// Whether the configuration switches it on.
+    pub configured: bool,
+    /// Attempts made.
+    pub polls: u64,
+    /// Attempts that failed.
+    pub failures: u64,
+    /// When an attempt last succeeded.
+    pub last_success_at: Option<DateTime<Utc>>,
+    /// When an attempt last failed.
+    pub last_failure_at: Option<DateTime<Utc>>,
+    /// Why the most recent failure failed. Kept after a later success, as
+    /// history; [`EnricherStatus::state`] is what says whether it still applies.
+    pub last_error: Option<String>,
+    /// Whether the most recent attempt succeeded, or `None` before the first.
+    pub last_ok: Option<bool>,
+}
+
+impl EnricherStatus {
+    /// A row for an enricher the configuration leaves off.
+    #[must_use]
+    pub fn not_configured(name: &str) -> Self {
+        EnricherStatus {
+            name: name.to_string(),
+            configured: false,
+            ..EnricherStatus::starting(name)
+        }
+    }
+
+    /// A row for a configured enricher that has not been asked anything yet.
+    #[must_use]
+    pub fn starting(name: &str) -> Self {
+        EnricherStatus {
+            name: name.to_string(),
+            configured: true,
+            polls: 0,
+            failures: 0,
+            last_success_at: None,
+            last_failure_at: None,
+            last_error: None,
+            last_ok: None,
+        }
+    }
+
+    /// Records one attempt that succeeded.
+    pub fn succeeded(&mut self, at: DateTime<Utc>) {
+        self.polls += 1;
+        self.last_success_at = Some(at);
+        self.last_ok = Some(true);
+    }
+
+    /// Records one attempt that failed, and why.
+    pub fn failed(&mut self, at: DateTime<Utc>, error: impl Into<String>) {
+        self.polls += 1;
+        self.failures += 1;
+        self.last_failure_at = Some(at);
+        self.last_error = Some(error.into());
+        self.last_ok = Some(false);
+    }
+
+    /// What it is doing, for `ng_enrichment_status.state`.
+    #[must_use]
+    pub fn state(&self) -> EnrichmentState {
+        if !self.configured {
+            return EnrichmentState::NotConfigured;
+        }
+        match self.last_ok {
+            None => EnrichmentState::Starting,
+            Some(true) => EnrichmentState::Ok,
+            Some(false) => EnrichmentState::Failing,
+        }
+    }
+}
+
+/// Completes a status list with a not-configured row for every known enricher
+/// it does not mention.
+#[must_use]
+pub fn with_unconfigured(mut statuses: Vec<EnricherStatus>) -> Vec<EnricherStatus> {
+    for name in KNOWN_ENRICHERS {
+        if !statuses.iter().any(|s| s.name == *name) {
+            statuses.push(EnricherStatus::not_configured(name));
+        }
+    }
+    statuses
+}
+
 /// One enricher plus when it is next due.
 struct Scheduled {
     enricher: Box<dyn Enricher>,
     interval: Duration,
     next_due: Instant,
-    polls: u64,
-    failures: u64,
+    status: EnricherStatus,
 }
 
 /// Runs every enabled enricher on its own cadence.
@@ -184,14 +317,14 @@ impl Orchestrator {
                     // polled at all; parking it a long way out costs nothing and
                     // keeps the schedule uniform.
                     .unwrap_or(Duration::from_secs(u64::from(u32::MAX)));
+                let status = EnricherStatus::starting(enricher.name());
                 Scheduled {
                     enricher,
                     interval,
                     // Due immediately, so a fresh start places every device
                     // rather than waiting out a poll interval first.
                     next_due: now,
-                    polls: 0,
-                    failures: 0,
+                    status,
                 }
             })
             .collect();
@@ -215,7 +348,22 @@ impl Orchestrator {
     pub fn counters(&self) -> Vec<(&str, u64, u64)> {
         self.enrichers
             .iter()
-            .map(|s| (s.enricher.name(), s.polls, s.failures))
+            .map(|s| (s.enricher.name(), s.status.polls, s.status.failures))
+            .collect()
+    }
+
+    /// How each enricher has fared, for `ng_enrichment_status`.
+    ///
+    /// An orchestrator switched off as a whole (`enrichment.enabled = false`)
+    /// reports what it holds as not configured: it will never ask them anything.
+    #[must_use]
+    pub fn statuses(&self) -> Vec<EnricherStatus> {
+        self.enrichers
+            .iter()
+            .map(|s| EnricherStatus {
+                configured: self.enabled,
+                ..s.status.clone()
+            })
             .collect()
     }
 
@@ -234,7 +382,6 @@ impl Orchestrator {
             if now < scheduled.next_due {
                 continue;
             }
-            scheduled.polls += 1;
             let started = Instant::now();
             let result = scheduled.enricher.enrich(devices).await;
             // Scheduled from when the poll *finished*, not from when it started.
@@ -250,6 +397,7 @@ impl Orchestrator {
             scheduled.next_due = now + started.elapsed() + scheduled.interval;
             match result {
                 Ok(enrichments) => {
+                    scheduled.status.succeeded(Utc::now());
                     tracing::debug!(
                         enricher = scheduled.enricher.name(),
                         found = enrichments.len(),
@@ -258,13 +406,13 @@ impl Orchestrator {
                     out.extend(enrichments.into_iter().filter(|e| !e.is_empty()));
                 }
                 Err(err) => {
-                    scheduled.failures += 1;
+                    scheduled.status.failed(Utc::now(), format!("{err:#}"));
                     // Deliberately not fatal, and deliberately not a reason to
                     // clear anything: a controller that is rebooting must not
                     // make every device's location vanish.
                     tracing::warn!(
                         enricher = scheduled.enricher.name(),
-                        failures = scheduled.failures,
+                        failures = scheduled.status.failures,
                         %err,
                         "enrichment poll failed; keeping the last known values"
                     );
@@ -553,5 +701,68 @@ mod tests {
     fn an_enrichment_with_only_an_ap_is_not_empty() {
         assert!(Enrichment::new(mac("3c:22:fb:00:00:01")).is_empty());
         assert!(!placed("3c:22:fb:00:00:01", "Kitchen AP").is_empty());
+    }
+
+    #[test]
+    fn an_enricher_status_moves_from_starting_to_ok_to_failing_and_back() {
+        let t = chrono::Utc::now();
+        let mut status = EnricherStatus::starting("unifi");
+        assert_eq!(status.state(), EnrichmentState::Starting);
+        status.succeeded(t);
+        assert_eq!(status.state(), EnrichmentState::Ok);
+        status.failed(t, "timed out");
+        assert_eq!(status.state(), EnrichmentState::Failing);
+        assert_eq!((status.polls, status.failures), (2, 1));
+        status.succeeded(t);
+        assert_eq!(status.state(), EnrichmentState::Ok);
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("timed out"),
+            "the last error is kept as history"
+        );
+    }
+
+    #[test]
+    fn a_status_list_is_completed_with_every_known_enricher() {
+        let statuses = with_unconfigured(vec![EnricherStatus::starting("unifi")]);
+        let names: Vec<&str> = statuses.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["unifi", REVERSE_DNS]);
+        assert_eq!(statuses[0].state(), EnrichmentState::Starting);
+        assert_eq!(statuses[1].state(), EnrichmentState::NotConfigured);
+    }
+
+    #[tokio::test]
+    async fn an_orchestrator_switched_off_reports_its_enrichers_as_not_configured() {
+        let o = Orchestrator::with_enrichers(
+            false,
+            vec![Box::new(Scripted::new(
+                "unifi",
+                Some(Duration::from_secs(30)),
+            ))],
+        );
+        let statuses = o.statuses();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].state(), EnrichmentState::NotConfigured);
+    }
+
+    #[tokio::test]
+    async fn a_failed_poll_records_the_error_the_enricher_gave() {
+        let scripted = Scripted::from_script(
+            "unifi",
+            Some(Duration::from_secs(30)),
+            vec![Err("controller refused the login".into())],
+        );
+        let mut o = Orchestrator::with_enrichers(true, vec![Box::new(scripted)]);
+        let _ = o.poll_due(Instant::now(), &[]).await;
+        let status = &o.statuses()[0];
+        assert_eq!(status.state(), EnrichmentState::Failing);
+        assert!(
+            status
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("refused the login")),
+            "{status:?}"
+        );
+        assert_eq!(o.counters()[0], ("unifi", 1, 1), "the stats counters agree");
     }
 }

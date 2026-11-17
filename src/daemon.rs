@@ -130,6 +130,25 @@ pub async fn run(
     db.preflight().await?;
     install_fingerprints(config);
 
+    // The zone every day boundary over these tables is measured in, published
+    // for the web side. A configured zone Postgres does not know is refused
+    // here, at startup, rather than discovered as a "today" that never matches.
+    let daemon_status = {
+        let client = db.client().await?;
+        let timezone =
+            crate::db::status::resolve_timezone(&client, config.timezone.as_deref()).await?;
+        tracing::info!(
+            timezone = %timezone.name,
+            source = timezone.source.as_str(),
+            "publishing the time zone day boundaries are measured in"
+        );
+        crate::db::status::DaemonStatus {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            timezone,
+            started_at: Utc::now(),
+        }
+    };
+
     // Rehydrate. A restart must not re-announce the whole network.
     let (mut manager, mut persister, mut registry, device_count) = {
         let client = db.client().await?;
@@ -250,11 +269,18 @@ pub async fn run(
     // Reverse DNS answers arrive out of band and re-enter the state machine as
     // ordinary signals.
     let (signal_tx, mut signal_rx) = mpsc::channel::<(MacAddr, Signal, DateTime<Utc>)>(256);
+    // A resolver that could not be built is still a configured enricher, and
+    // one that is failing: `ng_enrichment_status` says so rather than "off".
+    let mut rdns_unbuilt: Option<crate::enrich::EnricherStatus> = None;
     let resolver = if config.identity.reverse_dns {
         match ReverseResolver::from_system(config.identity.reverse_dns_ttl.get()) {
             Ok(resolver) => Some(resolver),
             Err(err) => {
                 tracing::warn!(%err, "reverse DNS is enabled but no resolver could be built");
+                let mut status =
+                    crate::enrich::EnricherStatus::starting(crate::enrich::REVERSE_DNS);
+                status.failed(Utc::now(), format!("no resolver could be built: {err:#}"));
+                rdns_unbuilt = Some(status);
                 None
             }
         }
@@ -296,6 +322,7 @@ pub async fn run(
         .into_iter()
         .map(|(name, polls, failures)| (name.to_string(), polls, failures))
         .collect();
+    let mut enricher_statuses = enrichers.statuses();
     let enrich_handle = spawn_enricher(enrichers, snapshot_rx, enriched_tx);
 
     let mut dedup = ObservationDedup::new(
@@ -335,6 +362,18 @@ pub async fn run(
     let local_offset = *chrono::Local::now().offset();
     let mut last_maintenance: Option<DateTime<Utc>> = None;
     let started_at = Utc::now();
+    let enrichment_status = |statuses: &[crate::enrich::EnricherStatus]| {
+        let mut all = statuses.to_vec();
+        if let Some(status) = resolver
+            .as_ref()
+            .map(ReverseResolver::status)
+            .or_else(|| rdns_unbuilt.clone())
+        {
+            all.push(status);
+        }
+        crate::enrich::with_unconfigured(all)
+    };
+    publish_status(&db, &daemon_status, &enrichment_status(&enricher_statuses)).await;
 
     loop {
         tokio::select! {
@@ -452,6 +491,7 @@ pub async fn run(
             enriched = enriched_rx.recv() => {
                 if let Some(enriched) = enriched {
                     enricher_counters = enriched.counters;
+                    enricher_statuses = enriched.statuses;
                     if !enriched.enrichments.is_empty() {
                         let mut sinks = Sinks {
                             db: &db,
@@ -484,6 +524,7 @@ pub async fn run(
                     config, started_at, &summary, &manager, &dedup, &enricher_counters,
                     &visibility(&tally, &this_host, analyzers.gateway(), sampler.as_ref()),
                 );
+                publish_status(&db, &daemon_status, &enrichment_status(&enricher_statuses)).await;
             }
 
             // A frame copy for the unknown-device sample. The capture host's
@@ -543,6 +584,7 @@ pub async fn run(
         &enricher_counters,
         &visibility(&tally, &this_host, analyzers.gateway(), sampler.as_ref()),
     );
+    publish_status(&db, &daemon_status, &enrichment_status(&enricher_statuses)).await;
     summary.devices = manager.len();
     summary.duplicates = dedup.duplicates_suppressed();
 
@@ -780,6 +822,8 @@ struct Enriched {
     /// Poll and failure counts per enricher, carried along because the
     /// orchestrator lives in the task and `netgraspd stats` needs them here.
     counters: Vec<(String, u64, u64)>,
+    /// The same, with times and the last error, for `ng_enrichment_status`.
+    statuses: Vec<crate::enrich::EnricherStatus>,
 }
 
 /// Owns the orchestrator and polls it off the main loop.
@@ -800,12 +844,14 @@ fn spawn_enricher(
                 .into_iter()
                 .map(|(name, polls, failures)| (name.to_string(), polls, failures))
                 .collect();
+            let statuses = enrichers.statuses();
             // Nothing found is still worth sending: the counters are how
             // `netgraspd stats` shows an enricher that is failing every time.
             if results
                 .send(Enriched {
                     enrichments,
                     counters,
+                    statuses,
                 })
                 .await
                 .is_err()
@@ -832,6 +878,33 @@ async fn run_maintenance(db: &Db, config: &crate::config::MaintenanceConfig) {
     match maintenance::run(&client, config, Utc::now()).await {
         Ok(report) => tracing::info!(summary = %report.summary(), "nightly maintenance complete"),
         Err(err) => tracing::error!(%err, "nightly maintenance failed"),
+    }
+}
+
+/// Writes `ng_daemon_status` and `ng_enrichment_status` for the web side.
+///
+/// The database half of [`write_status`], on the same tick. A failure is a
+/// warning: the rows going stale is exactly how a reader learns the daemon is
+/// not keeping them, and a daemon that stops watching the network because it
+/// could not write a heartbeat is the wrong trade.
+async fn publish_status(
+    db: &Db,
+    daemon: &crate::db::status::DaemonStatus,
+    enrichers: &[crate::enrich::EnricherStatus],
+) {
+    let client = match db.client().await {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::warn!(%err, "could not publish the daemon status: no database connection");
+            return;
+        }
+    };
+    let now = Utc::now();
+    if let Err(err) = crate::db::status::write_daemon_status(&client, daemon, now).await {
+        tracing::warn!(%err, "could not write ng_daemon_status");
+    }
+    if let Err(err) = crate::db::status::write_enrichment_status(&client, enrichers, now).await {
+        tracing::warn!(%err, "could not write ng_enrichment_status");
     }
 }
 

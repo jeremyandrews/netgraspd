@@ -9,6 +9,13 @@
 #
 # Durations are 30m, 2h, 1d, 90s, or a bare integer meaning seconds.
 
+# The household's time zone, as an IANA name. Published in
+# ng_daemon_status.timezone, which is what "today" means on the web side
+# whatever TimeZone the reading session carries. Unset, the daemon publishes the
+# database's own TimeZone. A name Postgres does not know stops the daemon at
+# startup. A top-level key, so it must stay above the first [section].
+# timezone = "Europe/Rome"
+
 [database]
 url = "postgres://netgrasp:netgrasp@localhost:5432/netgrasp"
 # The daemon is not connection-hungry: the flush task and the CLI readers are

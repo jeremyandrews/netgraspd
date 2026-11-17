@@ -15,6 +15,7 @@
 
 pub mod queries;
 pub mod schema;
+pub mod status;
 
 use anyhow::{Context, Result};
 use deadpool_postgres::{Config as PoolConfig, ManagerConfig, Pool, RecyclingMethod, Runtime};
@@ -105,6 +106,23 @@ impl Db {
     /// created by the plugin rather than by the daemon, or when a migration
     /// fails.
     pub async fn migrate(url: &str) -> Result<()> {
+        Self::run_migrations(url, None).await
+    }
+
+    /// Applies migrations up to and including `version`, and no further.
+    ///
+    /// For proving an upgrade: a database left exactly where an earlier release
+    /// left it, then [`Db::migrate`] over the top. The daemon itself always
+    /// migrates to the latest.
+    ///
+    /// # Errors
+    ///
+    /// As [`Db::migrate`].
+    pub async fn migrate_to(url: &str, version: u32) -> Result<()> {
+        Self::run_migrations(url, Some(version)).await
+    }
+
+    async fn run_migrations(url: &str, target: Option<u32>) -> Result<()> {
         let (mut client, connection) = tokio_postgres::connect(url, NoTls)
             .await
             .context("could not connect to Postgres to run migrations")?;
@@ -116,7 +134,13 @@ impl Db {
 
         schema::check_daemon_migrated_first(&client).await?;
 
-        let report = embedded::migrations::runner()
+        let mut runner = embedded::migrations::runner();
+        if let Some(version) = target {
+            let version = i32::try_from(version)
+                .with_context(|| format!("migration version {version} is out of range"))?;
+            runner = runner.set_target(refinery::Target::Version(version));
+        }
+        let report = runner
             .run_async(&mut client)
             .await
             .context("migration failed")?;

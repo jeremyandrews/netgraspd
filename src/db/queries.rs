@@ -213,6 +213,10 @@ pub struct NewEvent {
     pub details: Json,
     /// Whether a notification was delivered. False during a learning window.
     pub notified: bool,
+    /// The person a `person_*` event is about, as their Item id; `None` on
+    /// every other event. Lands in `ng_events.person_item_id`, so the web side
+    /// can answer "who came home today" without reading `details`.
+    pub person_item_id: Option<String>,
 }
 
 /// One row of `ng_events`, joined with its device's display name.
@@ -652,10 +656,16 @@ pub async fn upsert_ip(
 ///
 /// Returns an error when the insert fails.
 pub async fn insert_event(client: &Client, event: &NewEvent) -> Result<i64> {
+    // An id that is not UUID-shaped is recorded as null rather than allowed to
+    // fail the cast: losing the column is better than losing the event. The
+    // test is the one V4's backfill applies to old rows.
     let row = client
         .query_one(
-            "INSERT INTO ng_events (device_id, event_type, \"timestamp\", details, notified, sync_state)
-             VALUES ($1, $2, $3, $4, $5, 'dirty')
+            "INSERT INTO ng_events (device_id, event_type, \"timestamp\", details, notified, sync_state,
+                                    person_item_id)
+             VALUES ($1, $2, $3, $4, $5, 'dirty',
+                     CASE WHEN $6::text ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                          THEN ($6::text)::uuid END)
              RETURNING id",
             &[
                 &event.device_id,
@@ -663,6 +673,7 @@ pub async fn insert_event(client: &Client, event: &NewEvent) -> Result<i64> {
                 &event.timestamp,
                 &event.details,
                 &event.notified,
+                &event.person_item_id,
             ],
         )
         .await

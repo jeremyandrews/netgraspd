@@ -695,7 +695,7 @@ pub fn build_tapped_sources(
 
 /// A capture source that is not implemented yet.
 ///
-/// Every protocol in [`SOURCES`] is now real. This remains for the next one that
+/// Every protocol in `SOURCES` is now real. This remains for the next one that
 /// is not: the `CaptureSource` trait leaves a slot for passive Bluetooth
 /// scanning, and when that arrives it can be nameable in config and present in
 /// the startup path before it can capture anything.

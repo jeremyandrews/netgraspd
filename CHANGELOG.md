@@ -24,6 +24,13 @@ shipped rather than a release that was tagged at the time.
 
 ### Added
 
+- **Schema V4, additive only**, so the web side reads facts the daemon keeps true instead of reconstructing them. Nothing V1 to V3 created is renamed, dropped or retyped.
+  - `ng_people.last_arrived_at_epoch` and `last_departed_at_epoch`, the generated epoch twins V3 gave every other table and left off this one.
+  - `ng_events.person_item_id`, the person a `person_*` event is about, null on every other event. The migration backfills it from `details` for person events already recorded, and leaves a value that is not a UUID null.
+  - `ng_enrichment_status`, one row per enricher (`unifi`, `reverse_dns`), configured or not, with `state` (`not_configured`, `starting`, `ok`, `failing`), counts since start, the last success and failure times and the last error. Rewritten on every runtime status tick.
+  - `ng_daemon_status`, one row: version, start time, a heartbeat, and the time zone every day boundary is measured in.
+- **`timezone`**, a top-level setting naming the household's IANA zone. It is published in `ng_daemon_status.timezone` and is the one owner of what "today" means: readers measure a day as `ts AT TIME ZONE` that zone, not in their session's `TimeZone`. Unset, the database's own `TimeZone` is published. A zone Postgres does not know stops the daemon at startup.
+- `Db::migrate_to`, which migrates to a given version and no further, for proving an upgrade from an earlier schema.
 - **A profile for a network you do not own**, `netgrasp.foreign.toml.example`. It is an ordinary configuration file, not a mode. Notifications, enrichment and reverse DNS are off; all six sources are on; events and rollup are kept for one day; the unknown-device sample is on. It names its own database, and its status file and sample are relative paths an ordinary user can write. The image ships it beside the home example ([#18](https://github.com/jeremyandrews/netgraspd/pull/18)).
 - **The visibility report**, in the status file and in `netgraspd stats`. For each interface and each source it gives frames delivered, distinct source MACs (at most 4096 kept per set, then reported as "at least"), and how long the interface has been listening. It also gives the gateway the daemon believes in and where that belief came from. Each interface then gets one plain verdict, so an isolated guest network ("capture is working: 1 sender seen (the gateway), consistent with client isolation") no longer looks like broken capture ("nothing received on en0 in 10m: capture may be broken"). The new status fields are defaulted on read, so an older status file still parses ([#18](https://github.com/jeremyandrews/netgraspd/pull/18)).
 - **The unknown-device sample**, `[capture.unknown_sample]`, off by default. It keeps the first frames from each device the identifier could not name in one pcap file. These are broadcast and multicast frames only: a frame unicast to the capture host, which non-promiscuous capture also delivers, is refused, after the first home LAN run sampled 128 of them out of 150. It is bounded by frames per device, by devices and by total bytes, and each limit is logged once. Frames are held only while a device has `settle` (ten minutes, because real devices were named four to seven minutes after first sight) to be named, and a named device is never written ([#18](https://github.com/jeremyandrews/netgraspd/pull/18)).
@@ -42,6 +49,8 @@ shipped rather than a release that was tagged at the time.
 
 ### Documentation
 
+- README: what V4 adds for the web side, and what "today" means. ARCHITECTURE: the two status tables, why day boundaries have one owner, and quiet hours' fixed offset as an open question.
+- Three rustdoc links that `cargo doc` with `-D warnings` rejected are fixed.
 - README: Running on a network you do not own ([#18](https://github.com/jeremyandrews/netgraspd/pull/18)).
 - README: Capturing on macOS, the 2026-11-14 run of all six sources on macOS as an ordinary user, and macOS resident memory ([#15](https://github.com/jeremyandrews/netgraspd/pull/15)).
 

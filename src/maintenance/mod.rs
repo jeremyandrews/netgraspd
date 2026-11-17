@@ -45,7 +45,7 @@ use crate::config::MaintenanceConfig;
 use crate::db::queries::Client;
 
 /// Every table the vacuum covers.
-const NG_TABLES: [&str; 7] = [
+const NG_TABLES: [&str; 9] = [
     "ng_devices",
     "ng_device_signals",
     "ng_presence",
@@ -53,6 +53,8 @@ const NG_TABLES: [&str; 7] = [
     "ng_ip_history",
     "ng_location_history",
     "ng_people",
+    "ng_daemon_status",
+    "ng_enrichment_status",
 ];
 
 /// What one maintenance run did.

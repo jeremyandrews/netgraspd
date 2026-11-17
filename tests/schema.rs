@@ -497,7 +497,8 @@ async fn an_empty_database_passes_the_plugin_first_check() {
         return;
     };
     db.execute(
-        "DROP TABLE IF EXISTS ng_people, ng_location_history, ng_ip_history, ng_events,
+        "DROP TABLE IF EXISTS ng_enrichment_status, ng_daemon_status,
+                              ng_people, ng_location_history, ng_ip_history, ng_events,
                               ng_presence, ng_device_signals, ng_devices,
                               refinery_schema_history CASCADE",
     )
@@ -534,10 +535,16 @@ async fn a_read_command_against_an_under_migrated_database_names_the_version() {
     // built this database shipped V2, this build ships V3, and `stats` answered
     // with `relation "ng_location_history" does not exist`. A read command runs
     // no migration, so nothing had ever checked.
+    // Back to V2: what V4 added, then what V3 added.
+    db.execute("DROP TABLE IF EXISTS ng_enrichment_status, ng_daemon_status CASCADE")
+        .await;
+    db.execute("ALTER TABLE ng_events DROP COLUMN IF EXISTS person_item_id")
+        .await;
     db.execute("DROP TABLE IF EXISTS ng_location_history, ng_people CASCADE")
         .await;
     db.execute("DELETE FROM refinery_schema_history WHERE version >= 3")
         .await;
+    let latest = format!("through V{}", netgraspd::db::embedded_max_version());
 
     let config = test_config();
     for (name, result) in [
@@ -551,7 +558,7 @@ async fn a_read_command_against_an_under_migrated_database_names_the_version() {
         let err = result.expect_err("an under-migrated database must be refused");
         let text = format!("{err:#}");
         assert!(text.contains("migrated to V2"), "{name}: {text}");
-        assert!(text.contains("through V3"), "{name}: {text}");
+        assert!(text.contains(&latest), "{name}: {text}");
         assert!(
             !text.contains("does not exist"),
             "{name} still leaked the raw catalog error: {text}"
@@ -604,7 +611,8 @@ async fn migrate_builds_the_schema_on_an_empty_database_and_maintain_does_not() 
         return;
     };
     db.execute(
-        "DROP TABLE IF EXISTS ng_people, ng_location_history, ng_ip_history, ng_events,
+        "DROP TABLE IF EXISTS ng_enrichment_status, ng_daemon_status,
+                              ng_people, ng_location_history, ng_ip_history, ng_events,
                               ng_presence, ng_device_signals, ng_devices,
                               refinery_schema_history CASCADE",
     )
@@ -645,7 +653,8 @@ async fn a_read_command_against_an_empty_database_names_the_command_that_fixes_i
         return;
     };
     db.execute(
-        "DROP TABLE IF EXISTS ng_people, ng_location_history, ng_ip_history, ng_events,
+        "DROP TABLE IF EXISTS ng_enrichment_status, ng_daemon_status,
+                              ng_people, ng_location_history, ng_ip_history, ng_events,
                               ng_presence, ng_device_signals, ng_devices,
                               refinery_schema_history CASCADE",
     )

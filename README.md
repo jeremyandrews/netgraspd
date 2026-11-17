@@ -141,6 +141,12 @@ have to agree on one thing, the `ng_` tables.
 |---|---|---|---|
 | 1.0.0 | 1.0.0 | version 3 (`V3__enrichment_location_people.sql`) | 0.102.0 or a later 0.x |
 
+Unreleased: `main` is at schema version 4
+(`V4__people_epochs_event_person_daemon_status.sql`), which only adds. A plugin
+built for version 3 keeps working against it, because it names the columns it
+reads and reads none of the new ones; it has not adopted them yet, and the
+paired release lands when it does.
+
 **The rule.** A daemon and a plugin pair when they are built for the same `ng_`
 schema version, which is the highest migration under `migrations/` here.
 This repository owns that schema and its migrations are the canonical DDL; the
@@ -368,7 +374,54 @@ Every `timestamptz` the plugin reads has a generated `bigint` twin named
 `<column>_epoch`, because the Trovato kernel's database host function decodes a
 fixed list of types and returns null for a `timestamptz`. They are
 `GENERATED ALWAYS ... STORED`, so nothing can write one out of step with its
-source and the `timestamptz` column stays canonical.
+source and the `timestamptz` column stays canonical. Since V4 that includes
+`ng_people.last_arrived_at_epoch` and `last_departed_at_epoch`, which V3 left
+out.
+
+### What V4 adds for the web side
+
+V4 is additive: two columns, two twins and two tables, and nothing V1 to V3
+created is renamed, dropped or retyped. Everything below is daemon owned.
+
+- **`ng_events.person_item_id`** (`uuid`, null on every event that is not
+  `person_arrived`, `person_departed` or `person_location_changed`). The person
+  a person event is about, so "who came home today" is one equality join to
+  `ng_people` rather than a dig through `details`. Not a foreign key: an event
+  outlives the person it names. The migration backfills it from
+  `details ->> 'person_item_id'` for every person event already recorded, and
+  leaves a value that is not a UUID null rather than failing the upgrade.
+- **`ng_daemon_status`**, one row: `version`, `timezone`, `timezone_source`
+  (`config` or `database`), `started_at` and `updated_at`, with epoch twins.
+  Rewritten every `runtime.status_interval`, so an `updated_at` that has stopped
+  moving means the daemon has stopped.
+- **`ng_enrichment_status`**, one row per enricher this build knows (`unifi`,
+  `reverse_dns`), configured or not: `configured`, `state` (`not_configured`,
+  `starting`, `ok`, `failing`), `polls` and `failures` since the daemon
+  started, `last_success_at`, `last_failure_at`, `last_error`, `updated_at`,
+  with epoch twins. This is how a device page can say why a device has no
+  location: UniFi is not configured, or it is failing and here is the error.
+  For reverse DNS a lookup that finds no PTR record counts as a success; a
+  timeout or an unreachable resolver is a failure.
+
+**What "today" means.** A day boundary over these tables is measured in
+`ng_daemon_status.timezone`, as `ts AT TIME ZONE <that zone>`, and never in the
+reading session's own `TimeZone`. The kernel's connections, a `psql` session and
+the daemon can each carry a different one; the published zone is the same for
+all of them. Set it with the top-level `timezone` key (for example
+`timezone = "Europe/Rome"`); unset, the daemon publishes the database's own
+`TimeZone` as its session sees it, so a database already set to the household's
+zone needs nothing. The daemon's own SQL never depends on a session zone: the
+nightly rollups bucket by UTC day.
+
+```sql
+-- Who arrived today, in the household's day.
+SELECT p.name, e.timestamp_epoch
+  FROM ng_events e
+  JOIN ng_people p ON p.item_id = e.person_item_id
+ CROSS JOIN ng_daemon_status s
+ WHERE e.event_type = 'person_arrived'
+   AND (e."timestamp" AT TIME ZONE s.timezone)::date = (now() AT TIME ZONE s.timezone)::date;
+```
 
 ### Backup and restore
 
@@ -467,6 +520,7 @@ The blocks this milestone adds:
 | `[[people]]` | a person and the MACs they own, for an install with no Trovato plugin |
 | `[maintenance]` | when the nightly jobs run, and how long presence and events are kept |
 | `[runtime]` | where the daemon publishes the counters `netgraspd stats` reads |
+| `timezone` | top-level key: the IANA zone published in `ng_daemon_status` for day boundaries |
 
 `[enrichment.unifi.locations]` is a TOML table, so it must come after every
 plain key in `[enrichment.unifi]`.

@@ -303,10 +303,14 @@ async fn scratch_database(name: &str, version: u32) -> Option<String> {
         .await
         .ok()?;
     tokio::spawn(connection);
+    // Two statements, not one batch: a multi-statement batch is one implicit
+    // transaction, and DROP DATABASE refuses to run inside one.
     client
-        .batch_execute(&format!(
-            "DROP DATABASE IF EXISTS {name} WITH (FORCE); CREATE DATABASE {name}"
-        ))
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+        .await
+        .expect("dropping a leftover scratch database");
+    client
+        .batch_execute(&format!("CREATE DATABASE {name}"))
         .await
         .expect("creating a scratch database");
     let (base, _) = admin.rsplit_once('/').expect("a URL with a database name");

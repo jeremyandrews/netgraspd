@@ -164,6 +164,7 @@ impl Persister {
                             // Delivery has not been attempted yet; the notifier
                             // flips this once it succeeds.
                             notified: false,
+                            person_item_id: event.person_item_id(),
                         },
                     )
                     .await

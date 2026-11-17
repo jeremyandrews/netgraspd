@@ -97,7 +97,8 @@ pub async fn test_db() -> Option<TestDb> {
         client
             .batch_execute(
                 "TRUNCATE ng_events, ng_ip_history, ng_presence, ng_location_history,
-                          ng_people, ng_device_signals, ng_devices
+                          ng_people, ng_device_signals, ng_devices,
+                          ng_daemon_status, ng_enrichment_status
                  RESTART IDENTITY CASCADE",
             )
             .await
@@ -146,11 +147,16 @@ pub fn test_url_as_role(user: &str, password: &str) -> String {
 /// in the same binary *skip*, and a skipped test is a green tick that proved
 /// nothing.
 pub async fn rebuild_schema(db: &TestDb) {
-    db.execute(
-        "DROP TABLE IF EXISTS ng_people, ng_location_history, ng_ip_history, ng_events,
-                              ng_presence, ng_device_signals, ng_devices,
-                              refinery_schema_history CASCADE",
-    )
+    // Every table the contract names, from the contract, so a table added in a
+    // later migration cannot survive the drop and then fail its own CREATE.
+    let tables: Vec<&str> = netgraspd::db::schema::EXPECTED
+        .iter()
+        .map(|(table, _)| *table)
+        .collect();
+    db.execute(&format!(
+        "DROP TABLE IF EXISTS {}, refinery_schema_history CASCADE",
+        tables.join(", ")
+    ))
     .await;
     Db::migrate(&test_url())
         .await
