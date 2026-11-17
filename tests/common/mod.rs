@@ -20,7 +20,11 @@
 // only one of them uses reads as dead code in the others.
 #![allow(dead_code)]
 
+use std::sync::{Arc, Mutex as StdMutex};
+
 use netgraspd::db::Db;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 use tokio::sync::{Mutex, MutexGuard};
 
@@ -196,4 +200,90 @@ impl TestDb {
             .unwrap_or_else(|err| panic!("running {sql:?}: {err}"));
         row.get(0)
     }
+}
+
+/// One request the fake ntfy received.
+#[derive(Debug, Clone)]
+pub struct Logged {
+    /// Request path, which is the topic.
+    pub path: String,
+    /// The `X-Title` header.
+    pub title: String,
+    /// The `Authorization` header, when sent.
+    pub authorization: Option<String>,
+    /// The message body.
+    pub body: String,
+}
+
+/// A minimal HTTP server that records every request and answers with
+/// `status`. Enough of HTTP/1.1 for reqwest, and nothing more. It never
+/// forwards anything: it stands in for ntfy so that no test reaches the real one.
+pub async fn fake_ntfy(status: u16) -> (String, Arc<StdMutex<Vec<Logged>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let log: Arc<StdMutex<Vec<Logged>>> = Arc::new(StdMutex::new(Vec::new()));
+    let sink = Arc::clone(&log);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let sink = Arc::clone(&sink);
+            tokio::spawn(async move {
+                let mut buffer = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                let (head_len, content_length) = loop {
+                    let n = socket.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    buffer.extend_from_slice(&chunk[..n]);
+                    if let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buffer[..end]).to_string();
+                        let length = head
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        break (end + 4, length);
+                    }
+                };
+                while buffer.len() < head_len + content_length {
+                    let n = socket.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buffer.extend_from_slice(&chunk[..n]);
+                }
+                let head = String::from_utf8_lossy(&buffer[..head_len]).to_string();
+                let header = |name: &str| {
+                    head.lines().find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case(name).then(|| v.trim().to_string())
+                    })
+                };
+                let path = head
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or_default()
+                    .to_string();
+                sink.lock().expect("log").push(Logged {
+                    path,
+                    title: header("x-title").unwrap_or_default(),
+                    authorization: header("authorization"),
+                    body: String::from_utf8_lossy(&buffer[head_len..]).to_string(),
+                });
+                let reason = if status == 200 { "OK" } else { "Error" };
+                let reply = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+            });
+        }
+    });
+    (format!("http://{addr}"), log)
 }

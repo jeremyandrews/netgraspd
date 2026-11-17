@@ -742,10 +742,62 @@ mod tests {
     #[test]
     fn a_device_with_notifications_turned_off_is_silent() {
         let mut d = Dispatcher::new(config(), security(), utc());
-        let mut e = event(1, &mac_of(1), EventType::NewDevice);
+        let mut e = event(1, &mac_of(1), EventType::Returned);
         e.event.notify = false;
         let _ = d.offer(e, base());
         assert_eq!(d.suppressed().not_deliverable, 1);
+    }
+
+    #[test]
+    fn a_new_device_is_delivered_even_when_its_notify_is_off() {
+        let mut d = Dispatcher::new(config(), security(), utc());
+        let mut e = event(1, &mac_of(1), EventType::NewDevice);
+        e.event.notify = false;
+        let _ = d.offer(e, base());
+        assert_eq!(d.suppressed().not_deliverable, 0);
+        assert_eq!(d.tick(at(60)).len(), 1);
+    }
+
+    #[test]
+    fn an_informational_event_is_never_delivered_even_when_listed() {
+        let mut d = Dispatcher::new(
+            NotifyConfig {
+                event_types: [
+                    "ip_changed",
+                    "name_updated",
+                    "device_location_changed",
+                    "went_offline",
+                ]
+                .map(String::from)
+                .to_vec(),
+                ..config()
+            },
+            security(),
+            utc(),
+        );
+        for (n, kind) in [
+            EventType::IpChanged,
+            EventType::NameUpdated,
+            EventType::DeviceLocationChanged,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = i64::try_from(n).expect("small");
+            let mac = mac_of(u8::try_from(n).expect("small"));
+            let _ = d.offer(event(id, &mac, kind), base());
+        }
+        assert_eq!(d.suppressed().not_deliverable, 3);
+        assert!(d.drain().is_empty());
+    }
+
+    #[test]
+    fn the_default_allowlist_carries_a_chosen_device_coming_and_going() {
+        let mut d = Dispatcher::new(NotifyConfig::default(), security(), utc());
+        let _ = d.offer(event(1, &mac_of(1), EventType::WentOffline), base());
+        let _ = d.offer(event(2, &mac_of(2), EventType::Returned), base());
+        assert_eq!(d.suppressed(), SuppressionCounts::default());
+        assert_eq!(d.drain().len(), 2);
     }
 
     #[test]

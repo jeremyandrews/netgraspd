@@ -2783,6 +2783,95 @@ mod tests {
         assert!(event(&effects, EventType::Returned).deliverable());
     }
 
+    /// What each event type does when it is offered for delivery outside a
+    /// learning window, with the device's `notify` off and then on.
+    ///
+    /// Every type is listed, so a new one cannot be added without deciding
+    /// whether it is worth waking somebody for.
+    #[test]
+    fn every_event_type_has_a_delivery_rule() {
+        let mut m = Manager::new(config(), false);
+        let template = event(
+            &m.observe(&obs_at("3c:22:fb:00:00:01", None, base())),
+            EventType::NewDevice,
+        );
+        for kind in EventType::ALL {
+            // (with notify off, with notify on)
+            let expected = match kind {
+                // Nobody has had a chance to choose anything about a device that
+                // has only just appeared.
+                EventType::NewDevice => (true, true),
+                // Coming and going: only when a person asked about this device.
+                EventType::Returned | EventType::WentOffline => (false, true),
+                // Information for the event log, never for a phone.
+                EventType::IpChanged
+                | EventType::NameUpdated
+                | EventType::DeviceLocationChanged => (false, false),
+                // The person flags ride in `notify`; unchanged.
+                EventType::PersonArrived
+                | EventType::PersonDeparted
+                | EventType::PersonLocationChanged => (false, true),
+                // Security events keep their own rules.
+                EventType::ArpScan
+                | EventType::ArpSpoof
+                | EventType::RogueDhcp
+                | EventType::IdentityChange
+                | EventType::IpConflict
+                | EventType::GratuitousArp => (true, true),
+            };
+            let mut ev = template.clone();
+            ev.event_type = kind;
+            ev.notify = false;
+            let off = ev.deliverable();
+            ev.notify = true;
+            let on = ev.deliverable();
+            assert_eq!((off, on), expected, "{kind}: (notify off, notify on)");
+        }
+    }
+
+    #[test]
+    fn a_new_device_notifies_after_learning_whatever_its_notify_says() {
+        let mut m = Manager::new(config(), false);
+        let mut ev = event(
+            &m.observe(&obs_at("3c:22:fb:00:00:01", None, base())),
+            EventType::NewDevice,
+        );
+        ev.notify = false;
+        assert!(
+            ev.deliverable(),
+            "something new joining is the alert Netgrasp exists for"
+        );
+        ev.during_learning = true;
+        assert!(!ev.deliverable(), "the learning window still applies");
+    }
+
+    #[test]
+    fn a_device_nobody_has_chosen_comes_and_goes_in_silence() {
+        let mut m = Manager::new(config(), false);
+        let _ = m.observe(&obs_at("3c:22:fb:00:00:01", None, base()));
+        let gone = m.sweep(at(20_000));
+        let went = event(&gone, EventType::WentOffline);
+        assert!(!went.notify, "a new device starts with notify off");
+        assert!(!went.deliverable(), "{went:?}");
+        let back = m.observe(&obs_at("3c:22:fb:00:00:01", None, at(20_100)));
+        let returned = event(&back, EventType::Returned);
+        assert!(!returned.deliverable(), "{returned:?}");
+        // Both are still recorded.
+        assert!(events(&gone).contains(&EventType::WentOffline));
+        assert!(events(&back).contains(&EventType::Returned));
+    }
+
+    #[test]
+    fn a_device_a_person_turned_on_notifies_coming_and_going() {
+        let mut m = Manager::new(config(), false);
+        let _ = m.observe(&obs_at("3c:22:fb:00:00:01", None, base()));
+        let _ = m.apply_user_settings(&[settings("3c:22:fb:00:00:01")]);
+        let went = event(&m.sweep(at(20_000)), EventType::WentOffline);
+        assert!(went.deliverable(), "{went:?}");
+        let back = m.observe(&obs_at("3c:22:fb:00:00:01", None, at(20_100)));
+        assert!(event(&back, EventType::Returned).deliverable());
+    }
+
     fn restored_record(m: &str, state: DeviceState) -> DeviceRecord {
         DeviceRecord {
             id: i64::from(mac(m).octets()[5]),

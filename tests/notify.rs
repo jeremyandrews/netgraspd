@@ -9,16 +9,12 @@
 
 mod common;
 
-use std::sync::{Arc, Mutex};
-
 use jiff::SignedDuration;
 use jiff::tz::{Offset, TimeZone};
 use netgraspd::clock::Timestamp;
 use netgraspd::config::{HumanDuration, NtfyConfig};
 use netgraspd::notify::ntfy::NtfyNotifier;
 use netgraspd::notify::{self, Notifier, TestOutcome};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 
 const TOPIC: &str = "secret-topic-4f1c";
 const TOKEN: &str = "tk_secret_token_9a2b";
@@ -29,87 +25,6 @@ fn base() -> Timestamp {
 
 fn rome() -> TimeZone {
     TimeZone::fixed(Offset::from_seconds(3600).expect("offset"))
-}
-
-/// One request the fake ntfy received.
-#[derive(Debug, Clone)]
-struct Logged {
-    path: String,
-    title: String,
-    authorization: Option<String>,
-    body: String,
-}
-
-/// A minimal HTTP server that records every request and answers with
-/// `status`. Enough of HTTP/1.1 for reqwest, and nothing more.
-async fn fake_ntfy(status: u16) -> (String, Arc<Mutex<Vec<Logged>>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    let log: Arc<Mutex<Vec<Logged>>> = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&log);
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut socket, _)) = listener.accept().await else {
-                return;
-            };
-            let sink = Arc::clone(&sink);
-            tokio::spawn(async move {
-                let mut buffer = Vec::new();
-                let mut chunk = [0_u8; 4096];
-                let (head_len, content_length) = loop {
-                    let n = socket.read(&mut chunk).await.unwrap_or(0);
-                    if n == 0 {
-                        return;
-                    }
-                    buffer.extend_from_slice(&chunk[..n]);
-                    if let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let head = String::from_utf8_lossy(&buffer[..end]).to_string();
-                        let length = head
-                            .lines()
-                            .find_map(|l| {
-                                let (k, v) = l.split_once(':')?;
-                                k.eq_ignore_ascii_case("content-length")
-                                    .then(|| v.trim().parse::<usize>().ok())?
-                            })
-                            .unwrap_or(0);
-                        break (end + 4, length);
-                    }
-                };
-                while buffer.len() < head_len + content_length {
-                    let n = socket.read(&mut chunk).await.unwrap_or(0);
-                    if n == 0 {
-                        break;
-                    }
-                    buffer.extend_from_slice(&chunk[..n]);
-                }
-                let head = String::from_utf8_lossy(&buffer[..head_len]).to_string();
-                let header = |name: &str| {
-                    head.lines().find_map(|l| {
-                        let (k, v) = l.split_once(':')?;
-                        k.eq_ignore_ascii_case(name).then(|| v.trim().to_string())
-                    })
-                };
-                let path = head
-                    .lines()
-                    .next()
-                    .and_then(|l| l.split_whitespace().nth(1))
-                    .unwrap_or_default()
-                    .to_string();
-                sink.lock().expect("log").push(Logged {
-                    path,
-                    title: header("x-title").unwrap_or_default(),
-                    authorization: header("authorization"),
-                    body: String::from_utf8_lossy(&buffer[head_len..]).to_string(),
-                });
-                let reason = if status == 200 { "OK" } else { "Error" };
-                let reply = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
-                );
-                let _ = socket.write_all(reply.as_bytes()).await;
-            });
-        }
-    });
-    (format!("http://{addr}"), log)
 }
 
 fn ntfy(server: &str) -> Box<dyn Notifier> {
@@ -145,7 +60,7 @@ async fn the_status_row_says_whether_delivery_is_configured_and_by_what() {
     let Some(db) = common::test_db().await else {
         return;
     };
-    let (server, _log) = fake_ntfy(200).await;
+    let (server, _log) = common::fake_ntfy(200).await;
 
     notify::publish_status(&db.db, &[ntfy(&server)], true, base())
         .await
@@ -198,7 +113,7 @@ async fn a_requested_test_is_sent_once_and_marked_done() {
     let Some(db) = common::test_db().await else {
         return;
     };
-    let (server, log) = fake_ntfy(200).await;
+    let (server, log) = common::fake_ntfy(200).await;
     let notifiers = vec![ntfy(&server)];
     notify::publish_status(&db.db, &notifiers, true, base())
         .await
@@ -284,7 +199,7 @@ async fn a_failed_test_says_so_without_the_error_text() {
     let Some(db) = common::test_db().await else {
         return;
     };
-    let (server, log) = fake_ntfy(500).await;
+    let (server, log) = common::fake_ntfy(500).await;
     let notifiers = vec![ntfy(&server)];
     db.execute("INSERT INTO ng_notify_requests (requested_by) VALUES ('jeremy')")
         .await;
@@ -367,7 +282,7 @@ async fn an_arrival_reaches_ntfy_in_words() {
     let Some(_db) = common::test_db().await else {
         return;
     };
-    let (server, log) = fake_ntfy(200).await;
+    let (server, log) = common::fake_ntfy(200).await;
     let notifier = ntfy(&server);
     let event = netgraspd::device::DeviceEvent {
         event_type: netgraspd::types::EventType::PersonArrived,

@@ -1948,6 +1948,17 @@ mod tests {
     }
 
     #[test]
+    fn the_default_allowlist_is_a_new_device_and_a_chosen_device_coming_and_going() {
+        // ip_changed and name_updated are not here because they never deliver;
+        // returned and went_offline are both here because they deliver only for a
+        // device whose notify a person turned on, and that person asked for both.
+        assert_eq!(
+            NotifyConfig::default().event_types,
+            vec!["new_device", "returned", "went_offline"]
+        );
+    }
+
+    #[test]
     fn quiet_hours_handle_the_midnight_wrap() {
         let qh = QuietHours {
             start: ClockTime {

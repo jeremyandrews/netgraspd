@@ -1457,6 +1457,24 @@ mod tests {
     }
 
     #[test]
+    fn the_learning_notice_says_a_device_comes_and_goes_quietly_until_chosen() {
+        use crate::config::{NotifyConfig, NtfyConfig};
+        let notify = NotifyConfig {
+            ntfy: Some(NtfyConfig::default()),
+            ..NotifyConfig::default()
+        };
+        let notice = after_learning_notice(&notify);
+        assert!(
+            notice.contains("New devices from now on will notify"),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("comes and goes without an alert until its notify is turned on"),
+            "{notice}"
+        );
+    }
+
+    #[test]
     fn the_learning_notice_says_notify_only_when_something_would() {
         use crate::config::{NotifyConfig, NtfyConfig};
         let mut notify = NotifyConfig {

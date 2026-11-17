@@ -747,3 +747,127 @@ async fn muting_a_device_in_trovato_silences_the_next_alert_without_a_restart() 
         "the record survives the mute"
     );
 }
+
+/// Hands every event waiting on the bus to the dispatcher, closes the batch
+/// window, and sends what is due to the notifier. Returns how many deliveries
+/// went out.
+async fn deliver_waiting(
+    rx: &mut tokio::sync::broadcast::Receiver<netgraspd::device::persist::RecordedEvent>,
+    dispatcher: &mut Dispatcher,
+    notifier: &dyn netgraspd::notify::Notifier,
+    now: Timestamp,
+) -> usize {
+    let mut due = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        due.extend(dispatcher.offer(event, now));
+    }
+    due.extend(dispatcher.tick(now + SignedDuration::from_secs(61)));
+    for delivery in &due {
+        assert!(
+            netgraspd::notify::deliver(notifier, delivery).await,
+            "the fake ntfy accepts everything"
+        );
+    }
+    due.len()
+}
+
+#[tokio::test]
+async fn only_a_new_device_and_a_device_somebody_chose_reach_ntfy() {
+    let Some(db) = common::test_db().await else {
+        return;
+    };
+    let (server, log) = common::fake_ntfy(200).await;
+    let notifier = netgraspd::notify::ntfy::NtfyNotifier::new(&netgraspd::config::NtfyConfig {
+        topic: "u6-topic".into(),
+        server,
+        ..netgraspd::config::NtfyConfig::default()
+    })
+    .expect("a usable notifier");
+    // The shipped defaults, with somewhere to send to.
+    let mut dispatcher = Dispatcher::new(
+        NotifyConfig::default(),
+        netgraspd::config::SecurityNotifyConfig::default(),
+        jiff::tz::Offset::from_seconds(0).expect("utc"),
+    );
+    let mut p = Pipeline::new(state_config(), true);
+    let mut registry = netgraspd::people::Registry::new();
+    let mut rx = p.bus.subscribe();
+    let phone = mac("3c:22:fb:9a:1b:2c");
+    let titles = || {
+        log.lock()
+            .expect("log")
+            .iter()
+            .map(|l| l.title.clone())
+            .collect::<Vec<_>>()
+    };
+
+    // After learning, a device never seen before joins: that is an alert.
+    p.manager.end_learning();
+    p.frame(&db, &fixtures::arp_request(), "eth0", at(0)).await;
+    p.flush(&db).await;
+    netgraspd::daemon::reconcile_user_state(&db.db, &mut p.manager, &mut registry).await;
+    assert_eq!(
+        deliver_waiting(&mut rx, &mut dispatcher, &notifier, at(0)).await,
+        1
+    );
+    assert_eq!(titles().len(), 1, "{:?}", titles());
+    assert!(titles()[0].starts_with("New device"), "{:?}", titles());
+    assert_eq!(
+        db.scalar(&format!(
+            "SELECT COUNT(*) FROM ng_devices WHERE mac = '{phone}' AND notify"
+        ))
+        .await,
+        0,
+        "nobody has chosen this device"
+    );
+
+    // With notify as it was left, it goes and comes back: nothing reaches ntfy.
+    p.sweep(&db, at(20_000)).await;
+    assert_eq!(
+        deliver_waiting(&mut rx, &mut dispatcher, &notifier, at(20_000)).await,
+        0
+    );
+    p.frame(&db, &fixtures::arp_request(), "eth0", at(20_500))
+        .await;
+    assert_eq!(
+        deliver_waiting(&mut rx, &mut dispatcher, &notifier, at(20_500)).await,
+        0
+    );
+    assert_eq!(titles().len(), 1, "{:?}", titles());
+
+    // Somebody turns notify on in Trovato: the same going and coming both
+    // arrive.
+    as_the_plugin(
+        &db,
+        &format!("UPDATE ng_devices SET notify = true WHERE mac = '{phone}'"),
+    )
+    .await;
+    netgraspd::daemon::reconcile_user_state(&db.db, &mut p.manager, &mut registry).await;
+    p.sweep(&db, at(40_000)).await;
+    assert_eq!(
+        deliver_waiting(&mut rx, &mut dispatcher, &notifier, at(40_000)).await,
+        1
+    );
+    p.frame(&db, &fixtures::arp_request(), "eth0", at(40_500))
+        .await;
+    assert_eq!(
+        deliver_waiting(&mut rx, &mut dispatcher, &notifier, at(40_500)).await,
+        1
+    );
+    let sent = titles();
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    assert!(sent[1].starts_with("Offline"), "{sent:?}");
+    assert!(sent[2].starts_with("Back online"), "{sent:?}");
+
+    // Every one of them is still in the event log.
+    for (kind, n) in [("new_device", 1), ("went_offline", 2), ("returned", 2)] {
+        assert_eq!(
+            db.scalar(&format!(
+                "SELECT COUNT(*) FROM ng_events WHERE event_type = '{kind}'"
+            ))
+            .await,
+            n,
+            "{kind}"
+        );
+    }
+}
