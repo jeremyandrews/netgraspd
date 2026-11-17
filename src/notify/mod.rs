@@ -58,9 +58,10 @@ pub mod ntfy;
 
 use std::collections::HashMap;
 
+use crate::clock::Timestamp;
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::{DateTime, FixedOffset, Timelike, Utc};
+use jiff::tz::Offset;
 
 use crate::config::{NotifyConfig, SecurityNotifyConfig};
 use crate::device::DeviceEvent;
@@ -161,10 +162,10 @@ impl SuppressionCounts {
 pub struct Dispatcher {
     config: NotifyConfig,
     security: SecurityNotifyConfig,
-    offset: FixedOffset,
-    last_accepted: HashMap<MacAddr, DateTime<Utc>>,
+    offset: Offset,
+    last_accepted: HashMap<MacAddr, Timestamp>,
     pending: Vec<RecordedEvent>,
-    window_opened_at: Option<DateTime<Utc>>,
+    window_opened_at: Option<Timestamp>,
     suppressed: SuppressionCounts,
 }
 
@@ -175,7 +176,7 @@ impl Dispatcher {
     /// as a parameter rather than reading the system clock is what makes quiet
     /// hours testable.
     #[must_use]
-    pub fn new(config: NotifyConfig, security: SecurityNotifyConfig, offset: FixedOffset) -> Self {
+    pub fn new(config: NotifyConfig, security: SecurityNotifyConfig, offset: Offset) -> Self {
         Dispatcher {
             config,
             security,
@@ -190,7 +191,7 @@ impl Dispatcher {
     /// Builds a dispatcher using the machine's current UTC offset.
     #[must_use]
     pub fn with_local_offset(config: NotifyConfig, security: SecurityNotifyConfig) -> Self {
-        let offset = *chrono::Local::now().offset();
+        let offset = crate::clock::local_offset_now();
         Dispatcher::new(config, security, offset)
     }
 
@@ -211,7 +212,7 @@ impl Dispatcher {
     /// Returns any deliveries that became due as a result, which is usually none
     /// because the batch window has to close first.
     #[must_use]
-    pub fn offer(&mut self, event: RecordedEvent, now: DateTime<Utc>) -> Vec<Delivery> {
+    pub fn offer(&mut self, event: RecordedEvent, now: Timestamp) -> Vec<Delivery> {
         let security = event.event.event_type.is_security();
 
         // The master switch has no exception; see the module documentation.
@@ -250,10 +251,7 @@ impl Dispatcher {
         }
         if !(security && self.security.bypass_debounce)
             && let Some(previous) = self.last_accepted.get(&event.event.mac)
-            && now
-                .signed_duration_since(*previous)
-                .to_std()
-                .unwrap_or_default()
+            && std::time::Duration::try_from(now.since(*previous)).unwrap_or_default()
                 < self.config.debounce.get()
         {
             self.suppressed.debounced += 1;
@@ -280,14 +278,11 @@ impl Dispatcher {
     /// Call this on a timer as well as after every offer, otherwise a single
     /// event arriving on a quiet network would wait for the next one.
     #[must_use]
-    pub fn tick(&mut self, now: DateTime<Utc>) -> Vec<Delivery> {
+    pub fn tick(&mut self, now: Timestamp) -> Vec<Delivery> {
         let Some(opened) = self.window_opened_at else {
             return Vec::new();
         };
-        let elapsed = now
-            .signed_duration_since(opened)
-            .to_std()
-            .unwrap_or_default();
+        let elapsed = std::time::Duration::try_from(now.since(opened)).unwrap_or_default();
         if elapsed < self.config.batch_window.get() {
             return Vec::new();
         }
@@ -315,12 +310,11 @@ impl Dispatcher {
 
     /// Whether the given instant falls inside the configured quiet period.
     #[must_use]
-    pub fn in_quiet_hours(&self, now: DateTime<Utc>) -> bool {
+    pub fn in_quiet_hours(&self, now: Timestamp) -> bool {
         let Some(quiet) = self.config.quiet_hours else {
             return false;
         };
-        let local = now.with_timezone(&self.offset);
-        quiet.contains(local.hour() * 60 + local.minute())
+        quiet.contains(now.minute_of_day_at(self.offset))
     }
 }
 
@@ -351,23 +345,22 @@ mod tests {
     use super::*;
     use crate::config::{ClockTime, HumanDuration, QuietHours};
     use crate::types::EventType;
-    use chrono::TimeZone;
+    use jiff::SignedDuration;
+
     use std::sync::Mutex;
 
-    fn utc() -> FixedOffset {
-        FixedOffset::east_opt(0).expect("utc offset")
+    fn utc() -> Offset {
+        Offset::from_seconds(0).expect("utc offset")
     }
 
-    fn base() -> DateTime<Utc> {
+    fn base() -> Timestamp {
         // 2026-02-02T12:00:00Z, a time comfortably outside any quiet window used
         // in these tests.
-        Utc.with_ymd_and_hms(2026, 2, 2, 12, 0, 0)
-            .single()
-            .expect("valid time")
+        Timestamp::from_utc(2026, 2, 2, 12, 0, 0).expect("valid time")
     }
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        base() + chrono::Duration::seconds(secs)
+    fn at(secs: i64) -> Timestamp {
+        base() + SignedDuration::from_secs(secs)
     }
 
     fn security() -> SecurityNotifyConfig {
@@ -519,18 +512,12 @@ mod tests {
             ..config()
         };
         let mut d = Dispatcher::new(cfg, security(), utc());
-        let night = Utc
-            .with_ymd_and_hms(2026, 2, 2, 23, 30, 0)
-            .single()
-            .expect("valid time");
+        let night = Timestamp::from_utc(2026, 2, 2, 23, 30, 0).expect("valid time");
         let _ = d.offer(event(1, &mac_of(1), EventType::NewDevice), night);
         assert_eq!(d.suppressed().quiet_hours, 1);
         assert_eq!(d.pending(), 0);
 
-        let morning = Utc
-            .with_ymd_and_hms(2026, 2, 3, 7, 0, 0)
-            .single()
-            .expect("valid time");
+        let morning = Timestamp::from_utc(2026, 2, 3, 7, 0, 0).expect("valid time");
         let _ = d.offer(event(2, &mac_of(2), EventType::NewDevice), morning);
         assert_eq!(d.suppressed().quiet_hours, 1, "07:00 is no longer quiet");
         assert_eq!(d.pending(), 1);
@@ -549,12 +536,9 @@ mod tests {
             ..config()
         };
         // Rome in winter: UTC+1. 21:30 UTC is 22:30 local, which is quiet.
-        let rome = FixedOffset::east_opt(3600).expect("offset");
+        let rome = Offset::from_seconds(3600).expect("offset");
         let mut d = Dispatcher::new(cfg.clone(), security(), rome);
-        let evening = Utc
-            .with_ymd_and_hms(2026, 2, 2, 21, 30, 0)
-            .single()
-            .expect("valid time");
+        let evening = Timestamp::from_utc(2026, 2, 2, 21, 30, 0).expect("valid time");
         let _ = d.offer(event(1, &mac_of(1), EventType::NewDevice), evening);
         assert_eq!(d.suppressed().quiet_hours, 1);
 
@@ -650,10 +634,7 @@ mod tests {
             ..config()
         };
         let mut d = Dispatcher::new(cfg, security(), utc());
-        let night = Utc
-            .with_ymd_and_hms(2026, 2, 2, 23, 30, 0)
-            .single()
-            .expect("valid time");
+        let night = Timestamp::from_utc(2026, 2, 2, 23, 30, 0).expect("valid time");
         assert_eq!(
             d.offer(event(1, &mac_of(1), EventType::ArpSpoof), night)
                 .len(),

@@ -35,7 +35,7 @@
 
 use std::net::{IpAddr, Ipv6Addr};
 
-use chrono::{DateTime, Utc};
+use crate::clock::Timestamp;
 
 use crate::capture::ethernet::{ETHERTYPE_IPV6, parse_ethernet, parse_ipv6};
 use crate::types::{MacAddr, Observation, ObservationKind, Signal, SignalKind};
@@ -132,11 +132,7 @@ impl NdpMessage {
 /// Returns `None` for anything that is not a well-formed Neighbor Discovery
 /// message, and for messages whose source MAC cannot identify a device.
 #[must_use]
-pub fn parse_frame(
-    bytes: &[u8],
-    interface: &str,
-    observed_at: DateTime<Utc>,
-) -> Option<Observation> {
+pub fn parse_frame(bytes: &[u8], interface: &str, observed_at: Timestamp) -> Option<Observation> {
     let frame = parse_ethernet(bytes)?;
     if frame.ethertype != ETHERTYPE_IPV6 {
         return None;
@@ -258,10 +254,8 @@ mod tests {
     use super::*;
     use crate::capture::fixtures;
 
-    fn ts() -> DateTime<Utc> {
-        chrono::TimeZone::timestamp_opt(&Utc, 1_770_000_000, 0)
-            .single()
-            .expect("valid timestamp")
+    fn ts() -> Timestamp {
+        Timestamp::from_unix(1_770_000_000, 0).expect("valid timestamp")
     }
 
     #[test]

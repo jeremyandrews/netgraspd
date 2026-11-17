@@ -8,7 +8,7 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 
-use chrono::{DateTime, Utc};
+use crate::clock::Timestamp;
 
 use crate::capture::ethernet::{ETHERTYPE_ARP, parse_ethernet};
 use crate::types::{ArpDetail, ArpOp, MacAddr, Observation, ObservationKind, ProtocolDetail};
@@ -34,11 +34,7 @@ const OP_REPLY: u16 = 2;
 /// packet, and for packets whose sender hardware address cannot identify a
 /// device (broadcast, multicast or all-zero).
 #[must_use]
-pub fn parse_frame(
-    bytes: &[u8],
-    interface: &str,
-    observed_at: DateTime<Utc>,
-) -> Option<Observation> {
+pub fn parse_frame(bytes: &[u8], interface: &str, observed_at: Timestamp) -> Option<Observation> {
     let frame = parse_ethernet(bytes)?;
     if frame.ethertype != ETHERTYPE_ARP {
         return None;
@@ -113,10 +109,8 @@ mod tests {
     use super::*;
     use crate::capture::fixtures;
 
-    fn ts() -> DateTime<Utc> {
-        chrono::TimeZone::timestamp_opt(&Utc, 1_770_000_000, 0)
-            .single()
-            .expect("valid timestamp")
+    fn ts() -> Timestamp {
+        Timestamp::from_unix(1_770_000_000, 0).expect("valid timestamp")
     }
 
     #[test]

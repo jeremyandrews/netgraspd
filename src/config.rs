@@ -8,6 +8,7 @@
 //! bare integer means seconds. That form survives all four layers unchanged,
 //! which is the reason it is a string rather than a serde-native number.
 
+use jiff::SignedDuration;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -407,8 +408,8 @@ impl UnknownSampleConfig {
             frames_per_device: self.frames_per_device,
             max_devices: self.max_devices,
             max_bytes: self.max_bytes,
-            settle: chrono::TimeDelta::from_std(self.settle.get())
-                .unwrap_or_else(|_| chrono::TimeDelta::minutes(1)),
+            settle: SignedDuration::try_from(self.settle.get())
+                .unwrap_or_else(|_| SignedDuration::from_mins(1)),
         }
     }
 }

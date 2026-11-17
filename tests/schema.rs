@@ -15,8 +15,8 @@ mod common;
 
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, TimeZone, Utc};
 use netgraspd::cli::DevicesArgs;
+use netgraspd::clock::Timestamp;
 use netgraspd::config::Config;
 use netgraspd::db::Db;
 use netgraspd::db::schema::{self, EXPECTED};
@@ -30,10 +30,8 @@ fn db_message(err: &tokio_postgres::Error) -> String {
         .map_or_else(|| err.to_string(), |db| db.to_string())
 }
 
-fn at(secs: i64) -> DateTime<Utc> {
-    Utc.timestamp_opt(1_786_000_000 + secs, 0)
-        .single()
-        .expect("valid timestamp")
+fn at(secs: i64) -> Timestamp {
+    Timestamp::from_unix(1_786_000_000 + secs, 0).expect("valid timestamp")
 }
 
 #[tokio::test]
@@ -805,7 +803,7 @@ async fn every_epoch_column_matches_its_timestamp_is_null_when_it_is_and_cannot_
             "SELECT first_seen_at_epoch FROM ng_devices WHERE id = {device_id}"
         ))
         .await,
-        at(0).timestamp(),
+        at(0).unix_seconds(),
     );
 
     // An open session's ended_at is null, and so is its twin.

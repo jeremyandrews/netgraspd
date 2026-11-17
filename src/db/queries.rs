@@ -17,8 +17,8 @@
 
 use std::collections::HashMap;
 
+use crate::clock::Timestamp;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 use serde_json::Value as Json;
 use tokio_postgres::Row;
 
@@ -63,9 +63,9 @@ pub struct DeviceRecord {
     /// Interface the device was last seen on.
     pub last_interface: Option<String>,
     /// When the device was first discovered.
-    pub first_seen_at: DateTime<Utc>,
+    pub first_seen_at: Timestamp,
     /// When the device was last seen.
-    pub last_seen_at: DateTime<Utc>,
+    pub last_seen_at: Timestamp,
     /// True when the device was learned during a baseline window.
     pub baseline: bool,
     /// Access point it is associated with.
@@ -153,7 +153,7 @@ pub struct NewDevice {
     /// Interface it was seen on.
     pub last_interface: Option<String>,
     /// Discovery time, used for both first and last seen.
-    pub seen_at: DateTime<Utc>,
+    pub seen_at: Timestamp,
     /// True when discovered during a baseline learning window.
     pub baseline: bool,
     /// Vendor from the MAC prefix, if the registry knows one.
@@ -174,7 +174,7 @@ pub struct DeviceUpdate {
     /// Most recent interface.
     pub last_interface: Option<String>,
     /// Most recent sighting.
-    pub last_seen_at: DateTime<Utc>,
+    pub last_seen_at: Timestamp,
     /// Name chosen by the scorer.
     pub resolved_name: Option<String>,
     /// Signal kind behind that name.
@@ -207,7 +207,7 @@ pub struct NewEvent {
     /// What happened.
     pub event_type: EventType,
     /// When it happened.
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     /// Structured detail, free-form by design so that milestone 2's analyzers
     /// need no schema change.
     pub details: Json,
@@ -227,7 +227,7 @@ pub struct EventRecord {
     /// What happened.
     pub event_type: String,
     /// When it happened.
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     /// Structured detail.
     pub details: Json,
     /// Whether a notification was delivered.
@@ -476,7 +476,7 @@ pub async fn upsert_signal(
     device_id: i64,
     kind: SignalKind,
     value: &str,
-    seen_at: DateTime<Utc>,
+    seen_at: Timestamp,
 ) -> Result<()> {
     client
         .execute(
@@ -545,7 +545,7 @@ pub async fn open_presence(
     device_id: i64,
     interface: Option<&str>,
     ip: Option<&str>,
-    started_at: DateTime<Utc>,
+    started_at: Timestamp,
 ) -> Result<()> {
     client
         .execute(
@@ -587,11 +587,7 @@ pub async fn bump_presence(client: &Client, device_id: i64, count: i64) -> Resul
 /// # Errors
 ///
 /// Returns an error when the statement fails.
-pub async fn close_presence(
-    client: &Client,
-    device_id: i64,
-    ended_at: DateTime<Utc>,
-) -> Result<()> {
+pub async fn close_presence(client: &Client, device_id: i64, ended_at: Timestamp) -> Result<()> {
     client
         .execute(
             "UPDATE ng_presence
@@ -630,7 +626,7 @@ pub async fn upsert_ip(
     device_id: i64,
     ip: &str,
     interface: Option<&str>,
-    seen_at: DateTime<Utc>,
+    seen_at: Timestamp,
 ) -> Result<()> {
     client
         .execute(
@@ -766,7 +762,7 @@ pub async fn change_location(
     device_id: i64,
     ap_name: Option<&str>,
     location: &str,
-    at: DateTime<Utc>,
+    at: Timestamp,
 ) -> Result<()> {
     close_location(client, device_id, at).await?;
     client
@@ -785,11 +781,7 @@ pub async fn change_location(
 /// # Errors
 ///
 /// Returns an error when the statement fails.
-pub async fn close_location(
-    client: &Client,
-    device_id: i64,
-    ended_at: DateTime<Utc>,
-) -> Result<u64> {
+pub async fn close_location(client: &Client, device_id: i64, ended_at: Timestamp) -> Result<u64> {
     client
         .execute(
             "UPDATE ng_location_history
@@ -810,7 +802,7 @@ pub async fn close_location(
 /// # Errors
 ///
 /// Returns an error when the statement fails.
-pub async fn close_stale_location_stays(client: &Client, at: DateTime<Utc>) -> Result<u64> {
+pub async fn close_stale_location_stays(client: &Client, at: Timestamp) -> Result<u64> {
     client
         .execute(
             "UPDATE ng_location_history h
@@ -859,9 +851,9 @@ pub struct PersonRecord {
     /// Where they are. Daemon owned.
     pub current_location: Option<String>,
     /// When they last arrived. Daemon owned.
-    pub last_arrived_at: Option<DateTime<Utc>>,
+    pub last_arrived_at: Option<Timestamp>,
     /// When they last left. Daemon owned.
-    pub last_departed_at: Option<DateTime<Utc>>,
+    pub last_departed_at: Option<Timestamp>,
 }
 
 /// Loads every person.
@@ -971,8 +963,8 @@ pub async fn update_person(
     item_id: &str,
     state: &str,
     current_location: Option<&str>,
-    last_arrived_at: Option<DateTime<Utc>>,
-    last_departed_at: Option<DateTime<Utc>>,
+    last_arrived_at: Option<Timestamp>,
+    last_departed_at: Option<Timestamp>,
 ) -> Result<()> {
     client
         .execute(
@@ -1065,9 +1057,7 @@ pub async fn table_sizes(client: &Client) -> Result<Vec<TableSize>> {
 /// # Errors
 ///
 /// Returns an error when the query fails.
-pub async fn rollup_high_water(
-    client: &Client,
-) -> Result<Vec<(String, Option<DateTime<Utc>>, i64)>> {
+pub async fn rollup_high_water(client: &Client) -> Result<Vec<(String, Option<Timestamp>, i64)>> {
     let mut out = Vec::with_capacity(2);
     for table in ["ng_presence", "ng_location_history"] {
         let row = client
@@ -1126,7 +1116,7 @@ pub async fn device_state_counts(client: &Client) -> Result<Vec<(String, i64)>> 
 /// # Errors
 ///
 /// Returns an error when the query fails.
-pub async fn event_span(client: &Client) -> Result<(Option<DateTime<Utc>>, Option<DateTime<Utc>>)> {
+pub async fn event_span(client: &Client) -> Result<(Option<Timestamp>, Option<Timestamp>)> {
     let row = client
         .query_one(
             "SELECT MIN(\"timestamp\"), MAX(\"timestamp\") FROM ng_events",
@@ -1159,8 +1149,8 @@ mod tests {
             last_ip: None,
             last_ipv6: None,
             last_interface: None,
-            first_seen_at: Utc::now(),
-            last_seen_at: Utc::now(),
+            first_seen_at: Timestamp::now(),
+            last_seen_at: Timestamp::now(),
             baseline: false,
             hidden: false,
             notify: true,

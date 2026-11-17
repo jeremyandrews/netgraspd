@@ -44,7 +44,7 @@ pub mod ip_conflict;
 pub mod rogue_dhcp;
 pub mod window;
 
-use chrono::{DateTime, Utc};
+use crate::clock::Timestamp;
 use serde_json::Value as Json;
 
 use crate::config::SecurityConfig;
@@ -66,7 +66,7 @@ pub struct SecurityAlert {
     /// The interface it was seen on.
     pub interface: Option<String>,
     /// When it was decided.
-    pub at: DateTime<Utc>,
+    pub at: Timestamp,
     /// How loudly to deliver it.
     pub priority: EventPriority,
     /// The evidence, as it will land in `ng_events.details`.
@@ -79,7 +79,7 @@ impl SecurityAlert {
     pub fn new(
         event_type: EventType,
         mac: MacAddr,
-        at: DateTime<Utc>,
+        at: Timestamp,
         priority: EventPriority,
         details: Json,
     ) -> Self {
@@ -295,29 +295,20 @@ impl Chain {
 /// Every analyzer needs this and every analyzer would otherwise implement it
 /// slightly differently. A cooldown of zero always allows.
 #[must_use]
-pub fn cooled_down(
-    last: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
-    cooldown: std::time::Duration,
-) -> bool {
+pub fn cooled_down(last: Option<Timestamp>, now: Timestamp, cooldown: std::time::Duration) -> bool {
     let Some(last) = last else {
         return true;
     };
-    now.signed_duration_since(last)
-        .to_std()
-        .is_ok_and(|elapsed| elapsed >= cooldown)
+    std::time::Duration::try_from(now.since(last)).is_ok_and(|elapsed| elapsed >= cooldown)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::SecurityConfig;
-    use chrono::TimeZone;
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(1_770_000_000 + secs, 0)
-            .single()
-            .expect("valid timestamp")
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::from_unix(1_770_000_000 + secs, 0).expect("valid timestamp")
     }
 
     #[test]

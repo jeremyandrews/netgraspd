@@ -37,6 +37,7 @@ shipped rather than a release that was tagged at the time.
 
 ### Changed
 
+- **chrono is replaced by jiff.** chrono was declared unmaintained (RUSTSEC-2026-0543, no patched version), which failed `cargo audit --deny warnings` on every branch. Timestamps are now `clock::Timestamp`, a `jiff::Timestamp` that keeps chrono's formats: RFC 3339 with `Z` and 0, 3, 6 or 9 fractional digits in the status file, exports, `ng_events.details` and JSON output; `2026-11-17 19:15:27.957148 UTC` when displayed; the same `strftime` text. tokio-postgres uses `with-jiff-0_2` for `TIMESTAMPTZ`, cut to whole microseconds toward the Postgres epoch as chrono did, where jiff alone would round. Quiet hours and the nightly job read the local UTC offset once at startup, as before. No schema, column type, wire or file format changes; checked against chrono over a million random instants, and against a `main` build's export, `devices`, `events` and `stats` output, byte for byte.
 - **Behavior change:** with no `capture.interfaces` and no `-i`, capture only on interfaces that are up with carrier, not loopback, Ethernet and IPv4-addressed ([#15](https://github.com/jeremyandrews/netgraspd/pull/15)).
 - The macOS permission message names both routes, ChmodBPF and the `admin` group `chmod` ([#15](https://github.com/jeremyandrews/netgraspd/pull/15)).
 

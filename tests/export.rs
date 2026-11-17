@@ -10,8 +10,9 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
-use chrono::{TimeDelta, Utc};
+use jiff::SignedDuration;
 use netgraspd::capture::{fixtures, sample};
+use netgraspd::clock::Timestamp;
 use netgraspd::config::{Config, NtfyConfig};
 use netgraspd::export;
 use netgraspd::runtime::{Status, visibility};
@@ -38,7 +39,7 @@ fn url_password(url: &str) -> Option<String> {
 /// nothing, and a few events about them.
 async fn seed(db: &common::TestDb) {
     let client = db.client().await;
-    let now = Utc::now();
+    let now = Timestamp::now();
     client
         .execute(
             "INSERT INTO ng_devices
@@ -117,13 +118,13 @@ fn config(dir: &Path) -> (Config, Vec<String>) {
 
 /// A status file as an isolated guest network leaves it.
 fn write_status(path: &Path) {
-    let now = Utc::now();
-    let mut status = Status::new(now - TimeDelta::minutes(10));
+    let now = Timestamp::now();
+    let mut status = Status::new(now - SignedDuration::from_mins(10));
     status.updated_at = now;
     status.interfaces.insert(
         "en0".into(),
         visibility::InterfaceVisibility {
-            listening_since: Some(now - TimeDelta::minutes(10)),
+            listening_since: Some(now - SignedDuration::from_mins(10)),
             frames: 40,
             senders: 2,
             senders_capped: false,
@@ -150,18 +151,18 @@ fn write_sample(path: &Path) {
             frames_per_device: 3,
             max_devices: 3,
             max_bytes: 1 << 20,
-            settle: TimeDelta::seconds(1),
+            settle: SignedDuration::from_secs(1),
         },
     );
     let mut frame = fixtures::arp_request();
     frame[6..12].copy_from_slice(&[0xda, 0xa1, 0x19, 0, 0, 2]);
-    let at = Utc::now() - TimeDelta::minutes(5);
+    let at = Timestamp::now() - SignedDuration::from_mins(5);
     let len = u32::try_from(frame.len()).expect("small");
     sampler.offer(
         sample::Frame::from_ethernet(&frame, len, at).expect("a unicast sender"),
         Some(false),
     );
-    sampler.settle(Utc::now(), |_| Some(false));
+    sampler.settle(Timestamp::now(), |_| Some(false));
     assert!(path.exists(), "the fixture sample was written");
 }
 

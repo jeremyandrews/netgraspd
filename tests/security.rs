@@ -15,9 +15,10 @@
 
 mod common;
 
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use jiff::SignedDuration;
 use netgraspd::analyze::Chain;
 use netgraspd::capture::{ObservationDedup, arp, dhcp, fixtures, mdns, nbns, ndp, ssdp};
+use netgraspd::clock::Timestamp;
 use netgraspd::config::{
     ArpScanConfig, HumanDuration, IdentityChangeConfig, SecurityConfig, StateConfig,
 };
@@ -53,7 +54,7 @@ impl Pipeline {
 
     /// Feeds one raw frame through every parser, exactly as the six capture
     /// threads would.
-    async fn frame(&mut self, db: &common::TestDb, bytes: &[u8], iface: &str, at: DateTime<Utc>) {
+    async fn frame(&mut self, db: &common::TestDb, bytes: &[u8], iface: &str, at: Timestamp) {
         let parsed = arp::parse_frame(bytes, iface, at)
             .or_else(|| mdns::parse_frame(bytes, iface, at))
             .or_else(|| dhcp::parse_frame(bytes, iface, at))
@@ -126,14 +127,12 @@ impl Pipeline {
     }
 }
 
-fn base() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 2, 2, 9, 0, 0)
-        .single()
-        .expect("valid time")
+fn base() -> Timestamp {
+    Timestamp::from_utc(2026, 2, 2, 9, 0, 0).expect("valid time")
 }
 
-fn at(secs: i64) -> DateTime<Utc> {
-    base() + Duration::seconds(secs)
+fn at(secs: i64) -> Timestamp {
+    base() + SignedDuration::from_secs(secs)
 }
 
 fn state_config() -> StateConfig {
@@ -175,7 +174,7 @@ fn healthy_traffic() -> Vec<Vec<u8>> {
 }
 
 /// An ARP request from `from` asking about `target`.
-fn arp_request(from: &str, target: [u8; 4], when: DateTime<Utc>) -> Observation {
+fn arp_request(from: &str, target: [u8; 4], when: Timestamp) -> Observation {
     let mut frame = fixtures::arp_request();
     let source = mac(from).octets();
     frame[6..12].copy_from_slice(&source);
@@ -185,7 +184,7 @@ fn arp_request(from: &str, target: [u8; 4], when: DateTime<Utc>) -> Observation 
 }
 
 /// An ARP reply from `from` claiming `claimed`.
-fn arp_claim(from: &str, claimed: [u8; 4], when: DateTime<Utc>) -> Observation {
+fn arp_claim(from: &str, claimed: [u8; 4], when: Timestamp) -> Observation {
     let mut frame = fixtures::arp_reply();
     let source = mac(from).octets();
     frame[6..12].copy_from_slice(&source);
@@ -195,7 +194,7 @@ fn arp_claim(from: &str, claimed: [u8; 4], when: DateTime<Utc>) -> Observation {
 }
 
 /// A DHCP Offer from `from`.
-fn dhcp_offer_from(from: &str, when: DateTime<Utc>) -> Observation {
+fn dhcp_offer_from(from: &str, when: Timestamp) -> Observation {
     let mut frame = fixtures::dhcp_offer();
     frame[6..12].copy_from_slice(&mac(from).octets());
     dhcp::parse_frame(&frame, "eth0", when).expect("parsed")

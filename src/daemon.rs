@@ -24,8 +24,8 @@ use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
 use std::time::Duration;
 
+use crate::clock::Timestamp;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
 
@@ -141,7 +141,7 @@ pub async fn run(
 
         // A device that went offline while the daemon was not running left its
         // location stay open. Close them before anything reads the table.
-        match queries::close_stale_location_stays(&client, Utc::now()).await {
+        match queries::close_stale_location_stays(&client, Timestamp::now()).await {
             Ok(0) => {}
             Ok(closed) => tracing::info!(closed, "closed location stays left open by a restart"),
             Err(err) => tracing::warn!(%err, "could not close stale location stays"),
@@ -249,7 +249,7 @@ pub async fn run(
 
     // Reverse DNS answers arrive out of band and re-enter the state machine as
     // ordinary signals.
-    let (signal_tx, mut signal_rx) = mpsc::channel::<(MacAddr, Signal, DateTime<Utc>)>(256);
+    let (signal_tx, mut signal_rx) = mpsc::channel::<(MacAddr, Signal, Timestamp)>(256);
     let resolver = if config.identity.reverse_dns {
         match ReverseResolver::from_system(config.identity.reverse_dns_ttl.get()) {
             Ok(resolver) => Some(resolver),
@@ -332,9 +332,9 @@ pub async fn run(
     let show_table = !opts.no_table && std::io::stdout().is_terminal();
     let mut shutdown_rx = shutdown.clone();
     let mut asked_for_rdns: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let local_offset = *chrono::Local::now().offset();
-    let mut last_maintenance: Option<DateTime<Utc>> = None;
-    let started_at = Utc::now();
+    let local_offset = crate::clock::local_offset_now();
+    let mut last_maintenance: Option<Timestamp> = None;
+    let started_at = Timestamp::now();
 
     loop {
         tokio::select! {
@@ -421,7 +421,7 @@ pub async fn run(
             }
 
             _ = sweep.tick() => {
-                let effects = manager.sweep(Utc::now());
+                let effects = manager.sweep(Timestamp::now());
                 let (events, people) = apply_and_track(
                     &db, &mut persister, &bus, &mut manager, &mut registry, &effects,
                 ).await;
@@ -461,7 +461,7 @@ pub async fn run(
                             registry: &mut registry,
                         };
                         let applied = apply_enrichments(
-                            &mut sinks, &location_map, &enriched.enrichments, Utc::now(),
+                            &mut sinks, &location_map, &enriched.enrichments, Timestamp::now(),
                         ).await;
                         summary.location_changes += applied.locations;
                         summary.events += applied.events;
@@ -472,9 +472,9 @@ pub async fn run(
 
             _ = maintenance_tick.tick() => {
                 if maintenance::is_due(
-                    &config.maintenance, Utc::now(), last_maintenance, local_offset,
+                    &config.maintenance, Timestamp::now(), last_maintenance, local_offset,
                 ) {
-                    last_maintenance = Some(Utc::now());
+                    last_maintenance = Some(Timestamp::now());
                     run_maintenance(&db, &config.maintenance).await;
                 }
             }
@@ -504,7 +504,7 @@ pub async fn run(
 
             _ = sample_tick.tick(), if sampler.is_some() => {
                 if let Some(sampler) = sampler.as_mut() {
-                    sampler.settle(Utc::now(), |mac| manager.is_named(mac));
+                    sampler.settle(Timestamp::now(), |mac| manager.is_named(mac));
                 }
             }
 
@@ -529,7 +529,7 @@ pub async fn run(
     flush_devices(&db, &persister, &mut manager).await;
     // Held frames are decided now, on what is known now, rather than lost.
     if let Some(sampler) = sampler.as_mut() {
-        sampler.settle(Utc::now() + sample_config.limits().settle, |mac| {
+        sampler.settle(Timestamp::now() + sample_config.limits().settle, |mac| {
             manager.is_named(mac)
         });
     }
@@ -719,7 +719,7 @@ async fn apply_enrichments(
     sinks: &mut Sinks<'_>,
     map: &LocationMap,
     enrichments: &[crate::enrich::Enrichment],
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Applied {
     let mut applied = Applied::default();
     let mut outcome = people::Outcome::default();
@@ -829,7 +829,7 @@ async fn run_maintenance(db: &Db, config: &crate::config::MaintenanceConfig) {
             return;
         }
     };
-    match maintenance::run(&client, config, Utc::now()).await {
+    match maintenance::run(&client, config, Timestamp::now()).await {
         Ok(report) => tracing::info!(summary = %report.summary(), "nightly maintenance complete"),
         Err(err) => tracing::error!(%err, "nightly maintenance failed"),
     }
@@ -842,7 +842,7 @@ async fn run_maintenance(db: &Db, config: &crate::config::MaintenanceConfig) {
 /// watches the network, not one that complains once a minute.
 fn write_status(
     config: &Config,
-    started_at: DateTime<Utc>,
+    started_at: Timestamp,
     summary: &RunSummary,
     manager: &Manager,
     dedup: &ObservationDedup,
@@ -851,7 +851,7 @@ fn write_status(
 ) {
     let (online, idle, offline) = manager.state_counts();
     let mut status = Status::new(started_at);
-    status.updated_at = Utc::now();
+    status.updated_at = Timestamp::now();
     status.learning = manager.is_learning();
     status.observations = summary.observations;
     status.duplicates = dedup.duplicates_suppressed();
@@ -1268,7 +1268,7 @@ fn spawn_notifier(
                     Vec::new()
                 }
                 event = rx.recv() => match event {
-                    Ok(event) => dispatcher.offer(event, Utc::now()),
+                    Ok(event) => dispatcher.offer(event, Timestamp::now()),
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(skipped = n, "the notifier fell behind the event bus");
                         Vec::new()
@@ -1279,7 +1279,7 @@ fn spawn_notifier(
                         return;
                     }
                 },
-                _ = tick.tick() => dispatcher.tick(Utc::now()),
+                _ = tick.tick() => dispatcher.tick(Timestamp::now()),
             };
             send_all(&notifiers, &db, &deliveries).await;
         }
@@ -1318,12 +1318,16 @@ fn spawn_reverse_lookup(
     resolver: ReverseResolver,
     mac: MacAddr,
     ip: std::net::IpAddr,
-    tx: mpsc::Sender<(MacAddr, Signal, DateTime<Utc>)>,
+    tx: mpsc::Sender<(MacAddr, Signal, Timestamp)>,
 ) {
     tokio::spawn(async move {
         if let Some(name) = resolver.lookup(ip).await {
             let _ = tx
-                .send((mac, Signal::new(SignalKind::ReverseDns, name), Utc::now()))
+                .send((
+                    mac,
+                    Signal::new(SignalKind::ReverseDns, name),
+                    Timestamp::now(),
+                ))
                 .await;
         }
     });
@@ -1366,7 +1370,7 @@ async fn finish_learning(db: &Db, manager: &Manager) {
 
 /// Redraws the live device table.
 fn draw(manager: &Manager, dedup: &ObservationDedup) {
-    let now = Utc::now();
+    let now = Timestamp::now();
     let devices = manager.snapshot();
     let (online, idle, offline) = manager.state_counts();
     // Home the cursor and clear to the end of the screen, rather than clearing

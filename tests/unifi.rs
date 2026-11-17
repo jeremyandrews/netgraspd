@@ -18,7 +18,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use chrono::{DateTime, TimeZone, Utc};
+use netgraspd::clock::Timestamp;
 use netgraspd::config::UnifiConfig;
 use netgraspd::db::queries;
 use netgraspd::device::Manager;
@@ -35,10 +35,8 @@ const LAPTOP: &str = "b8:27:eb:00:00:02";
 const STRANGER: &str = "02:aa:bb:cc:dd:ee";
 const KITCHEN_AP_MAC: &str = "f4:e2:c6:11:22:33";
 
-fn base() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 14, 17, 0, 0)
-        .single()
-        .expect("valid time")
+fn base() -> Timestamp {
+    Timestamp::from_utc(2026, 8, 14, 17, 0, 0).expect("valid time")
 }
 
 fn mac(s: &str) -> MacAddr {
