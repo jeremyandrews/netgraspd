@@ -496,6 +496,7 @@ async fn an_empty_database_passes_the_plugin_first_check() {
     db.execute(
         "DROP TABLE IF EXISTS ng_people, ng_location_history, ng_ip_history, ng_events,
                               ng_presence, ng_device_signals, ng_devices,
+                              ng_notify_status, ng_notify_requests,
                               refinery_schema_history CASCADE",
     )
     .await;
@@ -603,6 +604,7 @@ async fn migrate_builds_the_schema_on_an_empty_database_and_maintain_does_not() 
     db.execute(
         "DROP TABLE IF EXISTS ng_people, ng_location_history, ng_ip_history, ng_events,
                               ng_presence, ng_device_signals, ng_devices,
+                              ng_notify_status, ng_notify_requests,
                               refinery_schema_history CASCADE",
     )
     .await;
@@ -644,6 +646,7 @@ async fn a_read_command_against_an_empty_database_names_the_command_that_fixes_i
     db.execute(
         "DROP TABLE IF EXISTS ng_people, ng_location_history, ng_ip_history, ng_events,
                               ng_presence, ng_device_signals, ng_devices,
+                              ng_notify_status, ng_notify_requests,
                               refinery_schema_history CASCADE",
     )
     .await;

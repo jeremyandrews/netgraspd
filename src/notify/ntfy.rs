@@ -458,6 +458,87 @@ mod tests {
         assert!(body.contains("MAC: 3c:22:fb:9a:1b:2c"), "{body}");
     }
 
+    fn rome() -> jiff::tz::TimeZone {
+        jiff::tz::TimeZone::fixed(jiff::tz::Offset::from_seconds(3600).expect("offset"))
+    }
+
+    fn jamie(kind: EventType, details: serde_json::Value) -> DeviceEvent {
+        DeviceEvent {
+            display_name: "Jamie".into(),
+            // 17:42 UTC is 18:42 in Rome in November.
+            at: Timestamp::from_utc(2026, 11, 17, 17, 42, 0).expect("valid time"),
+            details,
+            ..event(kind)
+        }
+    }
+
+    #[test]
+    fn an_arrival_names_the_person_and_the_device_at_local_time() {
+        let e = jamie(
+            EventType::PersonArrived,
+            serde_json::json!({ "person": "Jamie", "device_name": "Jamie's iPhone" }),
+        );
+        assert_eq!(
+            title_in(&e, &rome()),
+            "Jamie is home: Jamie's iPhone joined at 18:42"
+        );
+        assert_eq!(
+            body_in(&e, &rome()),
+            "Jamie is home: Jamie's iPhone joined at 18:42"
+        );
+    }
+
+    #[test]
+    fn an_arrival_with_a_place_says_where_after_the_sentence() {
+        let e = jamie(
+            EventType::PersonArrived,
+            serde_json::json!({
+                "device_name": "Jamie's iPhone",
+                "location": "Kitchen",
+                "via": "Driveway",
+            }),
+        );
+        assert_eq!(
+            body_in(&e, &rome()),
+            "Jamie is home: Jamie's iPhone joined at 18:42\nIn the Kitchen, via the Driveway"
+        );
+    }
+
+    #[test]
+    fn an_arrival_recorded_before_device_names_falls_back_to_the_mac() {
+        let e = jamie(EventType::PersonArrived, serde_json::json!({}));
+        assert_eq!(
+            title_in(&e, &rome()),
+            "Jamie is home: 3c:22:fb:9a:1b:2c joined at 18:42"
+        );
+    }
+
+    #[test]
+    fn a_departure_gives_the_last_time_the_device_was_seen() {
+        let e = jamie(
+            EventType::PersonDeparted,
+            serde_json::json!({ "last_seen_at": "2026-11-17T06:55:00Z" }),
+        );
+        assert_eq!(title_in(&e, &rome()), "Jamie left: last seen 07:55");
+        assert_eq!(body_in(&e, &rome()), "Jamie left: last seen 07:55");
+    }
+
+    #[test]
+    fn a_departure_without_a_last_seen_time_uses_the_event_time() {
+        let e = jamie(EventType::PersonDeparted, serde_json::Value::Null);
+        assert_eq!(title_in(&e, &rome()), "Jamie left: last seen 18:42");
+    }
+
+    #[test]
+    fn the_test_alert_says_what_it_is_and_when() {
+        let at = Timestamp::from_utc(2026, 11, 17, 17, 43, 0).expect("valid time");
+        assert_eq!(TEST_TITLE, "Netgrasp test alert");
+        assert_eq!(
+            test_body(at, &rome()),
+            "Alerts from netgraspd reach this device. Sent at 18:43."
+        );
+    }
+
     #[test]
     fn each_event_type_gets_its_own_title_and_tag() {
         let mut seen = Vec::new();

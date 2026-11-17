@@ -633,7 +633,7 @@ mod tests {
     }
 
     #[test]
-    fn the_seven_tables_the_plugin_reads_are_all_covered() {
+    fn the_nine_tables_the_plugin_reads_are_all_covered() {
         let names: Vec<&str> = EXPECTED.iter().map(|(t, _)| *t).collect();
         for required in [
             "ng_devices",
@@ -643,10 +643,12 @@ mod tests {
             "ng_ip_history",
             "ng_location_history",
             "ng_people",
+            "ng_notify_status",
+            "ng_notify_requests",
         ] {
             assert!(names.contains(&required), "{required} is not in EXPECTED");
         }
-        assert_eq!(names.len(), 7, "an unexpected table joined the contract");
+        assert_eq!(names.len(), 9, "an unexpected table joined the contract");
     }
 
     #[test]
