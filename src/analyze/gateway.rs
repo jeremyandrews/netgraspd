@@ -489,12 +489,10 @@ impl GatewayTracker {
 mod tests {
     use super::*;
     use crate::capture::{arp, dhcp, fixtures};
-    use chrono::{DateTime, TimeZone, Utc};
+    use crate::clock::Timestamp;
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(1_770_000_000 + secs, 0)
-            .single()
-            .expect("valid timestamp")
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::from_unix(1_770_000_000 + secs, 0).expect("valid timestamp")
     }
 
     fn mac(s: &str) -> MacAddr {
@@ -502,7 +500,7 @@ mod tests {
     }
 
     /// An ARP request from `from` asking about `target`.
-    fn request(from: &str, target: [u8; 4], when: DateTime<Utc>) -> Observation {
+    fn request(from: &str, target: [u8; 4], when: Timestamp) -> Observation {
         let mut frame = fixtures::arp_request();
         let source = mac(from).octets();
         frame[6..12].copy_from_slice(&source);
@@ -512,7 +510,7 @@ mod tests {
     }
 
     /// An ARP reply from `from` claiming `claimed`.
-    fn reply(from: &str, claimed: [u8; 4], when: DateTime<Utc>) -> Observation {
+    fn reply(from: &str, claimed: [u8; 4], when: Timestamp) -> Observation {
         let mut frame = fixtures::arp_reply();
         let source = mac(from).octets();
         frame[6..12].copy_from_slice(&source);

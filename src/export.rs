@@ -16,8 +16,8 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use crate::clock::Timestamp;
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::json;
 
@@ -99,9 +99,9 @@ pub struct ExportedDevice {
     /// Interface last seen on.
     pub last_interface: Option<String>,
     /// First sighting.
-    pub first_seen_at: DateTime<Utc>,
+    pub first_seen_at: Timestamp,
     /// Most recent sighting.
-    pub last_seen_at: DateTime<Utc>,
+    pub last_seen_at: Timestamp,
     /// Every stored signal, as `{kind, value}`.
     pub signals: Vec<BTreeMap<&'static str, String>>,
 }
@@ -185,7 +185,7 @@ pub async fn export(config: &Config, dir: &Path) -> Result<ExportReport> {
     let records = queries::load_devices(&client).await?;
     let signals = queries::load_all_signals(&client).await?;
     let events = queries::recent_events(&client, i64::MAX).await?;
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     let devices: Vec<ExportedDevice> = records
         .iter()
@@ -355,7 +355,7 @@ fn cell(value: Option<&str>) -> String {
 // would only scatter a document that reads top to bottom.
 fn summary(
     config: &Config,
-    now: DateTime<Utc>,
+    now: Timestamp,
     status: Option<&Status>,
     devices: &[ExportedDevice],
     events: &[queries::EventRecord],
@@ -367,7 +367,7 @@ fn summary(
     let _ = writeln!(
         out,
         "Written {} by netgraspd {}, from the database at `{}`.\n",
-        now.format("%Y-%m-%d %H:%M:%S UTC"),
+        now.strftime("%Y-%m-%d %H:%M:%S UTC"),
         env!("CARGO_PKG_VERSION"),
         config::redact_database_url(&config.database.url)
     );
@@ -386,7 +386,7 @@ fn summary(
             let _ = writeln!(
                 out,
                 "From the status file the daemon last wrote at {}, after running {}.\n",
-                status.updated_at.format("%Y-%m-%d %H:%M:%S UTC"),
+                status.updated_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
                 crate::runtime::human_duration(status.uptime())
             );
             for (interface, verdict) in status.verdicts() {
@@ -429,7 +429,7 @@ fn summary(
                 cell(d.typed_by.as_deref()),
                 cell(d.vendor.as_deref()),
                 cell(d.last_ip.as_deref()),
-                d.last_seen_at.format("%Y-%m-%d %H:%M"),
+                d.last_seen_at.strftime("%Y-%m-%d %H:%M"),
             );
         }
         let _ = writeln!(out);
@@ -458,7 +458,7 @@ fn summary(
             let _ = writeln!(
                 out,
                 "| {} | {} | {} |",
-                e.timestamp.format("%Y-%m-%d %H:%M:%S"),
+                e.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
                 e.event_type,
                 cell(e.device_label.as_deref())
             );

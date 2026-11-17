@@ -1,7 +1,7 @@
--- Netgrasp daemon schema, V4: what the web side had to reconstruct, kept true
+-- Netgrasp daemon schema, V5: what the web side had to reconstruct, kept true
 -- by the daemon instead.
 --
--- Additive only. Nothing V1 to V3 created is renamed, dropped or retyped: the
+-- Additive only. Nothing V1 to V4 created is renamed, dropped or retyped: the
 -- Trovato plugin's migrations and its daemon_schema.sql fixture read those
 -- tables, and an install whose plugin has not adopted anything below must keep
 -- working exactly as it did.

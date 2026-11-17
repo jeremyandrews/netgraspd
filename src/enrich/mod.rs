@@ -22,10 +22,10 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use serde_json::Value as Json;
 use tokio::time::Instant;
 
+use crate::clock::Timestamp;
 use crate::config::EnrichmentConfig;
 use crate::device::DeviceSnapshot;
 use crate::types::MacAddr;
@@ -185,9 +185,9 @@ pub struct EnricherStatus {
     /// Attempts that failed.
     pub failures: u64,
     /// When an attempt last succeeded.
-    pub last_success_at: Option<DateTime<Utc>>,
+    pub last_success_at: Option<Timestamp>,
     /// When an attempt last failed.
-    pub last_failure_at: Option<DateTime<Utc>>,
+    pub last_failure_at: Option<Timestamp>,
     /// Why the most recent failure failed. Kept after a later success, as
     /// history; [`EnricherStatus::state`] is what says whether it still applies.
     pub last_error: Option<String>,
@@ -222,14 +222,14 @@ impl EnricherStatus {
     }
 
     /// Records one attempt that succeeded.
-    pub fn succeeded(&mut self, at: DateTime<Utc>) {
+    pub fn succeeded(&mut self, at: Timestamp) {
         self.polls += 1;
         self.last_success_at = Some(at);
         self.last_ok = Some(true);
     }
 
     /// Records one attempt that failed, and why.
-    pub fn failed(&mut self, at: DateTime<Utc>, error: impl Into<String>) {
+    pub fn failed(&mut self, at: Timestamp, error: impl Into<String>) {
         self.polls += 1;
         self.failures += 1;
         self.last_failure_at = Some(at);
@@ -397,7 +397,7 @@ impl Orchestrator {
             scheduled.next_due = now + started.elapsed() + scheduled.interval;
             match result {
                 Ok(enrichments) => {
-                    scheduled.status.succeeded(Utc::now());
+                    scheduled.status.succeeded(Timestamp::now());
                     tracing::debug!(
                         enricher = scheduled.enricher.name(),
                         found = enrichments.len(),
@@ -406,7 +406,9 @@ impl Orchestrator {
                     out.extend(enrichments.into_iter().filter(|e| !e.is_empty()));
                 }
                 Err(err) => {
-                    scheduled.status.failed(Utc::now(), format!("{err:#}"));
+                    scheduled
+                        .status
+                        .failed(Timestamp::now(), format!("{err:#}"));
                     // Deliberately not fatal, and deliberately not a reason to
                     // clear anything: a controller that is rebooting must not
                     // make every device's location vanish.
@@ -705,7 +707,7 @@ mod tests {
 
     #[test]
     fn an_enricher_status_moves_from_starting_to_ok_to_failing_and_back() {
-        let t = chrono::Utc::now();
+        let t = Timestamp::now();
         let mut status = EnricherStatus::starting("unifi");
         assert_eq!(status.state(), EnrichmentState::Starting);
         status.succeeded(t);

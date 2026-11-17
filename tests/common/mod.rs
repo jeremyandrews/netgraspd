@@ -98,6 +98,7 @@ pub async fn test_db() -> Option<TestDb> {
             .batch_execute(
                 "TRUNCATE ng_events, ng_ip_history, ng_presence, ng_location_history,
                           ng_people, ng_device_signals, ng_devices,
+                          ng_notify_status, ng_notify_requests,
                           ng_daemon_status, ng_enrichment_status
                  RESTART IDENTITY CASCADE",
             )

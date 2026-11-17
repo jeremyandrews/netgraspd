@@ -15,8 +15,8 @@ mod common;
 
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, TimeZone, Utc};
 use netgraspd::cli::DevicesArgs;
+use netgraspd::clock::Timestamp;
 use netgraspd::config::Config;
 use netgraspd::db::Db;
 use netgraspd::db::queries;
@@ -31,10 +31,8 @@ fn db_message(err: &tokio_postgres::Error) -> String {
         .map_or_else(|| err.to_string(), |db| db.to_string())
 }
 
-fn at(secs: i64) -> DateTime<Utc> {
-    Utc.timestamp_opt(1_786_000_000 + secs, 0)
-        .single()
-        .expect("valid timestamp")
+fn at(secs: i64) -> Timestamp {
+    Timestamp::from_unix(1_786_000_000 + secs, 0).expect("valid timestamp")
 }
 
 #[tokio::test]
@@ -500,6 +498,7 @@ async fn an_empty_database_passes_the_plugin_first_check() {
         "DROP TABLE IF EXISTS ng_enrichment_status, ng_daemon_status,
                               ng_people, ng_location_history, ng_ip_history, ng_events,
                               ng_presence, ng_device_signals, ng_devices,
+                              ng_notify_status, ng_notify_requests,
                               refinery_schema_history CASCADE",
     )
     .await;
@@ -535,7 +534,8 @@ async fn a_read_command_against_an_under_migrated_database_names_the_version() {
     // built this database shipped V2, this build ships V3, and `stats` answered
     // with `relation "ng_location_history" does not exist`. A read command runs
     // no migration, so nothing had ever checked.
-    // Back to V2: what V4 added, then what V3 added.
+    // Back to V2: what V5 added, then what V3 added. V4's notify tables are
+    // created IF NOT EXISTS, so they survive the rollback and re-migration.
     db.execute("DROP TABLE IF EXISTS ng_enrichment_status, ng_daemon_status CASCADE")
         .await;
     db.execute("ALTER TABLE ng_events DROP COLUMN IF EXISTS person_item_id")
@@ -544,7 +544,6 @@ async fn a_read_command_against_an_under_migrated_database_names_the_version() {
         .await;
     db.execute("DELETE FROM refinery_schema_history WHERE version >= 3")
         .await;
-    let latest = format!("through V{}", netgraspd::db::embedded_max_version());
 
     let config = test_config();
     for (name, result) in [
@@ -558,7 +557,10 @@ async fn a_read_command_against_an_under_migrated_database_names_the_version() {
         let err = result.expect_err("an under-migrated database must be refused");
         let text = format!("{err:#}");
         assert!(text.contains("migrated to V2"), "{name}: {text}");
-        assert!(text.contains(&latest), "{name}: {text}");
+        // Whatever this build ships, named as such. It was V3 when this test
+        // was written; V4 added the notify tables and V5 the status tables.
+        let shipped = format!("through V{}", netgraspd::db::embedded_max_version());
+        assert!(text.contains(&shipped), "{name}: {text}");
         assert!(
             !text.contains("does not exist"),
             "{name} still leaked the raw catalog error: {text}"
@@ -614,6 +616,7 @@ async fn migrate_builds_the_schema_on_an_empty_database_and_maintain_does_not() 
         "DROP TABLE IF EXISTS ng_enrichment_status, ng_daemon_status,
                               ng_people, ng_location_history, ng_ip_history, ng_events,
                               ng_presence, ng_device_signals, ng_devices,
+                              ng_notify_status, ng_notify_requests,
                               refinery_schema_history CASCADE",
     )
     .await;
@@ -656,6 +659,7 @@ async fn a_read_command_against_an_empty_database_names_the_command_that_fixes_i
         "DROP TABLE IF EXISTS ng_enrichment_status, ng_daemon_status,
                               ng_people, ng_location_history, ng_ip_history, ng_events,
                               ng_presence, ng_device_signals, ng_devices,
+                              ng_notify_status, ng_notify_requests,
                               refinery_schema_history CASCADE",
     )
     .await;
@@ -815,7 +819,7 @@ async fn every_epoch_column_matches_its_timestamp_is_null_when_it_is_and_cannot_
             "SELECT first_seen_at_epoch FROM ng_devices WHERE id = {device_id}"
         ))
         .await,
-        at(0).timestamp(),
+        at(0).unix_seconds(),
     );
 
     // An open session's ended_at is null, and so is its twin.
@@ -985,14 +989,14 @@ async fn ng_people_carries_epoch_twins_of_its_arrival_and_departure_times() {
             "SELECT last_arrived_at_epoch FROM ng_people WHERE item_id = '{arrived}'::uuid"
         ))
         .await,
-        at(100).timestamp(),
+        at(100).unix_seconds(),
     );
     assert_eq!(
         db.scalar(&format!(
             "SELECT last_departed_at_epoch FROM ng_people WHERE item_id = '{arrived}'::uuid"
         ))
         .await,
-        at(50).timestamp(),
+        at(50).unix_seconds(),
     );
 
     let err = client

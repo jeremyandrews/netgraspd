@@ -10,7 +10,7 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
 
-use chrono::{DateTime, Utc};
+use crate::clock::Timestamp;
 use serde::{Deserialize, Serialize};
 
 /// A 48-bit IEEE 802 MAC address.
@@ -534,7 +534,7 @@ pub struct Observation {
     /// Protocol fields the security analyzers need, when the protocol has any.
     pub detail: Option<ProtocolDetail>,
     /// When the packet was seen.
-    pub observed_at: DateTime<Utc>,
+    pub observed_at: Timestamp,
 }
 
 impl Observation {
@@ -545,7 +545,7 @@ impl Observation {
         interface: impl Into<String>,
         source: &'static str,
         kind: ObservationKind,
-        observed_at: DateTime<Utc>,
+        observed_at: Timestamp,
     ) -> Self {
         Observation {
             mac,
@@ -812,7 +812,6 @@ impl fmt::Display for EventType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
     #[test]
     fn mac_parses_every_common_separator() {
@@ -1021,7 +1020,7 @@ mod tests {
 
     #[test]
     fn protocol_detail_accessors_do_not_confuse_the_two_protocols() {
-        let ts = Utc.timestamp_opt(0, 0).single().expect("epoch");
+        let ts = Timestamp::from_unix(0, 0).expect("epoch");
         let arp = Observation::new(
             "3c:22:fb:00:00:01".parse().expect("mac"),
             None,

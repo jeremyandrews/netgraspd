@@ -8,8 +8,11 @@
 #
 # The daemon does not run as root. Packet capture needs CAP_NET_RAW and nothing
 # else, so systemd grants exactly that through AmbientCapabilities and takes
-# everything else away. `setcap` on the binary is the alternative and works, but
-# it has to be reapplied after every upgrade; this survives one.
+# everything else away. CAP_NET_ADMIN is not needed: every capture handle is
+# opened non-promiscuous, so the daemon never changes an interface's flags, and
+# an AF_PACKET socket needs CAP_NET_RAW alone. `setcap` on the binary is the
+# alternative and works, but it has to be reapplied after every upgrade; this
+# survives one.
 
 [Unit]
 Description=netgraspd, a passive network device monitor
@@ -27,8 +30,8 @@ Group=netgraspd
 ExecStart=/usr/local/bin/netgraspd run --config /etc/netgrasp.toml --no-table
 
 # The capability, and only the capability.
-AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
-CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
 NoNewPrivileges=true
 
 # Everything below is the ordinary hardening for a daemon that reads packets and

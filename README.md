@@ -76,6 +76,21 @@ createuser netgrasp --pwprompt
 createdb netgrasp --owner netgrasp
 ```
 
+`createuser` and `createdb` connect to a server on the local socket. When
+Postgres runs in a container or on another host, run the same two steps as SQL
+over a superuser connection instead:
+
+```sh
+psql "postgresql://postgres:…@127.0.0.1:5432/postgres" \
+    -c "create role netgrasp login password '…'"
+psql "postgresql://postgres:…@127.0.0.1:5432/postgres" \
+    -c "create database netgrasp owner netgrasp"
+```
+
+and point `database.url` at it:
+`postgres://netgrasp:…@127.0.0.1:5432/netgrasp`. The same holds wherever
+`createuser` or `createdb` appears below.
+
 ### The image
 
 ```sh
@@ -124,7 +139,23 @@ sudo systemctl daemon-reload && sudo systemctl enable --now netgraspd
 
 The binary is built on Debian 13 (trixie) and is dynamically linked against its
 glibc and libpcap, so it wants a comparably recent distribution. On an older
-one, run the image instead. The unit grants the capture capability itself, so
+one, run the image instead.
+
+It links libpcap by Debian's soname, `libpcap.so.0.8`, which is what the
+`libpcap0.8` package installs. Other distributions ship the same libpcap 1.x
+as `libpcap.so.1`, and the binary will not start there (`error while loading
+shared libraries: libpcap.so.0.8`). Debian's `libpcap0.8` is itself libpcap
+1.10 under the old name, and every `pcap_*` symbol the binary uses is
+unversioned and present in libpcap 1.x, so a link to the installed library is
+enough. On Fedora and other RPM distributions:
+
+```sh
+sudo dnf install libpcap
+sudo ln -s libpcap.so.1 /usr/lib64/libpcap.so.0.8 && sudo ldconfig
+```
+
+(the library directory is `/usr/lib` on some distributions; `ldconfig -p |
+grep libpcap` says where it is). Or run the image, which carries its own. The unit grants the capture capability itself, so
 the binary needs no `setcap`; see [Deploying](#deploying).
 
 If you run the Trovato plugin as well, read [Compatibility](#compatibility)
@@ -141,9 +172,9 @@ have to agree on one thing, the `ng_` tables.
 |---|---|---|---|
 | 1.0.0 | 1.0.0 | version 3 (`V3__enrichment_location_people.sql`) | 0.102.0 or a later 0.x |
 
-Unreleased: `main` is at schema version 4
-(`V4__people_epochs_event_person_daemon_status.sql`), which only adds. A plugin
-built for version 3 keeps working against it, because it names the columns it
+Unreleased: `main` is at schema version 5 (`V4__notify_status_and_requests.sql`
+and `V5__people_epochs_event_person_daemon_status.sql`), both of which only add.
+A plugin built for version 3 keeps working against it, because it names the columns it
 reads and reads none of the new ones; it has not adopted them yet, and the
 paired release lands when it does.
 
@@ -175,7 +206,7 @@ $EDITOR netgrasp.toml          # at minimum, database.url
 
 # 3. Build, and grant the one capability capture needs.
 cargo build --release
-sudo setcap cap_net_raw,cap_net_admin+ep target/release/netgraspd
+sudo setcap cap_net_raw+ep target/release/netgraspd
 
 # 4. Watch. The first run on an empty database spends five minutes learning.
 ./target/release/netgraspd run
@@ -207,7 +238,7 @@ tells you which of the following you need.
 root:
 
 ```sh
-sudo setcap cap_net_raw,cap_net_admin+ep /usr/local/bin/netgraspd
+sudo setcap cap_net_raw+ep /usr/local/bin/netgraspd
 ```
 
 This has to be reapplied after every upgrade. Under systemd, don't: the shipped
@@ -352,6 +383,7 @@ Who owns which column:
 |---|---|---|
 | `ng_devices` | identity, state, addresses, location | `display_name`, `notes`, `hidden`, `notify`, `owner_item_id`, `trovato_item_id` |
 | `ng_people` | `state`, `current_location`, `last_arrived_at`, `last_departed_at` | `item_id`, `name`, `notes`, `notify_arrive`, `notify_depart` |
+| `ng_notify_requests` | `handled_at`, `outcome` | inserts the row (`requested_by`, `requested_at`) |
 | everything else | all of it | nothing |
 
 Ownership runs in both directions, on two different clocks. The daemon writes
@@ -374,13 +406,13 @@ Every `timestamptz` the plugin reads has a generated `bigint` twin named
 `<column>_epoch`, because the Trovato kernel's database host function decodes a
 fixed list of types and returns null for a `timestamptz`. They are
 `GENERATED ALWAYS ... STORED`, so nothing can write one out of step with its
-source and the `timestamptz` column stays canonical. Since V4 that includes
+source and the `timestamptz` column stays canonical. Since V5 that includes
 `ng_people.last_arrived_at_epoch` and `last_departed_at_epoch`, which V3 left
 out.
 
-### What V4 adds for the web side
+### What V5 adds for the web side
 
-V4 is additive: two columns, two twins and two tables, and nothing V1 to V3
+V5 is additive: two columns, two twins and two tables, and nothing V1 to V4
 created is renamed, dropped or retyped. Everything below is daemon owned.
 
 - **`ng_events.person_item_id`** (`uuid`, null on every event that is not
@@ -784,16 +816,25 @@ as root, and survives an upgrade in a way that `setcap` on the binary does not.
 docker build -t netgraspd .
 
 # Capture: host networking to see the LAN, one capability, nothing else.
+# database.url comes from the mounted file.
 docker run -d --name netgraspd \
     --network=host --cap-drop=ALL --cap-add=NET_RAW --user root \
-    -e NETGRASP_DATABASE__URL=postgres://netgrasp:netgrasp@localhost:5432/netgrasp \
     -v /etc/netgrasp.toml:/etc/netgrasp.toml:ro \
     -v netgraspd-state:/var/lib/netgraspd \
     netgraspd run --config /etc/netgrasp.toml --no-table
 
-# Everything else needs neither, and runs as the image's unprivileged user.
-docker run --rm netgraspd stats
+# Everything else needs no capability, and runs as the image's unprivileged
+# user. It still needs the same configuration, the same network to reach a
+# database on the host's loopback, and the state volume the status file is in.
+docker run --rm --network=host \
+    -v /etc/netgrasp.toml:/etc/netgrasp.toml:ro \
+    -v netgraspd-state:/var/lib/netgraspd \
+    netgraspd --config /etc/netgrasp.toml stats
 ```
+
+An environment variable overrides the file: `-e
+NETGRASP_DATABASE__URL=…` would replace the mounted `database.url`, credentials
+and all. Use one or the other, not both.
 
 Build the Raspberry Pi image with `--platform linux/arm64`.
 
@@ -963,6 +1004,29 @@ Two categories skip the `notify.event_types` allowlist because they are governed
 elsewhere: security events by `[security.notifications]`, and person events by
 `notify_arrive` and `notify_depart` on the person row. Requiring them in two
 places would make a silent misconfiguration look like a working setup.
+
+Arriving and leaving are one sentence each, with the time on the local clock:
+
+- `Jamie is home: Jamie's iPhone joined at 18:42`
+- `Jamie left: last seen 07:55`
+
+They use the person's name and the device's, never a pronoun. A departure gives
+the time the device was last heard from, not the time the offline timeout
+declared it gone.
+
+**What the web side can see.** The plugin cannot read this file and has no
+outbound HTTP, so two tables carry what it needs, and neither ever holds the
+topic, the server or the token:
+
+- `ng_notify_status`, one row: `notify_configured` (a notifier is built and
+  `notify.enabled` is on), `notify_backend` (`ntfy`), and `last_delivery_ok` and
+  `last_delivery_at` for the most recent attempt, an alert or a test.
+- `ng_notify_requests`: the plugin inserts a row to ask for a test alert. Every
+  `state.reconcile_interval` the daemon sends one test for however many rows are
+  waiting ("Netgrasp test alert": "Alerts from netgraspd reach this device. Sent
+  at 18:43.") and marks each one handled with an `outcome` of `sent`, `failed`
+  or `not_configured`. The outcome is a word and never the transport's error,
+  because that error names the URL and the URL contains the topic.
 
 ## Security analyzers
 

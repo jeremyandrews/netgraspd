@@ -233,8 +233,8 @@ impl Persister {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::Timestamp;
     use crate::types::DeviceState;
-    use chrono::{TimeZone, Utc};
 
     fn record(mac: &str, id: i64) -> DeviceRecord {
         DeviceRecord {
@@ -254,8 +254,8 @@ mod tests {
             last_ip: None,
             last_ipv6: None,
             last_interface: None,
-            first_seen_at: Utc.timestamp_opt(0, 0).single().expect("epoch"),
-            last_seen_at: Utc.timestamp_opt(0, 0).single().expect("epoch"),
+            first_seen_at: Timestamp::from_unix(0, 0).expect("epoch"),
+            last_seen_at: Timestamp::from_unix(0, 0).expect("epoch"),
             baseline: false,
             hidden: false,
             notify: true,

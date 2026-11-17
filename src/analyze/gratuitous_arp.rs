@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use crate::clock::Timestamp;
 use serde_json::json;
 
 use crate::analyze::window::{BoundedMap, RateWindow};
@@ -30,7 +30,7 @@ const WINDOW_CAPACITY: usize = 256;
 #[derive(Debug)]
 struct Tracked {
     announcements: RateWindow,
-    last_alert: Option<DateTime<Utc>>,
+    last_alert: Option<Timestamp>,
 }
 
 /// The gratuitous ARP flood analyzer.
@@ -119,12 +119,9 @@ mod tests {
     use crate::capture::{arp, fixtures};
     use crate::config::HumanDuration;
     use crate::types::{EventPriority, Observation};
-    use chrono::TimeZone;
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(1_770_000_000 + secs, 0)
-            .single()
-            .expect("valid timestamp")
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::from_unix(1_770_000_000 + secs, 0).expect("valid timestamp")
     }
 
     fn mac(s: &str) -> MacAddr {
@@ -141,7 +138,7 @@ mod tests {
     }
 
     /// A gratuitous ARP from `from`.
-    fn announcement(from: &str, when: DateTime<Utc>) -> Observation {
+    fn announcement(from: &str, when: Timestamp) -> Observation {
         let mut frame = fixtures::arp_gratuitous();
         let source = mac(from).octets();
         frame[6..12].copy_from_slice(&source);

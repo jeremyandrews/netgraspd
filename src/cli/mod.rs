@@ -24,8 +24,8 @@ pub mod table;
 
 use std::path::PathBuf;
 
+use crate::clock::Timestamp;
 use anyhow::{Context, Result};
-use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 
 use crate::config::{self, Config, ConfigSource, Override};
@@ -204,6 +204,18 @@ impl Cli {
     }
 }
 
+/// Whether log lines carry ANSI colour.
+///
+/// Only when the log stream is a terminal and `NO_COLOR` is unset or empty
+/// (<https://no-color.org>). Under systemd or `docker logs` the stream is a
+/// pipe, and colour there is escape bytes in the journal, in `grep` and in
+/// every log shipper downstream.
+#[must_use]
+pub fn log_colour(log_stream_is_terminal: bool, no_color: Option<&std::ffi::OsStr>) -> bool {
+    let no_color = no_color.is_some_and(|value| !value.is_empty());
+    log_stream_is_terminal && !no_color
+}
+
 /// Logs where the configuration came from and which database it names.
 ///
 /// Runs for every subcommand, before anything connects. A read command that
@@ -253,7 +265,7 @@ pub async fn devices(config: &Config, args: &DevicesArgs) -> Result<()> {
         println!("No devices recorded yet.");
         return Ok(());
     }
-    print!("{}", table::device_record_table(&records, Utc::now()));
+    print!("{}", table::device_record_table(&records, Timestamp::now()));
     Ok(())
 }
 
@@ -283,7 +295,7 @@ pub async fn events(config: &Config, args: &EventsArgs) -> Result<()> {
         }
         return Ok(());
     }
-    print!("{}", table::event_table(&records, Utc::now()));
+    print!("{}", table::event_table(&records, Timestamp::now()));
     Ok(())
 }
 
@@ -305,7 +317,7 @@ pub async fn people(config: &Config) -> Result<()> {
         );
         return Ok(());
     }
-    print!("{}", table::people_table(&rows, Utc::now()));
+    print!("{}", table::people_table(&rows, Timestamp::now()));
     Ok(())
 }
 
@@ -365,7 +377,7 @@ pub async fn migrate(config: &Config) -> Result<()> {
 /// error: "the daemon is not running" is one of the answers this command exists
 /// to give.
 pub async fn stats(config: &Config) -> Result<()> {
-    let now = Utc::now();
+    let now = Timestamp::now();
     println!("netgraspd {}", env!("CARGO_PKG_VERSION"));
     println!();
 
@@ -416,8 +428,8 @@ pub async fn stats(config: &Config) -> Result<()> {
     if let (Some(oldest), Some(newest)) = (oldest, newest) {
         println!(
             "  spanning {} to {} ({} of retention configured)",
-            oldest.format("%Y-%m-%d"),
-            newest.format("%Y-%m-%d"),
+            oldest.strftime("%Y-%m-%d"),
+            newest.strftime("%Y-%m-%d"),
             format_args!("{} days", config.maintenance.event_retention_days)
         );
     }
@@ -428,7 +440,7 @@ pub async fn stats(config: &Config) -> Result<()> {
         match high_water {
             Some(mark) => println!(
                 "  {table}: {summaries} summary rows, newest day {}",
-                mark.format("%Y-%m-%d")
+                mark.strftime("%Y-%m-%d")
             ),
             None => println!(
                 "  {table}: nothing summarised yet (rollup starts at {} days)",
@@ -476,7 +488,7 @@ fn plural(count: i64, noun: &str) -> String {
 }
 
 /// Prints the half of `stats` that comes from the running daemon.
-fn print_runtime_section(config: &Config, now: chrono::DateTime<Utc>) {
+fn print_runtime_section(config: &Config, now: Timestamp) {
     let path = &config.runtime.status_path;
     let status = match runtime::Status::read(path) {
         Ok(status) => status,
@@ -561,14 +573,14 @@ pub async fn maintain(config: &Config, args: &MaintainArgs) -> Result<()> {
     let db = Db::connect(&config.database)?;
     db.require_schema().await?;
     let client = db.client().await?;
-    let now = Utc::now();
+    let now = Timestamp::now();
     let rollup_before = maintenance::cutoff(now, config.maintenance.rollup_after_days);
     let events_before = maintenance::cutoff(now, config.maintenance.event_retention_days);
 
     println!(
         "Rolling up presence and location before {}, pruning events before {}.",
-        rollup_before.format("%Y-%m-%d"),
-        events_before.format("%Y-%m-%d")
+        rollup_before.strftime("%Y-%m-%d"),
+        events_before.strftime("%Y-%m-%d")
     );
 
     if args.dry_run {
@@ -608,11 +620,7 @@ pub async fn maintain(config: &Config, args: &MaintainArgs) -> Result<()> {
 }
 
 /// Runs a counting query with one timestamp parameter.
-async fn db_scalar(
-    client: &queries::Client,
-    sql: &str,
-    before: chrono::DateTime<Utc>,
-) -> Result<i64> {
+async fn db_scalar(client: &queries::Client, sql: &str, before: Timestamp) -> Result<i64> {
     let row = client.query_one(sql, &[&before]).await?;
     Ok(row.try_get(0)?)
 }
@@ -729,6 +737,17 @@ mod tests {
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).expect("arguments parse")
+    }
+
+    #[test]
+    fn logs_are_coloured_only_on_a_terminal_without_no_color() {
+        use std::ffi::OsStr;
+        assert!(log_colour(true, None), "a terminal, nothing said");
+        assert!(!log_colour(false, None), "a pipe: journald, docker logs");
+        assert!(!log_colour(true, Some(OsStr::new("1"))), "NO_COLOR set");
+        assert!(!log_colour(false, Some(OsStr::new("1"))));
+        // The convention: an empty NO_COLOR is the same as an absent one.
+        assert!(log_colour(true, Some(OsStr::new(""))));
     }
 
     #[test]

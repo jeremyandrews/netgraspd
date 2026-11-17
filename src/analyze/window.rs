@@ -11,11 +11,12 @@
 //! seconds, and a security detector that trusted state written before a crash
 //! would be trusting state written by whatever caused the crash.
 
+use jiff::SignedDuration;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use crate::clock::Timestamp;
 
 /// A map with a hard entry cap that evicts the least recently touched key.
 ///
@@ -24,7 +25,7 @@ use chrono::{DateTime, Utc};
 /// allocation-free, and impossible to get subtly wrong.
 #[derive(Debug)]
 pub struct BoundedMap<K, V> {
-    entries: HashMap<K, (V, DateTime<Utc>)>,
+    entries: HashMap<K, (V, Timestamp)>,
     capacity: usize,
     evictions: u64,
 }
@@ -46,7 +47,7 @@ impl<K: Eq + Hash + Clone, V> BoundedMap<K, V> {
     }
 
     /// The value for a key, marking it as touched now.
-    pub fn get_mut(&mut self, key: &K, now: DateTime<Utc>) -> Option<&mut V> {
+    pub fn get_mut(&mut self, key: &K, now: Timestamp) -> Option<&mut V> {
         self.entries.get_mut(key).map(|(value, seen)| {
             *seen = now;
             value
@@ -58,7 +59,7 @@ impl<K: Eq + Hash + Clone, V> BoundedMap<K, V> {
     pub fn entry_or_insert_with(
         &mut self,
         key: K,
-        now: DateTime<Utc>,
+        now: Timestamp,
         default: impl FnOnce() -> V,
     ) -> &mut V {
         if !self.entries.contains_key(&key) && self.entries.len() >= self.capacity {
@@ -70,7 +71,7 @@ impl<K: Eq + Hash + Clone, V> BoundedMap<K, V> {
     }
 
     /// Inserts or replaces a value.
-    pub fn insert(&mut self, key: K, value: V, now: DateTime<Utc>) {
+    pub fn insert(&mut self, key: K, value: V, now: Timestamp) {
         if !self.entries.contains_key(&key) && self.entries.len() >= self.capacity {
             self.evict_oldest();
         }
@@ -78,12 +79,12 @@ impl<K: Eq + Hash + Clone, V> BoundedMap<K, V> {
     }
 
     /// Drops every entry untouched for longer than `max_age`.
-    pub fn prune(&mut self, now: DateTime<Utc>, max_age: Duration) {
-        let Ok(max_age) = chrono::Duration::from_std(max_age) else {
+    pub fn prune(&mut self, now: Timestamp, max_age: Duration) {
+        let Ok(max_age) = SignedDuration::try_from(max_age) else {
             return;
         };
         self.entries
-            .retain(|_, (_, seen)| now.signed_duration_since(*seen) <= max_age);
+            .retain(|_, (_, seen)| now.since(*seen) <= max_age);
     }
 
     /// How many entries are held.
@@ -128,7 +129,7 @@ impl<K: Eq + Hash + Clone, V> BoundedMap<K, V> {
 /// unanswered ARP two hundred times is not sweeping anything.
 #[derive(Debug, Default)]
 pub struct DistinctWindow<T> {
-    seen: Vec<(T, DateTime<Utc>)>,
+    seen: Vec<(T, Timestamp)>,
     capacity: usize,
 }
 
@@ -144,12 +145,11 @@ impl<T: Eq + Clone> DistinctWindow<T> {
 
     /// Records a value and returns how many distinct values are inside the
     /// window as of `now`.
-    pub fn record(&mut self, value: T, now: DateTime<Utc>, window: Duration) -> usize {
-        let Ok(window) = chrono::Duration::from_std(window) else {
+    pub fn record(&mut self, value: T, now: Timestamp, window: Duration) -> usize {
+        let Ok(window) = SignedDuration::try_from(window) else {
             return self.seen.len();
         };
-        self.seen
-            .retain(|(_, at)| now.signed_duration_since(*at) <= window);
+        self.seen.retain(|(_, at)| now.since(*at) <= window);
         match self
             .seen
             .iter_mut()
@@ -191,7 +191,7 @@ impl<T: Eq + Clone> DistinctWindow<T> {
 /// A count of events inside a sliding time window.
 #[derive(Debug, Default)]
 pub struct RateWindow {
-    events: Vec<DateTime<Utc>>,
+    events: Vec<Timestamp>,
     capacity: usize,
 }
 
@@ -206,12 +206,11 @@ impl RateWindow {
     }
 
     /// Records an event and returns how many are inside the window.
-    pub fn record(&mut self, now: DateTime<Utc>, window: Duration) -> usize {
-        let Ok(window) = chrono::Duration::from_std(window) else {
+    pub fn record(&mut self, now: Timestamp, window: Duration) -> usize {
+        let Ok(window) = SignedDuration::try_from(window) else {
             return self.events.len();
         };
-        self.events
-            .retain(|at| now.signed_duration_since(*at) <= window);
+        self.events.retain(|at| now.since(*at) <= window);
         if self.events.len() >= self.capacity {
             self.events.remove(0);
         }
@@ -240,12 +239,9 @@ impl RateWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(1_770_000_000 + secs, 0)
-            .single()
-            .expect("valid timestamp")
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::from_unix(1_770_000_000 + secs, 0).expect("valid timestamp")
     }
 
     #[test]

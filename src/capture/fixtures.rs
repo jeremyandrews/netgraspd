@@ -198,6 +198,7 @@ pub fn all() -> Vec<(&'static str, Vec<u8>)> {
 }
 
 pub mod build;
+pub mod lan;
 
 #[cfg(test)]
 mod tests {
@@ -217,9 +218,7 @@ mod tests {
 
     #[test]
     fn no_parser_panics_on_any_truncation_of_any_fixture() {
-        let ts = chrono::TimeZone::timestamp_opt(&chrono::Utc, 1_770_000_000, 0)
-            .single()
-            .expect("valid timestamp");
+        let ts = crate::clock::Timestamp::from_unix(1_770_000_000, 0).expect("valid timestamp");
         for (name, bytes) in all() {
             for n in 0..=bytes.len() {
                 let slice = &bytes[..n];

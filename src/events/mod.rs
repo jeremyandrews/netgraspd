@@ -71,9 +71,9 @@ impl Default for EventBus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::Timestamp;
     use crate::device::DeviceEvent;
     use crate::types::EventType;
-    use chrono::{TimeZone, Utc};
 
     fn recorded(id: i64) -> RecordedEvent {
         RecordedEvent {
@@ -85,7 +85,7 @@ mod tests {
                 vendor: None,
                 ip: None,
                 interface: None,
-                at: Utc.timestamp_opt(0, 0).single().expect("epoch"),
+                at: Timestamp::from_unix(0, 0).expect("epoch"),
                 baseline: false,
                 during_learning: false,
                 notify: true,

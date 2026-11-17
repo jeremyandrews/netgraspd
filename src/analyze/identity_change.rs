@@ -39,7 +39,7 @@
 //! get through are exactly the cases where the device is now asserting something
 //! about itself that contradicts what it asserted before.
 
-use chrono::{DateTime, Utc};
+use crate::clock::Timestamp;
 use serde_json::json;
 
 use crate::analyze::{Analyzer, Context, SecurityAlert, Stimulus, cooled_down};
@@ -93,7 +93,7 @@ impl Sensitivity {
 /// The `identity_change` analyzer.
 pub struct IdentityChange {
     sensitivity: Sensitivity,
-    alerted: Vec<(MacAddr, DateTime<Utc>)>,
+    alerted: Vec<(MacAddr, Timestamp)>,
 }
 
 impl IdentityChange {
@@ -107,7 +107,7 @@ impl IdentityChange {
     }
 
     /// When this device was last alerted about.
-    fn last_alert(&self, mac: MacAddr) -> Option<DateTime<Utc>> {
+    fn last_alert(&self, mac: MacAddr) -> Option<Timestamp> {
         self.alerted
             .iter()
             .find(|(m, _)| *m == mac)
@@ -115,7 +115,7 @@ impl IdentityChange {
     }
 
     /// Records that a device was alerted about.
-    fn record_alert(&mut self, mac: MacAddr, at: DateTime<Utc>) {
+    fn record_alert(&mut self, mac: MacAddr, at: Timestamp) {
         if let Some(slot) = self.alerted.iter_mut().find(|(m, _)| *m == mac) {
             slot.1 = at;
             return;
@@ -196,12 +196,9 @@ mod tests {
     use super::*;
     use crate::analyze::GatewayTracker;
     use crate::identity::Classification;
-    use chrono::TimeZone;
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(1_770_000_000 + secs, 0)
-            .single()
-            .expect("valid timestamp")
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::from_unix(1_770_000_000 + secs, 0).expect("valid timestamp")
     }
 
     fn mac(s: &str) -> MacAddr {
@@ -229,7 +226,7 @@ mod tests {
     fn change(
         previous: Classification,
         current: Classification,
-        when: DateTime<Utc>,
+        when: Timestamp,
     ) -> Reclassification {
         Reclassification {
             mac: mac("3c:22:fb:00:00:01"),

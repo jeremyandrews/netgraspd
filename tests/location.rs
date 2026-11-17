@@ -13,7 +13,8 @@
 
 mod common;
 
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use jiff::SignedDuration;
+use netgraspd::clock::Timestamp;
 use netgraspd::config::{HumanDuration, StateConfig, UnifiConfig};
 use netgraspd::db::queries;
 use netgraspd::device::persist::Persister;
@@ -26,14 +27,12 @@ const PHONE: &str = "3c:22:fb:00:00:01";
 const LAPTOP: &str = "3c:22:fb:00:00:02";
 const WATCH: &str = "b8:27:eb:00:00:03";
 
-fn base() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 14, 17, 0, 0)
-        .single()
-        .expect("valid time")
+fn base() -> Timestamp {
+    Timestamp::from_utc(2026, 8, 14, 17, 0, 0).expect("valid time")
 }
 
-fn at(secs: i64) -> DateTime<Utc> {
-    base() + Duration::seconds(secs)
+fn at(secs: i64) -> Timestamp {
+    base() + SignedDuration::from_secs(secs)
 }
 
 fn mac(s: &str) -> MacAddr {
@@ -86,7 +85,7 @@ impl Harness {
     }
 
     /// Creates a device by observing it, exactly as a captured frame would.
-    async fn see(&mut self, db: &common::TestDb, m: &str, when: DateTime<Utc>) {
+    async fn see(&mut self, db: &common::TestDb, m: &str, when: Timestamp) {
         let observation = Observation::new(
             mac(m),
             Some("192.168.1.40".parse().expect("ip")),
@@ -101,7 +100,7 @@ impl Harness {
     }
 
     /// Places a device at an access point, as an enrichment poll would.
-    async fn place(&mut self, db: &common::TestDb, m: &str, ap: &str, when: DateTime<Utc>) {
+    async fn place(&mut self, db: &common::TestDb, m: &str, ap: &str, when: Timestamp) {
         let place = self.map.place(ap);
         let previous = self.manager.current_ap(mac(m));
         let movement = self.map.movement(previous.as_deref(), ap);
@@ -117,14 +116,14 @@ impl Harness {
     }
 
     /// Runs the timeout sweep.
-    async fn sweep(&mut self, db: &common::TestDb, now: DateTime<Utc>) {
+    async fn sweep(&mut self, db: &common::TestDb, now: Timestamp) {
         let effects = self.manager.sweep(now);
         self.apply(db, &effects, now).await;
     }
 
     /// Applies effects, then feeds the presence transitions to the registry, the
     /// same way `daemon::apply_and_track` does.
-    async fn apply(&mut self, db: &common::TestDb, effects: &[Effect], _now: DateTime<Utc>) {
+    async fn apply(&mut self, db: &common::TestDb, effects: &[Effect], _now: Timestamp) {
         if effects.is_empty() {
             return;
         }
@@ -437,7 +436,7 @@ async fn a_person_arrives_through_the_driveway_and_settles_in_the_backyard() {
     for event in &h.person_events {
         println!(
             "{}  {:<24} {}",
-            event.at.format("%H:%M:%S"),
+            event.at.strftime("%H:%M:%S"),
             event.event_type.to_string(),
             event.details
         );

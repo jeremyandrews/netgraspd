@@ -17,8 +17,8 @@
 //! the maintenance rollups bucket by UTC day explicitly.
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Utc};
 
+use crate::clock::Timestamp;
 use crate::db::queries::Client;
 use crate::enrich::EnricherStatus;
 
@@ -102,7 +102,7 @@ pub struct DaemonStatus {
     /// The zone day boundaries are measured in.
     pub timezone: ResolvedTimezone,
     /// When this daemon process started.
-    pub started_at: DateTime<Utc>,
+    pub started_at: Timestamp,
 }
 
 /// Writes the `ng_daemon_status` row, stamping it `now`.
@@ -113,7 +113,7 @@ pub struct DaemonStatus {
 pub async fn write_daemon_status(
     client: &Client,
     status: &DaemonStatus,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<()> {
     client
         .execute(
@@ -147,7 +147,7 @@ pub async fn write_daemon_status(
 pub async fn write_enrichment_status(
     client: &Client,
     statuses: &[EnricherStatus],
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<()> {
     for status in statuses {
         let polls = i64::try_from(status.polls).unwrap_or(i64::MAX);

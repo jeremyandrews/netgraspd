@@ -14,11 +14,11 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
 use hickory_resolver::TokioResolver;
 use hickory_resolver::proto::rr::RData;
 use tokio::sync::Mutex;
 
+use crate::clock::Timestamp;
 use crate::enrich::{EnricherStatus, REVERSE_DNS};
 
 /// A caching reverse resolver.
@@ -135,8 +135,8 @@ impl ReverseResolver {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match outcome {
-            Ok(()) => status.succeeded(Utc::now()),
-            Err(error) => status.failed(Utc::now(), error),
+            Ok(()) => status.succeeded(Timestamp::now()),
+            Err(error) => status.failed(Timestamp::now(), error),
         }
     }
 

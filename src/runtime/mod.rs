@@ -18,11 +18,12 @@
 
 pub mod visibility;
 
+use jiff::SignedDuration;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::clock::Timestamp;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// How much older than the write interval a status file may be before `stats`
@@ -49,9 +50,9 @@ pub struct Status {
     /// Process id, for an operator who wants to signal it.
     pub pid: u32,
     /// When this run started.
-    pub started_at: DateTime<Utc>,
+    pub started_at: Timestamp,
     /// When this file was last written.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
     /// Whether a learning window is in progress.
     pub learning: bool,
     /// Observations accepted after deduplication.
@@ -119,7 +120,7 @@ pub struct Status {
 impl Status {
     /// A status for a run that has just started.
     #[must_use]
-    pub fn new(started_at: DateTime<Utc>) -> Self {
+    pub fn new(started_at: Timestamp) -> Self {
         Status {
             version: env!("CARGO_PKG_VERSION").to_string(),
             pid: std::process::id(),
@@ -148,15 +149,15 @@ impl Status {
 
     /// How long the daemon has been running, as of the last write.
     #[must_use]
-    pub fn uptime(&self) -> chrono::TimeDelta {
+    pub fn uptime(&self) -> SignedDuration {
         self.updated_at - self.started_at
     }
 
     /// Whether this file is too old to describe a running daemon.
     #[must_use]
-    pub fn is_stale(&self, now: DateTime<Utc>, interval: std::time::Duration) -> bool {
-        let allowance = chrono::TimeDelta::from_std(interval * STALE_AFTER_INTERVALS)
-            .unwrap_or_else(|_| chrono::TimeDelta::minutes(5));
+    pub fn is_stale(&self, now: Timestamp, interval: std::time::Duration) -> bool {
+        let allowance = SignedDuration::try_from(interval * STALE_AFTER_INTERVALS)
+            .unwrap_or_else(|_| SignedDuration::from_mins(5));
         now - self.updated_at > allowance
     }
 
@@ -167,7 +168,7 @@ impl Status {
     /// exists for: whether a source that should be seeing traffic is seeing any.
     #[must_use]
     pub fn source_rates(&self) -> Vec<(String, u64, f64)> {
-        let seconds = self.uptime().num_milliseconds().max(1) as f64 / 1000.0;
+        let seconds = self.uptime().as_millis().max(1) as f64 / 1000.0;
         self.sources
             .iter()
             .map(|(name, count)| {
@@ -188,7 +189,7 @@ impl Status {
                     "FAILED {} on {} at {}: {}",
                     f.source,
                     f.interface,
-                    f.at.format("%Y-%m-%d %H:%M:%S UTC"),
+                    f.at.strftime("%Y-%m-%d %H:%M:%S UTC"),
                     f.error
                 )
             })
@@ -353,8 +354,8 @@ pub fn human_bytes(bytes: u64) -> String {
 
 /// Renders a duration the way an operator reads one.
 #[must_use]
-pub fn human_duration(delta: chrono::TimeDelta) -> String {
-    let total = delta.num_seconds().max(0);
+pub fn human_duration(delta: SignedDuration) -> String {
+    let total = delta.as_secs().max(0);
     let (days, hours, minutes, seconds) = (
         total / 86_400,
         (total % 86_400) / 3600,
@@ -375,12 +376,9 @@ pub fn human_duration(delta: chrono::TimeDelta) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
-    fn base() -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 8, 14, 9, 0, 0)
-            .single()
-            .expect("valid time")
+    fn base() -> Timestamp {
+        Timestamp::from_utc(2026, 8, 14, 9, 0, 0).expect("valid time")
     }
 
     /// A directory of this test's own.
@@ -467,7 +465,7 @@ mod tests {
     /// has heard only this host and the gateway.
     fn isolated_status() -> Status {
         let mut status = Status::new(base());
-        status.updated_at = base() + chrono::Duration::minutes(10);
+        status.updated_at = base() + SignedDuration::from_mins(10);
         let mut sources = BTreeMap::new();
         sources.insert(
             "arp".to_string(),
@@ -486,7 +484,7 @@ mod tests {
                 senders_capped: false,
                 this_host_seen: true,
                 gateway_seen: true,
-                last_frame_at: Some(base() + chrono::Duration::minutes(9)),
+                last_frame_at: Some(base() + SignedDuration::from_mins(9)),
                 sources,
             },
         );
@@ -603,9 +601,9 @@ mod tests {
         let interval = std::time::Duration::from_secs(30);
         let mut status = Status::new(base());
         status.updated_at = base();
-        assert!(!status.is_stale(base() + chrono::Duration::seconds(60), interval));
+        assert!(!status.is_stale(base() + SignedDuration::from_secs(60), interval));
         assert!(
-            status.is_stale(base() + chrono::Duration::seconds(91), interval),
+            status.is_stale(base() + SignedDuration::from_secs(91), interval),
             "three missed writes means it has stopped"
         );
     }
@@ -613,7 +611,7 @@ mod tests {
     #[test]
     fn source_rates_are_counts_over_uptime() {
         let mut status = Status::new(base());
-        status.updated_at = base() + chrono::Duration::seconds(100);
+        status.updated_at = base() + SignedDuration::from_secs(100);
         status.sources.insert("arp".into(), 500);
         let rates = status.source_rates();
         assert_eq!(rates.len(), 1);
@@ -641,14 +639,14 @@ mod tests {
 
     #[test]
     fn durations_render_at_the_right_scale() {
-        assert_eq!(human_duration(chrono::TimeDelta::seconds(45)), "45s");
-        assert_eq!(human_duration(chrono::TimeDelta::seconds(125)), "2m 5s");
-        assert_eq!(human_duration(chrono::TimeDelta::seconds(3725)), "1h 2m");
+        assert_eq!(human_duration(SignedDuration::from_secs(45)), "45s");
+        assert_eq!(human_duration(SignedDuration::from_secs(125)), "2m 5s");
+        assert_eq!(human_duration(SignedDuration::from_secs(3725)), "1h 2m");
         assert_eq!(
-            human_duration(chrono::TimeDelta::seconds(90 * 86_400 + 3725)),
+            human_duration(SignedDuration::from_secs(90 * 86_400 + 3725)),
             "90d 1h 2m"
         );
-        assert_eq!(human_duration(chrono::TimeDelta::seconds(-5)), "0s");
+        assert_eq!(human_duration(SignedDuration::from_secs(-5)), "0s");
     }
 
     #[test]

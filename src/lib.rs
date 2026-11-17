@@ -39,6 +39,7 @@
 pub mod analyze;
 pub mod capture;
 pub mod cli;
+pub mod clock;
 pub mod config;
 pub mod daemon;
 pub mod db;

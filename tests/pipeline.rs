@@ -11,8 +11,9 @@
 
 mod common;
 
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use jiff::SignedDuration;
 use netgraspd::capture::{ObservationDedup, arp, fixtures, mdns};
+use netgraspd::clock::Timestamp;
 use netgraspd::config::{HumanDuration, NotifyConfig, StateConfig};
 use netgraspd::db::queries;
 use netgraspd::device::persist::Persister;
@@ -44,7 +45,7 @@ impl Pipeline {
     }
 
     /// Feeds one raw frame, exactly as a capture thread would.
-    async fn frame(&mut self, db: &common::TestDb, bytes: &[u8], iface: &str, at: DateTime<Utc>) {
+    async fn frame(&mut self, db: &common::TestDb, bytes: &[u8], iface: &str, at: Timestamp) {
         let parsed =
             arp::parse_frame(bytes, iface, at).or_else(|| mdns::parse_frame(bytes, iface, at));
         let Some(observation) = parsed else {
@@ -63,18 +64,12 @@ impl Pipeline {
         self.apply(db, &effects).await;
     }
 
-    async fn signal(
-        &mut self,
-        db: &common::TestDb,
-        mac: MacAddr,
-        signal: &Signal,
-        at: DateTime<Utc>,
-    ) {
+    async fn signal(&mut self, db: &common::TestDb, mac: MacAddr, signal: &Signal, at: Timestamp) {
         let effects = self.manager.add_signal(mac, signal, at);
         self.apply(db, &effects).await;
     }
 
-    async fn sweep(&mut self, db: &common::TestDb, now: DateTime<Utc>) {
+    async fn sweep(&mut self, db: &common::TestDb, now: Timestamp) {
         let effects = self.manager.sweep(now);
         self.apply(db, &effects).await;
     }
@@ -105,14 +100,12 @@ impl Pipeline {
     }
 }
 
-fn base() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 2, 2, 9, 0, 0)
-        .single()
-        .expect("valid time")
+fn base() -> Timestamp {
+    Timestamp::from_utc(2026, 2, 2, 9, 0, 0).expect("valid time")
 }
 
-fn at(secs: i64) -> DateTime<Utc> {
-    base() + Duration::seconds(secs)
+fn at(secs: i64) -> Timestamp {
+    base() + SignedDuration::from_secs(secs)
 }
 
 fn state_config() -> StateConfig {
@@ -419,7 +412,7 @@ async fn a_learning_window_records_every_event_and_notifies_none_of_them() {
     let mut dispatcher = Dispatcher::new(
         NotifyConfig::default(),
         netgraspd::config::SecurityNotifyConfig::default(),
-        chrono::FixedOffset::east_opt(0).expect("utc"),
+        jiff::tz::Offset::from_seconds(0).expect("utc"),
     );
     let mut deliveries: Vec<Delivery> = Vec::new();
     while let Ok(event) = rx.try_recv() {

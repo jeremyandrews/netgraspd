@@ -24,8 +24,8 @@ use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
 use std::time::Duration;
 
+use crate::clock::Timestamp;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
 
@@ -145,7 +145,7 @@ pub async fn run(
         crate::db::status::DaemonStatus {
             version: env!("CARGO_PKG_VERSION").to_string(),
             timezone,
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
         }
     };
 
@@ -160,7 +160,7 @@ pub async fn run(
 
         // A device that went offline while the daemon was not running left its
         // location stay open. Close them before anything reads the table.
-        match queries::close_stale_location_stays(&client, Utc::now()).await {
+        match queries::close_stale_location_stays(&client, Timestamp::now()).await {
             Ok(0) => {}
             Ok(closed) => tracing::info!(closed, "closed location stays left open by a restart"),
             Err(err) => tracing::warn!(%err, "could not close stale location stays"),
@@ -268,7 +268,7 @@ pub async fn run(
 
     // Reverse DNS answers arrive out of band and re-enter the state machine as
     // ordinary signals.
-    let (signal_tx, mut signal_rx) = mpsc::channel::<(MacAddr, Signal, DateTime<Utc>)>(256);
+    let (signal_tx, mut signal_rx) = mpsc::channel::<(MacAddr, Signal, Timestamp)>(256);
     // A resolver that could not be built is still a configured enricher, and
     // one that is failing: `ng_enrichment_status` says so rather than "off".
     let mut rdns_unbuilt: Option<crate::enrich::EnricherStatus> = None;
@@ -279,7 +279,10 @@ pub async fn run(
                 tracing::warn!(%err, "reverse DNS is enabled but no resolver could be built");
                 let mut status =
                     crate::enrich::EnricherStatus::starting(crate::enrich::REVERSE_DNS);
-                status.failed(Utc::now(), format!("no resolver could be built: {err:#}"));
+                status.failed(
+                    Timestamp::now(),
+                    format!("no resolver could be built: {err:#}"),
+                );
                 rdns_unbuilt = Some(status);
                 None
             }
@@ -359,9 +362,9 @@ pub async fn run(
     let show_table = !opts.no_table && std::io::stdout().is_terminal();
     let mut shutdown_rx = shutdown.clone();
     let mut asked_for_rdns: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let local_offset = *chrono::Local::now().offset();
-    let mut last_maintenance: Option<DateTime<Utc>> = None;
-    let started_at = Utc::now();
+    let local_offset = crate::clock::local_offset_now();
+    let mut last_maintenance: Option<Timestamp> = None;
+    let started_at = Timestamp::now();
     let enrichment_status = |statuses: &[crate::enrich::EnricherStatus]| {
         let mut all = statuses.to_vec();
         if let Some(status) = resolver
@@ -418,7 +421,11 @@ pub async fn run(
                 if dedup.admit(&observation) {
                     summary.observations += 1;
 
+                    // The gateway answering for somebody else's address is
+                    // not evidence of what the gateway is called.
+                    let proxied = analyzers.gateway().proxy_arp_for(&observation).is_some();
                     if let (Some(resolver), Some(ip)) = (resolver.as_ref(), observation.ip)
+                        && !proxied
                         && ip.is_ipv4()
                         && asked_for_rdns.insert(ip.to_string())
                     {
@@ -431,7 +438,7 @@ pub async fn run(
                     }
 
                     registry.device_seen(observation.mac, observation.observed_at);
-                    let effects = manager.observe(&observation);
+                    let effects = manager.observe_with_gateway(&observation, analyzers.gateway());
                     let (events, people) = apply_and_track(
                         &db, &mut persister, &bus, &mut manager, &mut registry, &effects,
                     ).await;
@@ -460,7 +467,7 @@ pub async fn run(
             }
 
             _ = sweep.tick() => {
-                let effects = manager.sweep(Utc::now());
+                let effects = manager.sweep(Timestamp::now());
                 let (events, people) = apply_and_track(
                     &db, &mut persister, &bus, &mut manager, &mut registry, &effects,
                 ).await;
@@ -501,7 +508,7 @@ pub async fn run(
                             registry: &mut registry,
                         };
                         let applied = apply_enrichments(
-                            &mut sinks, &location_map, &enriched.enrichments, Utc::now(),
+                            &mut sinks, &location_map, &enriched.enrichments, Timestamp::now(),
                         ).await;
                         summary.location_changes += applied.locations;
                         summary.events += applied.events;
@@ -512,9 +519,9 @@ pub async fn run(
 
             _ = maintenance_tick.tick() => {
                 if maintenance::is_due(
-                    &config.maintenance, Utc::now(), last_maintenance, local_offset,
+                    &config.maintenance, Timestamp::now(), last_maintenance, local_offset,
                 ) {
-                    last_maintenance = Some(Utc::now());
+                    last_maintenance = Some(Timestamp::now());
                     run_maintenance(&db, &config.maintenance).await;
                 }
             }
@@ -545,14 +552,14 @@ pub async fn run(
 
             _ = sample_tick.tick(), if sampler.is_some() => {
                 if let Some(sampler) = sampler.as_mut() {
-                    sampler.settle(Utc::now(), |mac| manager.is_named(mac));
+                    sampler.settle(Timestamp::now(), |mac| manager.is_named(mac));
                 }
             }
 
             _ = learning_tick.tick(), if manager.is_learning() => {
                 if Instant::now() >= learning_deadline {
                     manager.end_learning();
-                    finish_learning(&db, &manager).await;
+                    finish_learning(&db, &manager, &config.notify).await;
                 } else if show_table {
                     print_learning_progress(&manager, learning_deadline);
                 }
@@ -570,7 +577,7 @@ pub async fn run(
     flush_devices(&db, &persister, &mut manager).await;
     // Held frames are decided now, on what is known now, rather than lost.
     if let Some(sampler) = sampler.as_mut() {
-        sampler.settle(Utc::now() + sample_config.limits().settle, |mac| {
+        sampler.settle(Timestamp::now() + sample_config.limits().settle, |mac| {
             manager.is_named(mac)
         });
     }
@@ -761,7 +768,7 @@ async fn apply_enrichments(
     sinks: &mut Sinks<'_>,
     map: &LocationMap,
     enrichments: &[crate::enrich::Enrichment],
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Applied {
     let mut applied = Applied::default();
     let mut outcome = people::Outcome::default();
@@ -875,7 +882,7 @@ async fn run_maintenance(db: &Db, config: &crate::config::MaintenanceConfig) {
             return;
         }
     };
-    match maintenance::run(&client, config, Utc::now()).await {
+    match maintenance::run(&client, config, Timestamp::now()).await {
         Ok(report) => tracing::info!(summary = %report.summary(), "nightly maintenance complete"),
         Err(err) => tracing::error!(%err, "nightly maintenance failed"),
     }
@@ -899,7 +906,7 @@ async fn publish_status(
             return;
         }
     };
-    let now = Utc::now();
+    let now = Timestamp::now();
     if let Err(err) = crate::db::status::write_daemon_status(&client, daemon, now).await {
         tracing::warn!(%err, "could not write ng_daemon_status");
     }
@@ -915,7 +922,7 @@ async fn publish_status(
 /// watches the network, not one that complains once a minute.
 fn write_status(
     config: &Config,
-    started_at: DateTime<Utc>,
+    started_at: Timestamp,
     summary: &RunSummary,
     manager: &Manager,
     dedup: &ObservationDedup,
@@ -924,7 +931,7 @@ fn write_status(
 ) {
     let (online, idle, offline) = manager.state_counts();
     let mut status = Status::new(started_at);
-    status.updated_at = Utc::now();
+    status.updated_at = Timestamp::now();
     status.learning = manager.is_learning();
     status.observations = summary.observations;
     status.duplicates = dedup.duplicates_suppressed();
@@ -1325,9 +1332,19 @@ fn spawn_notifier(
     let mut rx = bus.subscribe();
     let db = db.clone();
     let mut shutdown_rx = shutdown;
+    let enabled = config.notify.enabled;
+    let reconcile_interval = config.state.reconcile_interval.get();
 
     tokio::spawn(async move {
         let mut tick = ticker(DISPATCH_TICK);
+        // Test alerts the web side asked for are answered on the reconcile
+        // cadence, the same one that picks up every other change made there.
+        let mut requests = ticker(reconcile_interval);
+        if let Err(err) =
+            crate::notify::publish_status(&db, &notifiers, enabled, Timestamp::now()).await
+        {
+            tracing::warn!(%err, "could not publish the notify status");
+        }
         loop {
             let deliveries = tokio::select! {
                 biased;
@@ -1341,7 +1358,7 @@ fn spawn_notifier(
                     Vec::new()
                 }
                 event = rx.recv() => match event {
-                    Ok(event) => dispatcher.offer(event, Utc::now()),
+                    Ok(event) => dispatcher.offer(event, Timestamp::now()),
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(skipped = n, "the notifier fell behind the event bus");
                         Vec::new()
@@ -1352,7 +1369,15 @@ fn spawn_notifier(
                         return;
                     }
                 },
-                _ = tick.tick() => dispatcher.tick(Utc::now()),
+                _ = tick.tick() => dispatcher.tick(Timestamp::now()),
+                _ = requests.tick() => {
+                    if let Err(err) = crate::notify::handle_test_requests(
+                        &db, &notifiers, enabled, Timestamp::now(),
+                    ).await {
+                        tracing::warn!(%err, "could not answer test alert requests");
+                    }
+                    Vec::new()
+                }
             };
             send_all(&notifiers, &db, &deliveries).await;
         }
@@ -1370,6 +1395,11 @@ async fn send_all(
         let mut delivered = false;
         for notifier in notifiers {
             delivered |= deliver(notifier.as_ref(), delivery).await;
+        }
+        if !notifiers.is_empty()
+            && let Err(err) = crate::notify::record_delivery(db, delivered, Timestamp::now()).await
+        {
+            tracing::warn!(%err, "could not record the delivery outcome");
         }
         if !delivered {
             continue;
@@ -1391,12 +1421,16 @@ fn spawn_reverse_lookup(
     resolver: ReverseResolver,
     mac: MacAddr,
     ip: std::net::IpAddr,
-    tx: mpsc::Sender<(MacAddr, Signal, DateTime<Utc>)>,
+    tx: mpsc::Sender<(MacAddr, Signal, Timestamp)>,
 ) {
     tokio::spawn(async move {
         if let Some(name) = resolver.lookup(ip).await {
             let _ = tx
-                .send((mac, Signal::new(SignalKind::ReverseDns, name), Utc::now()))
+                .send((
+                    mac,
+                    Signal::new(SignalKind::ReverseDns, name),
+                    Timestamp::now(),
+                ))
                 .await;
         }
     });
@@ -1422,13 +1456,13 @@ fn print_learning_progress(manager: &Manager, deadline: Instant) {
 }
 
 /// Prints the learning-mode completion summary.
-async fn finish_learning(db: &Db, manager: &Manager) {
+async fn finish_learning(db: &Db, manager: &Manager, notify: &crate::config::NotifyConfig) {
     let (online, idle, offline) = manager.state_counts();
     println!(
         "\r\u{1b}[KLearning complete: {} devices on the baseline ({online} online, {idle} idle, {offline} offline).",
         manager.len()
     );
-    println!("New devices from now on will notify.");
+    println!("{}", after_learning_notice(notify));
     if let Ok(client) = db.client().await
         && let Ok(recorded) =
             queries::count_events_of_type(&client, crate::types::EventType::NewDevice).await
@@ -1437,9 +1471,28 @@ async fn finish_learning(db: &Db, manager: &Manager) {
     }
 }
 
+/// What the end of the learning window means for new devices, given the
+/// notification settings.
+///
+/// The window exists so that the baseline does not notify; saying that new
+/// devices "will notify" afterwards is only true when something would deliver
+/// a `new_device` notification. Each reason it would not is named, so that the
+/// line points at the setting to change.
+fn after_learning_notice(notify: &crate::config::NotifyConfig) -> &'static str {
+    if !notify.enabled {
+        "New devices from now on are recorded; notifications are off (notify.enabled = false)."
+    } else if notify.ntfy.is_none() {
+        "New devices from now on are recorded; no notifier is configured to deliver them."
+    } else if !notify.event_types.iter().any(|t| t == "new_device") {
+        "New devices from now on are recorded; new_device is not in notify.event_types."
+    } else {
+        "New devices from now on will notify."
+    }
+}
+
 /// Redraws the live device table.
 fn draw(manager: &Manager, dedup: &ObservationDedup) {
-    let now = Utc::now();
+    let now = Timestamp::now();
     let devices = manager.snapshot();
     let (online, idle, offline) = manager.state_counts();
     // Home the cursor and clear to the end of the screen, rather than clearing
@@ -1477,6 +1530,32 @@ mod tests {
         let opts = RunOptions::default();
         assert!(!opts.learn);
         assert!(!opts.no_table);
+    }
+
+    #[test]
+    fn the_learning_notice_says_notify_only_when_something_would() {
+        use crate::config::{NotifyConfig, NtfyConfig};
+        let mut notify = NotifyConfig {
+            ntfy: Some(NtfyConfig::default()),
+            ..NotifyConfig::default()
+        };
+        assert_eq!(
+            after_learning_notice(&notify),
+            "New devices from now on will notify."
+        );
+
+        notify.event_types = vec!["returned".into()];
+        assert!(after_learning_notice(&notify).contains("not in notify.event_types"));
+
+        notify.event_types = vec!["new_device".into()];
+        notify.ntfy = None;
+        assert!(after_learning_notice(&notify).contains("no notifier"));
+
+        // The foreign network profile: off, and nowhere to send them either.
+        notify.enabled = false;
+        let notice = after_learning_notice(&notify);
+        assert!(notice.contains("notifications are off"), "{notice}");
+        assert!(!notice.contains("will notify"), "{notice}");
     }
 
     #[test]

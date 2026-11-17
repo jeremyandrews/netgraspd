@@ -1,7 +1,7 @@
 //! What the daemon publishes about itself for the web side: which time zone a
 //! day is measured in, and whether enrichment is configured, working or
 //! failing. Plus the one migration in this series that has to carry old rows
-//! forward, proven against a database left at the previous release's schema.
+//! forward, proven against a database left at the schema just before it.
 //!
 //! All of it against a real Postgres, because every assertion here is about
 //! what another process will read out of a table.
@@ -12,17 +12,15 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::{DateTime, TimeZone, Utc};
+use netgraspd::clock::Timestamp;
 use netgraspd::db::Db;
 use netgraspd::db::status::{self, DaemonStatus, TimezoneSource};
 use netgraspd::device::DeviceSnapshot;
 use netgraspd::enrich::{self, Enricher, Enrichment, EnrichmentState, Orchestrator};
 use tokio::time::Instant;
 
-fn at(secs: i64) -> DateTime<Utc> {
-    Utc.timestamp_opt(1_786_000_000 + secs, 0)
-        .single()
-        .expect("valid timestamp")
+fn at(secs: i64) -> Timestamp {
+    Timestamp::from_unix(1_786_000_000 + secs, 0).expect("valid timestamp")
 }
 
 /// An enricher that answers from a script.
@@ -118,7 +116,7 @@ async fn an_install_with_no_enrichment_says_so_for_every_enricher() {
         assert!(!row.configured, "{name}: {row:?}");
         assert_eq!(row.state, "not_configured", "{name}: {row:?}");
         assert_eq!(row.polls, 0);
-        assert_eq!(row.updated_at_epoch, Some(at(0).timestamp()));
+        assert_eq!(row.updated_at_epoch, Some(at(0).unix_seconds()));
     }
 }
 
@@ -195,7 +193,7 @@ async fn a_failing_enricher_says_it_is_failing_and_why() {
             .is_some_and(|e| e.contains("refused the connection")),
         "{row:?}"
     );
-    assert_eq!(row.updated_at_epoch, Some(at(60).timestamp()));
+    assert_eq!(row.updated_at_epoch, Some(at(60).unix_seconds()));
 
     // Reverse DNS is not configured in this test and says so beside it.
     let rdns = enrichment_row(&db, "reverse_dns").await.expect("row");
@@ -234,12 +232,12 @@ async fn a_configured_time_zone_is_published_and_a_day_is_measured_in_it() {
     assert_eq!(
         db.scalar("SELECT updated_at_epoch FROM ng_daemon_status")
             .await,
-        at(40).timestamp()
+        at(40).unix_seconds()
     );
     assert_eq!(
         db.scalar("SELECT started_at_epoch FROM ng_daemon_status")
             .await,
-        at(0).timestamp()
+        at(0).unix_seconds()
     );
 
     // 23:30 UTC on 17 November is already the 18th in Rome. The web side asks
@@ -328,7 +326,7 @@ async fn person_events_recorded_before_the_column_existed_are_backfilled() {
     let Some(_db) = common::test_db().await else {
         return;
     };
-    let Some(url) = scratch_database("netgrasp_backfill_test", 3).await else {
+    let Some(url) = scratch_database("netgrasp_backfill_test", 4).await else {
         return;
     };
     let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
@@ -348,7 +346,7 @@ async fn person_events_recorded_before_the_column_existed_are_backfilled() {
                  ('new_device', now(), '{"person_item_id":"11111111-2222-3333-4444-555555555555"}');"#,
         )
         .await
-        .expect("seeding v3 rows");
+        .expect("seeding pre-V5 rows");
 
     Db::migrate(&url).await.expect("the upgrade applies");
 
@@ -375,10 +373,9 @@ async fn person_events_recorded_before_the_column_existed_are_backfilled() {
     );
     assert_eq!(
         count("SELECT last_arrived_at_epoch FROM ng_people").await,
-        Utc.with_ymd_and_hms(2026, 11, 17, 7, 30, 0)
-            .single()
+        Timestamp::from_utc(2026, 11, 17, 7, 30, 0)
             .expect("time")
-            .timestamp(),
+            .unix_seconds(),
         "the generated twin is filled for rows that existed before it"
     );
     drop(client);

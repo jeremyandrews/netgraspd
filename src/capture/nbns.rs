@@ -27,7 +27,7 @@
 //! is why the suffix decides which signal a name becomes rather than being
 //! discarded as trivia.
 
-use chrono::{DateTime, Utc};
+use crate::clock::Timestamp;
 
 use crate::capture::ethernet::{
     ETHERTYPE_IPV4, IPPROTO_UDP, parse_ethernet, parse_ipv4, parse_udp,
@@ -114,11 +114,7 @@ impl NetbiosName {
 /// Returns `None` when the frame is not NetBIOS over UDP, when the source MAC
 /// cannot identify a device, or when nothing readable is in the payload.
 #[must_use]
-pub fn parse_frame(
-    bytes: &[u8],
-    interface: &str,
-    observed_at: DateTime<Utc>,
-) -> Option<Observation> {
+pub fn parse_frame(bytes: &[u8], interface: &str, observed_at: Timestamp) -> Option<Observation> {
     let frame = parse_ethernet(bytes)?;
     if frame.ethertype != ETHERTYPE_IPV4 {
         return None;
@@ -306,10 +302,8 @@ mod tests {
     use super::*;
     use crate::capture::fixtures;
 
-    fn ts() -> DateTime<Utc> {
-        chrono::TimeZone::timestamp_opt(&Utc, 1_770_000_000, 0)
-            .single()
-            .expect("valid timestamp")
+    fn ts() -> Timestamp {
+        Timestamp::from_unix(1_770_000_000, 0).expect("valid timestamp")
     }
 
     fn signal(obs: &Observation, kind: SignalKind) -> Option<&str> {

@@ -11,7 +11,7 @@
 //!    suppression (via [`DeviceEvent::deliverable`]).
 //! 2. The configured event-type allowlist.
 //! 3. Quiet hours.
-//! 4. Per-device debounce.
+//! 4. Per-device debounce, kept apart for person events (see below).
 //! 5. Batching: events are held for `batch_window`, and a window that
 //!    accumulated at least `batch_threshold` of them collapses into one summary
 //!    instead of a storm. This is what makes a network restart one notification.
@@ -50,6 +50,10 @@
 //! the logs to say why. So they skip the allowlist and obey everything else,
 //! because somebody coming home is a lifecycle event and quiet hours mean quiet.
 //!
+//! Their debounce is their own. A phone coming back is `returned` and then
+//! `person_arrived` for the same MAC in the same instant, and a debounce shared
+//! with device events would always let the first through and drop the second.
+//!
 //! `person_location_changed` has no flag of its own, and adding one would need a
 //! column the plugin has not seen. It is recorded with `notify` false, so it is
 //! in the event log and never on a phone.
@@ -58,11 +62,14 @@ pub mod ntfy;
 
 use std::collections::HashMap;
 
+use crate::clock::Timestamp;
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::{DateTime, FixedOffset, Timelike, Utc};
+use jiff::tz::Offset;
 
 use crate::config::{NotifyConfig, SecurityNotifyConfig};
+use crate::db::Db;
+use crate::db::queries;
 use crate::device::DeviceEvent;
 use crate::device::persist::RecordedEvent;
 use crate::types::MacAddr;
@@ -101,6 +108,141 @@ pub trait Notifier: Send + Sync {
     fn supports_priority(&self) -> bool {
         false
     }
+
+    /// Sends a test alert, so that somebody can see delivery work without
+    /// waiting for a device to come home.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when delivery fails, or when the transport has no way
+    /// to send one.
+    async fn send_test(&self, at: Timestamp) -> Result<()> {
+        let _ = at;
+        anyhow::bail!("{} cannot send a test alert", self.name())
+    }
+}
+
+/// What became of a test alert somebody asked for.
+///
+/// Stored in `ng_notify_requests.outcome` as [`TestOutcome::as_str`]. A word,
+/// never an error message: a transport error names the URL, and the URL
+/// contains the topic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestOutcome {
+    /// At least one notifier accepted it.
+    Sent,
+    /// Every notifier refused it or could not be reached.
+    Failed,
+    /// There is nowhere to send it.
+    NotConfigured,
+}
+
+impl TestOutcome {
+    /// The word stored in `ng_notify_requests.outcome`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            TestOutcome::Sent => "sent",
+            TestOutcome::Failed => "failed",
+            TestOutcome::NotConfigured => "not_configured",
+        }
+    }
+}
+
+/// Whether anything will actually be delivered.
+fn configured(notifiers: &[Box<dyn Notifier>], enabled: bool) -> bool {
+    enabled && !notifiers.is_empty()
+}
+
+/// Writes `ng_notify_status`: whether delivery is configured, and by what.
+///
+/// Names the transport and nothing else. The topic, the server and the token
+/// stay in the daemon's configuration.
+///
+/// # Errors
+///
+/// Returns an error when there is no database connection or the write fails.
+pub async fn publish_status(
+    db: &Db,
+    notifiers: &[Box<dyn Notifier>],
+    enabled: bool,
+    now: Timestamp,
+) -> Result<()> {
+    let is_configured = configured(notifiers, enabled);
+    let backend = if is_configured {
+        Some(
+            notifiers
+                .iter()
+                .map(|n| n.name())
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    } else {
+        None
+    };
+    let client = db.client().await?;
+    queries::publish_notify_status(&client, is_configured, backend.as_deref(), now).await
+}
+
+/// Records the outcome of one delivery attempt in `ng_notify_status`.
+///
+/// # Errors
+///
+/// Returns an error when there is no database connection or the write fails.
+pub async fn record_delivery(db: &Db, ok: bool, at: Timestamp) -> Result<()> {
+    let client = db.client().await?;
+    queries::record_notify_delivery(&client, ok, at).await
+}
+
+/// Answers every test request waiting in `ng_notify_requests` with one test
+/// alert.
+///
+/// Several presses of the button before the tick comes round are one test, not
+/// several: the person asked whether alerts work, and one alert answers that.
+///
+/// Returns `None` when nothing was waiting.
+///
+/// # Errors
+///
+/// Returns an error when there is no database connection or a query fails. A
+/// transport failure is an outcome, not an error.
+pub async fn handle_test_requests(
+    db: &Db,
+    notifiers: &[Box<dyn Notifier>],
+    enabled: bool,
+    now: Timestamp,
+) -> Result<Option<TestOutcome>> {
+    let client = db.client().await?;
+    let pending = queries::pending_notify_requests(&client).await?;
+    if pending.is_empty() {
+        return Ok(None);
+    }
+    let outcome = if configured(notifiers, enabled) {
+        let mut sent = false;
+        for notifier in notifiers {
+            match notifier.send_test(now).await {
+                Ok(()) => sent = true,
+                Err(err) => {
+                    tracing::warn!(notifier = notifier.name(), %err, "test alert failed");
+                }
+            }
+        }
+        queries::record_notify_delivery(&client, sent, now).await?;
+        if sent {
+            TestOutcome::Sent
+        } else {
+            TestOutcome::Failed
+        }
+    } else {
+        TestOutcome::NotConfigured
+    };
+    queries::complete_notify_requests(&client, &pending, outcome.as_str(), now).await?;
+    tracing::info!(
+        requests = pending.len(),
+        outcome = outcome.as_str(),
+        "answered a test alert request"
+    );
+    Ok(Some(outcome))
 }
 
 /// What the dispatcher decided to deliver.
@@ -161,10 +303,14 @@ impl SuppressionCounts {
 pub struct Dispatcher {
     config: NotifyConfig,
     security: SecurityNotifyConfig,
-    offset: FixedOffset,
-    last_accepted: HashMap<MacAddr, DateTime<Utc>>,
+    offset: Offset,
+    /// When an alert was last accepted, per device and per audience: a person
+    /// event and a device event about the same MAC are debounced separately,
+    /// because the one about the device always comes first and would otherwise
+    /// swallow the one about the person.
+    last_accepted: HashMap<(MacAddr, bool), Timestamp>,
     pending: Vec<RecordedEvent>,
-    window_opened_at: Option<DateTime<Utc>>,
+    window_opened_at: Option<Timestamp>,
     suppressed: SuppressionCounts,
 }
 
@@ -175,7 +321,7 @@ impl Dispatcher {
     /// as a parameter rather than reading the system clock is what makes quiet
     /// hours testable.
     #[must_use]
-    pub fn new(config: NotifyConfig, security: SecurityNotifyConfig, offset: FixedOffset) -> Self {
+    pub fn new(config: NotifyConfig, security: SecurityNotifyConfig, offset: Offset) -> Self {
         Dispatcher {
             config,
             security,
@@ -190,7 +336,7 @@ impl Dispatcher {
     /// Builds a dispatcher using the machine's current UTC offset.
     #[must_use]
     pub fn with_local_offset(config: NotifyConfig, security: SecurityNotifyConfig) -> Self {
-        let offset = *chrono::Local::now().offset();
+        let offset = crate::clock::local_offset_now();
         Dispatcher::new(config, security, offset)
     }
 
@@ -211,7 +357,7 @@ impl Dispatcher {
     /// Returns any deliveries that became due as a result, which is usually none
     /// because the batch window has to close first.
     #[must_use]
-    pub fn offer(&mut self, event: RecordedEvent, now: DateTime<Utc>) -> Vec<Delivery> {
+    pub fn offer(&mut self, event: RecordedEvent, now: Timestamp) -> Vec<Delivery> {
         let security = event.event.event_type.is_security();
 
         // The master switch has no exception; see the module documentation.
@@ -249,11 +395,8 @@ impl Dispatcher {
             return self.tick(now);
         }
         if !(security && self.security.bypass_debounce)
-            && let Some(previous) = self.last_accepted.get(&event.event.mac)
-            && now
-                .signed_duration_since(*previous)
-                .to_std()
-                .unwrap_or_default()
+            && let Some(previous) = self.last_accepted.get(&(event.event.mac, person))
+            && std::time::Duration::try_from(now.since(*previous)).unwrap_or_default()
                 < self.config.debounce.get()
         {
             self.suppressed.debounced += 1;
@@ -269,7 +412,7 @@ impl Dispatcher {
             return deliveries;
         }
 
-        self.last_accepted.insert(event.event.mac, now);
+        self.last_accepted.insert((event.event.mac, person), now);
         self.pending.push(event);
         self.window_opened_at.get_or_insert(now);
         self.tick(now)
@@ -280,14 +423,11 @@ impl Dispatcher {
     /// Call this on a timer as well as after every offer, otherwise a single
     /// event arriving on a quiet network would wait for the next one.
     #[must_use]
-    pub fn tick(&mut self, now: DateTime<Utc>) -> Vec<Delivery> {
+    pub fn tick(&mut self, now: Timestamp) -> Vec<Delivery> {
         let Some(opened) = self.window_opened_at else {
             return Vec::new();
         };
-        let elapsed = now
-            .signed_duration_since(opened)
-            .to_std()
-            .unwrap_or_default();
+        let elapsed = std::time::Duration::try_from(now.since(opened)).unwrap_or_default();
         if elapsed < self.config.batch_window.get() {
             return Vec::new();
         }
@@ -315,12 +455,11 @@ impl Dispatcher {
 
     /// Whether the given instant falls inside the configured quiet period.
     #[must_use]
-    pub fn in_quiet_hours(&self, now: DateTime<Utc>) -> bool {
+    pub fn in_quiet_hours(&self, now: Timestamp) -> bool {
         let Some(quiet) = self.config.quiet_hours else {
             return false;
         };
-        let local = now.with_timezone(&self.offset);
-        quiet.contains(local.hour() * 60 + local.minute())
+        quiet.contains(now.minute_of_day_at(self.offset))
     }
 }
 
@@ -351,23 +490,22 @@ mod tests {
     use super::*;
     use crate::config::{ClockTime, HumanDuration, QuietHours};
     use crate::types::EventType;
-    use chrono::TimeZone;
+    use jiff::SignedDuration;
+
     use std::sync::Mutex;
 
-    fn utc() -> FixedOffset {
-        FixedOffset::east_opt(0).expect("utc offset")
+    fn utc() -> Offset {
+        Offset::from_seconds(0).expect("utc offset")
     }
 
-    fn base() -> DateTime<Utc> {
+    fn base() -> Timestamp {
         // 2026-02-02T12:00:00Z, a time comfortably outside any quiet window used
         // in these tests.
-        Utc.with_ymd_and_hms(2026, 2, 2, 12, 0, 0)
-            .single()
-            .expect("valid time")
+        Timestamp::from_utc(2026, 2, 2, 12, 0, 0).expect("valid time")
     }
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        base() + chrono::Duration::seconds(secs)
+    fn at(secs: i64) -> Timestamp {
+        base() + SignedDuration::from_secs(secs)
     }
 
     fn security() -> SecurityNotifyConfig {
@@ -506,6 +644,34 @@ mod tests {
         assert_eq!(d.suppressed().debounced, 0);
     }
 
+    // Jamie's phone coming back is two events for one MAC in the same instant:
+    // `returned`, then `person_arrived`. With a debounce keyed by MAC alone the
+    // arrival was always swallowed by the device alert in front of it, so on the
+    // default config nobody was ever told that Jamie was home.
+    #[test]
+    fn a_device_coming_back_does_not_debounce_its_owners_arrival() {
+        let mut d = Dispatcher::new(config(), security(), utc());
+        let _ = d.offer(event(1, &mac_of(1), EventType::Returned), base());
+        let _ = d.offer(event(2, &mac_of(1), EventType::PersonArrived), base());
+        assert_eq!(d.suppressed().debounced, 0);
+        assert_eq!(d.pending(), 2);
+        let ids: Vec<i64> = d
+            .tick(at(60))
+            .iter()
+            .flat_map(|delivery| delivery.events().iter().map(|e| e.id).collect::<Vec<_>>())
+            .collect();
+        assert_eq!(ids, [1, 2]);
+    }
+
+    #[test]
+    fn a_person_event_is_still_debounced_against_the_last_person_event() {
+        let mut d = Dispatcher::new(config(), security(), utc());
+        let _ = d.offer(event(1, &mac_of(1), EventType::PersonArrived), base());
+        let _ = d.offer(event(2, &mac_of(1), EventType::PersonDeparted), at(10));
+        assert_eq!(d.suppressed().debounced, 1);
+        assert_eq!(d.pending(), 1);
+    }
+
     #[test]
     fn quiet_hours_suppress_and_release_on_the_boundary() {
         let cfg = NotifyConfig {
@@ -519,18 +685,12 @@ mod tests {
             ..config()
         };
         let mut d = Dispatcher::new(cfg, security(), utc());
-        let night = Utc
-            .with_ymd_and_hms(2026, 2, 2, 23, 30, 0)
-            .single()
-            .expect("valid time");
+        let night = Timestamp::from_utc(2026, 2, 2, 23, 30, 0).expect("valid time");
         let _ = d.offer(event(1, &mac_of(1), EventType::NewDevice), night);
         assert_eq!(d.suppressed().quiet_hours, 1);
         assert_eq!(d.pending(), 0);
 
-        let morning = Utc
-            .with_ymd_and_hms(2026, 2, 3, 7, 0, 0)
-            .single()
-            .expect("valid time");
+        let morning = Timestamp::from_utc(2026, 2, 3, 7, 0, 0).expect("valid time");
         let _ = d.offer(event(2, &mac_of(2), EventType::NewDevice), morning);
         assert_eq!(d.suppressed().quiet_hours, 1, "07:00 is no longer quiet");
         assert_eq!(d.pending(), 1);
@@ -549,12 +709,9 @@ mod tests {
             ..config()
         };
         // Rome in winter: UTC+1. 21:30 UTC is 22:30 local, which is quiet.
-        let rome = FixedOffset::east_opt(3600).expect("offset");
+        let rome = Offset::from_seconds(3600).expect("offset");
         let mut d = Dispatcher::new(cfg.clone(), security(), rome);
-        let evening = Utc
-            .with_ymd_and_hms(2026, 2, 2, 21, 30, 0)
-            .single()
-            .expect("valid time");
+        let evening = Timestamp::from_utc(2026, 2, 2, 21, 30, 0).expect("valid time");
         let _ = d.offer(event(1, &mac_of(1), EventType::NewDevice), evening);
         assert_eq!(d.suppressed().quiet_hours, 1);
 
@@ -650,10 +807,7 @@ mod tests {
             ..config()
         };
         let mut d = Dispatcher::new(cfg, security(), utc());
-        let night = Utc
-            .with_ymd_and_hms(2026, 2, 2, 23, 30, 0)
-            .single()
-            .expect("valid time");
+        let night = Timestamp::from_utc(2026, 2, 2, 23, 30, 0).expect("valid time");
         assert_eq!(
             d.offer(event(1, &mac_of(1), EventType::ArpSpoof), night)
                 .len(),

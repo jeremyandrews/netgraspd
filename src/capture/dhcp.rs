@@ -36,7 +36,7 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 
-use chrono::{DateTime, Utc};
+use crate::clock::Timestamp;
 
 use crate::capture::ethernet::{
     ETHERTYPE_IPV4, IPPROTO_UDP, parse_ethernet, parse_ipv4, parse_udp,
@@ -90,11 +90,7 @@ const MAX_PARAM_LIST: usize = 64;
 /// Returns `None` for anything that is not a well-formed DHCP message over
 /// IPv4/UDP, and for messages whose device MAC cannot identify a device.
 #[must_use]
-pub fn parse_frame(
-    bytes: &[u8],
-    interface: &str,
-    observed_at: DateTime<Utc>,
-) -> Option<Observation> {
+pub fn parse_frame(bytes: &[u8], interface: &str, observed_at: Timestamp) -> Option<Observation> {
     let frame = parse_ethernet(bytes)?;
     if frame.ethertype != ETHERTYPE_IPV4 {
         return None;
@@ -311,7 +307,7 @@ fn build(
     frame_src: MacAddr,
     ip_src: IpAddr,
     interface: &str,
-    observed_at: DateTime<Utc>,
+    observed_at: Timestamp,
 ) -> Option<Observation> {
     let server_message = message.message_type.is_server_message();
 
@@ -381,10 +377,8 @@ mod tests {
     /// 20-byte IPv4 header, then UDP.
     const PAYLOAD: usize = 14 + 20 + 8;
 
-    fn ts() -> DateTime<Utc> {
-        chrono::TimeZone::timestamp_opt(&Utc, 1_770_000_000, 0)
-            .single()
-            .expect("valid timestamp")
+    fn ts() -> Timestamp {
+        Timestamp::from_unix(1_770_000_000, 0).expect("valid timestamp")
     }
 
     fn signal(obs: &Observation, kind: SignalKind) -> Option<&str> {
