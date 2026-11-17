@@ -16,7 +16,7 @@
 pub mod persist;
 
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
 use crate::clock::Timestamp;
@@ -235,6 +235,45 @@ impl DeviceSnapshot {
     }
 }
 
+/// How long an IPv4 address a device used stays one it holds.
+///
+/// **A device can hold several addresses at once**, and seeing it at one it
+/// already holds is not a change of address. A router with a leg on each of
+/// three segments ARPs from all three in turn; read as one current address,
+/// that was 527,210 `ip_changed` events in a week from one router on the home
+/// LAN of issue #11. A MetalLB node answers for its own address and for its
+/// VIP. So a sighting at an address the device used within this long is a
+/// sighting, and only an address it has not used in this long is a change.
+///
+/// The first sighting of a second address still raises `ip_changed`, because
+/// nothing on the wire tells a second address from a move until the first one
+/// is used again; after that, the pair is held and nothing more is raised. An
+/// hour is long enough to hold a VIP that is only answered for when somebody
+/// asks, and short enough that a device that moves and later moves back is
+/// reported moving back.
+const ADDRESS_HOLD: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// How many held IPv4 addresses one device keeps. A router with a leg on more
+/// segments than this rotates the oldest out; nothing is wrong, it costs an
+/// `ip_changed` when that one is next used.
+const MAX_HELD_ADDRESSES: usize = 8;
+
+/// How long a device that has spoken for other hosts in mDNS stays untrusted
+/// for its unaddressed records.
+///
+/// A responder that sends a record proving it speaks for another host, an A or
+/// AAAA record naming somebody else's address, is a reflector or a sleep
+/// proxy. Its *unaddressed* records (a PTR with no SRV, a TXT, a probe's
+/// question) then cannot be assumed to be its own, in that frame **or the
+/// frames after it**: a reflector re-sends everything the other segments say,
+/// and most of what it re-sends names no address at all. Judged frame by
+/// frame, that handed a router on the home LAN of issue #10 4,278 other hosts'
+/// names, their services and their models. A reflector proves itself again
+/// within seconds, so this only has to outlast the gap between proofs; an hour
+/// does, and lets a device that once covered for a sleeping host trust its
+/// own announcements again afterwards.
+const SPOKE_FOR_OTHERS_MEMORY: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
 /// One device's in-memory state.
 #[derive(Debug, Clone)]
 struct Entry {
@@ -244,6 +283,9 @@ struct Entry {
     last_seen_at: Timestamp,
     last_ip: Option<String>,
     last_ipv6: Option<String>,
+    /// Every IPv4 address the device has used recently and when it last did;
+    /// see [`ADDRESS_HOLD`]. `last_ip` is one of them.
+    held: Vec<(Ipv4Addr, DateTime<Utc>)>,
     last_interface: Option<String>,
     /// Every stored signal, most recently confirmed first, which is the order
     /// the scorer breaks ties in.
@@ -351,19 +393,61 @@ impl Entry {
     /// Only the two current addresses count, not the whole history in
     /// `ng_ip_history`. An address a device gave up last month is not evidence
     /// about what it is called today.
+    ///
+    /// A device holding several IPv4 addresses at once, a router with a leg on
+    /// each segment or a node answering for a load-balancer VIP, holds every
+    /// one of them, not only the one in `last_ip`.
     fn holds(&self, address: IpAddr) -> bool {
         let text = address.to_string();
         self.last_ip.as_deref() == Some(text.as_str())
             || self.last_ipv6.as_deref() == Some(text.as_str())
+            || matches!(address, IpAddr::V4(v4) if self.held_at(v4, self.last_seen_at))
     }
 
     /// The addresses this device is currently known to be using.
     fn current_addresses(&self) -> Vec<IpAddr> {
-        [self.last_ip.as_deref(), self.last_ipv6.as_deref()]
+        let mut out: Vec<IpAddr> = [self.last_ip.as_deref(), self.last_ipv6.as_deref()]
             .into_iter()
             .flatten()
             .filter_map(|text| text.parse().ok())
-            .collect()
+            .collect();
+        for (v4, _) in &self.held {
+            let address = IpAddr::V4(*v4);
+            if self.held_at(*v4, self.last_seen_at) && !out.contains(&address) {
+                out.push(address);
+            }
+        }
+        out
+    }
+
+    /// True when the device used this IPv4 address within [`ADDRESS_HOLD`] of
+    /// `now`.
+    fn held_at(&self, address: Ipv4Addr, now: DateTime<Utc>) -> bool {
+        let hold = chrono::Duration::from_std(ADDRESS_HOLD).unwrap_or(chrono::Duration::MAX);
+        self.held
+            .iter()
+            .any(|(held, seen)| *held == address && now.signed_duration_since(*seen) <= hold)
+    }
+
+    /// Records that the device used this IPv4 address at `now`.
+    fn note_held(&mut self, address: Ipv4Addr, now: DateTime<Utc>) {
+        if let Some((_, seen)) = self.held.iter_mut().find(|(held, _)| *held == address) {
+            if now > *seen {
+                *seen = now;
+            }
+            return;
+        }
+        if self.held.len() >= MAX_HELD_ADDRESSES
+            && let Some(oldest) = self
+                .held
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, seen))| *seen)
+                .map(|(index, _)| index)
+        {
+            self.held.remove(oldest);
+        }
+        self.held.push((address, now));
     }
 
     /// Most recently confirmed value of one signal kind.
@@ -539,6 +623,8 @@ struct Attributed {
     /// Evidence naming an address no known device holds. Counted rather than
     /// guessed at.
     unattributed: u64,
+    /// True when this frame proved its sender speaks for other hosts.
+    spoke_for_others: bool,
 }
 
 /// The capture host's own hardware addresses, read from the operating system
@@ -589,6 +675,9 @@ pub struct Manager {
     /// The capture host's MACs other than the one it is recorded under; see
     /// [`Manager::set_capture_host`].
     host_aliases: HashSet<MacAddr>,
+    /// When each MAC last sent mDNS proving it speaks for other hosts; see
+    /// [`SPOKE_FOR_OTHERS_MEMORY`].
+    spoke_for_others: HashMap<MacAddr, DateTime<Utc>>,
 }
 
 impl Manager {
@@ -603,6 +692,7 @@ impl Manager {
             reclassifications: Vec::new(),
             unattributed_claims: 0,
             host_aliases: HashSet::new(),
+            spoke_for_others: HashMap::new(),
         }
     }
 
@@ -662,9 +752,12 @@ impl Manager {
     /// 3. Evidence naming an address nobody known holds is kept as a count and
     ///    becomes nobody's name.
     /// 4. Evidence naming no address at all falls back to the sender, unless
-    ///    the same frame proved it was speaking for somebody else. A responder
-    ///    that has demonstrated it answers for other hosts has forfeited the
-    ///    assumption that its unqualified records are about itself.
+    ///    this frame, or one the sender sent within
+    ///    [`SPOKE_FOR_OTHERS_MEMORY`], proved it was speaking for somebody
+    ///    else. A responder that has demonstrated it answers for other hosts
+    ///    has forfeited the assumption that its unqualified records are about
+    ///    itself, and a reflector demonstrates it in one frame and then
+    ///    re-sends unaddressed records in the next.
     fn attribute(&self, obs: &Observation) -> Attributed {
         let mut out = Attributed::default();
         if obs.claims.is_empty() {
@@ -681,10 +774,18 @@ impl Manager {
         {
             sender.push(ip);
         }
-        let speaks_for_others = obs
+        let proves_it = obs
             .claims
             .iter()
             .any(|claim| !claim.addresses.is_empty() && !claim.matches(&sender));
+        out.spoke_for_others = proves_it;
+        let memory =
+            chrono::Duration::from_std(SPOKE_FOR_OTHERS_MEMORY).unwrap_or(chrono::Duration::MAX);
+        let speaks_for_others = proves_it
+            || self
+                .spoke_for_others
+                .get(&obs.mac)
+                .is_some_and(|last| obs.observed_at.signed_duration_since(*last) <= memory);
 
         for claim in &obs.claims {
             if claim.signal.value.trim().is_empty() {
@@ -809,6 +910,12 @@ impl Manager {
                     state: record.state,
                     first_seen_at: record.first_seen_at,
                     last_seen_at: record.last_seen_at,
+                    held: record
+                        .last_ip
+                        .as_deref()
+                        .and_then(|text| text.parse::<Ipv4Addr>().ok())
+                        .map(|v4| vec![(v4, record.last_seen_at)])
+                        .unwrap_or_default(),
                     last_ip: record.last_ip,
                     last_ipv6: record.last_ipv6,
                     last_interface: record.last_interface,
@@ -883,8 +990,51 @@ impl Manager {
     }
 
     /// Folds one observation into the table.
+    ///
+    /// The daemon calls [`observe_with_gateway`](Self::observe_with_gateway)
+    /// instead, which also knows when a frame is the gateway answering for
+    /// somebody else's address.
     #[must_use]
     pub fn observe(&mut self, obs: &Observation) -> Vec<Effect> {
+        self.observe_frame(obs)
+    }
+
+    /// Folds one observation into the table, knowing what the gateway tracker
+    /// believes.
+    ///
+    /// **A gateway proxy-ARPing is not the gateway changing address.** A
+    /// router answering for an address on another segment, a MetalLB VIP for
+    /// instance, puts that address in the ARP sender field with its own MAC.
+    /// Read as an ordinary sighting, it moved the gateway's `last_ip` to the
+    /// VIP and back, raised `ip_changed` both ways and wrote the VIP into the
+    /// gateway's address history (issue #12), while the analyzers, which ask
+    /// [`GatewayTracker::proxy_arp_for`](crate::analyze::GatewayTracker::proxy_arp_for),
+    /// had already declined to call it a conflict. The device table now asks
+    /// the same question and gets the same answer: the frame says the gateway
+    /// is present, and says nothing about its address.
+    ///
+    /// The decision is the tracker's and is made from the packet, so it is
+    /// exactly as narrow as the analyzers' exemption: a reply, from the learned
+    /// gateway MAC, for an address that is not the gateway's own. Anybody else
+    /// answering for an address is recorded as holding it.
+    #[must_use]
+    pub fn observe_with_gateway(
+        &mut self,
+        obs: &Observation,
+        gateway: &crate::analyze::GatewayTracker,
+    ) -> Vec<Effect> {
+        if gateway.proxy_arp_for(obs).is_some() {
+            let presence_only = Observation {
+                ip: None,
+                ..obs.clone()
+            };
+            return self.observe_frame(&presence_only);
+        }
+        self.observe_frame(obs)
+    }
+
+    /// The body of [`observe`](Self::observe).
+    fn observe_frame(&mut self, obs: &Observation) -> Vec<Effect> {
         // Group and all-zero addresses never identify a device. The parsers
         // already reject them, so reaching here means a new source got it wrong.
         if obs.mac.is_group() || obs.mac.is_zero() {
@@ -920,6 +1070,16 @@ impl Manager {
         // means reading other devices' addresses as well as the sender's.
         let attributed = self.attribute(obs);
         self.unattributed_claims += attributed.unattributed;
+        if attributed.spoke_for_others {
+            if self.spoke_for_others.len() >= self.devices.len().max(1) {
+                // Bounded by the device table: a MAC no longer in it cannot
+                // send anything that would read this.
+                let devices = &self.devices;
+                self.spoke_for_others
+                    .retain(|mac, _| devices.contains_key(mac));
+            }
+            self.spoke_for_others.insert(obs.mac, at);
+        }
 
         let learning = self.learning;
         let config = self.config.clone();
@@ -979,10 +1139,18 @@ impl Manager {
                 interface: obs.interface.clone(),
                 at,
             });
-            if let Some(v4) = ipv4_string(Some(ip)) {
-                let changed = entry.last_ip.as_deref().is_some_and(|old| old != v4);
+            if let IpAddr::V4(address) = ip {
+                let v4 = address.to_string();
+                // An address the device already holds is a sighting, not a
+                // change, and leaves last_ip where it was; see ADDRESS_HOLD.
+                let already_held = entry.held_at(address, at);
+                entry.note_held(address, at);
+                let changed =
+                    !already_held && entry.last_ip.as_deref().is_some_and(|old| old != v4);
                 let previous = entry.last_ip.clone();
-                entry.last_ip = Some(v4.clone());
+                if changed || entry.last_ip.is_none() {
+                    entry.last_ip = Some(v4.clone());
+                }
                 if changed {
                     effects.push(Effect::Event(Box::new(DeviceEvent {
                         event_type: EventType::IpChanged,
@@ -1084,17 +1252,6 @@ impl Manager {
         effects
     }
 
-    /// Folds one observation into the table, knowing what the gateway tracker
-    /// believes.
-    #[must_use]
-    pub fn observe_with_gateway(
-        &mut self,
-        obs: &Observation,
-        _gateway: &crate::analyze::GatewayTracker,
-    ) -> Vec<Effect> {
-        self.observe(obs)
-    }
-
     /// Creates an entry for a MAC never seen before.
     fn discover(&mut self, obs: &Observation) -> Vec<Effect> {
         let at = obs.observed_at;
@@ -1114,6 +1271,7 @@ impl Manager {
             last_seen_at: at,
             last_ip: None,
             last_ipv6: None,
+            held: Vec::new(),
             last_interface: Some(obs.interface.clone()),
             signals,
             identity,
@@ -1689,6 +1847,59 @@ mod tests {
         );
         let _ = m.observe(&claim);
         assert_eq!(display_of(&m, "d0:21:f9:dc:a1:19"), "unifi");
+    }
+
+    #[test]
+    fn a_device_that_moves_back_after_the_hold_is_reported_moving_back() {
+        let mut m = Manager::new(config(), false);
+        let hold = i64::try_from(ADDRESS_HOLD.as_secs()).expect("fits");
+        let _ = m.observe(&obs_at("3c:22:fb:00:00:01", Some("192.168.1.40"), at(0)));
+        let moved = m.observe(&obs_at("3c:22:fb:00:00:01", Some("192.168.1.41"), at(60)));
+        assert_eq!(ip_changes(&moved), 1);
+        // Seen at the new address for longer than the hold, never the old one.
+        for minute in 2..=(hold / 60 + 2) {
+            let _ = m.observe(&obs_at(
+                "3c:22:fb:00:00:01",
+                Some("192.168.1.41"),
+                at(minute * 60),
+            ));
+        }
+        let back = m.observe(&obs_at(
+            "3c:22:fb:00:00:01",
+            Some("192.168.1.40"),
+            at(hold + 600),
+        ));
+        let ev = event(&back, EventType::IpChanged);
+        assert_eq!(ev.details["previous_ip"], "192.168.1.41");
+        assert_eq!(ev.details["new_ip"], "192.168.1.40");
+    }
+
+    #[test]
+    fn a_reflector_that_stops_speaking_for_others_is_trusted_again_after_the_memory() {
+        use crate::capture::fixtures::lan;
+        let mut m = Manager::new(config(), false);
+        let memory = i64::try_from(SPOKE_FOR_OTHERS_MEMORY.as_secs()).expect("fits");
+        let _ = m.observe(&mdns_frame(&lan::mdns_macbook_announcement(), at(0)));
+        let _ = m.observe(&mdns_frame(&lan::mdns_reflected_addressed(), at(1)));
+        let _ = m.observe(&mdns_frame(&lan::mdns_reflected_unaddressed(), at(memory)));
+        assert!(
+            m.devices[&MacAddr(lan::ROUTER)]
+                .signals
+                .iter()
+                .all(|s| s.kind != SignalKind::MdnsService),
+            "inside the memory"
+        );
+        let _ = m.observe(&mdns_frame(
+            &lan::mdns_reflected_unaddressed(),
+            at(memory + 2),
+        ));
+        assert!(
+            m.devices[&MacAddr(lan::ROUTER)]
+                .signals
+                .iter()
+                .any(|s| s.kind == SignalKind::MdnsService),
+            "past it, an unaddressed record falls back to the sender as it always did"
+        );
     }
 
     #[test]

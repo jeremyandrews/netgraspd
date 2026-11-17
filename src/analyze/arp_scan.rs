@@ -14,6 +14,18 @@
 //! ordinary threshold; but a compromised router sweeping the whole subnet is
 //! exactly the thing worth knowing about, so silencing it entirely would be
 //! wrong.
+//!
+//! **The gateway is not the only router.** The gateway tracker names one, and a
+//! LAN routed across several segments has others: on the home LAN of issue #11
+//! a second router ARPed from 10.20.0.2, 10.30.0.1 and 10.40.0.1 for hosts on
+//! each, and as an ordinary host it was 19,857 `arp_scan` alerts in a week,
+//! 93% of every security event. What marks a router out on the wire is that it
+//! **asks from more than one address of its own**: it has a leg on each segment
+//! it routes, and asks for that segment's hosts from its address there. A host
+//! asks from the one address it has. So a MAC that has asked from two or more
+//! addresses within ten minutes gets the gateway's threshold too, and the same
+//! rule: looser, never exempt. A scanner that forges a second sender address
+//! buys the router threshold and no more, and a sweep past it alerts.
 
 use std::time::Duration;
 
@@ -31,10 +43,24 @@ use crate::types::{ArpOp, EventType, MacAddr};
 /// the time a window holds this many the alert has long since fired.
 const WINDOW_CAPACITY: usize = 512;
 
+/// How long an address a MAC asked from counts toward it being a router.
+///
+/// Longer than the scan window, because a router asks from its quieter legs
+/// less often than once every thirty seconds, and short enough that a host that
+/// changed address once is not a router for the rest of the day.
+const ROUTER_MEMORY: Duration = Duration::from_secs(10 * 60);
+
+/// How many of its own addresses one MAC's sender window holds. Two is all the
+/// rule needs; a few more keep the count honest for reporting.
+const SENDER_CAPACITY: usize = 8;
+
 /// Per-MAC scan state.
 #[derive(Debug)]
 struct Tracked {
     targets: DistinctWindow<std::net::Ipv4Addr>,
+    /// The addresses this MAC has asked *from*, which is what tells a router
+    /// from a host; see the module documentation.
+    senders: DistinctWindow<std::net::Ipv4Addr>,
     last_alert: Option<Timestamp>,
 }
 
@@ -84,19 +110,29 @@ impl Analyzer for ArpScan {
         }
 
         let mac = observation.mac;
-        let is_gateway = context.gateway.is_gateway(mac);
-        let threshold = if is_gateway {
-            self.gateway_threshold
-        } else {
-            self.threshold
-        };
         let now = observation.observed_at;
         let window = self.window;
 
         let tracked = self.tracked.entry_or_insert_with(mac, now, || Tracked {
             targets: DistinctWindow::new(WINDOW_CAPACITY),
+            senders: DistinctWindow::new(SENDER_CAPACITY),
             last_alert: None,
         });
+        // An ARP probe asks from 0.0.0.0 and a link-local address is
+        // self-assigned; neither is a leg on a routed segment.
+        let own_addresses = match arp.sender_ip {
+            Some(sender) if !sender.is_link_local() => {
+                tracked.senders.record(sender, now, ROUTER_MEMORY)
+            }
+            _ => tracked.senders.len(),
+        };
+        let is_gateway = context.gateway.is_gateway(mac);
+        let multi_homed = own_addresses >= 2;
+        let threshold = if is_gateway || multi_homed {
+            self.gateway_threshold
+        } else {
+            self.threshold
+        };
         let distinct = tracked.targets.record(arp.target_ip, now, window);
         if distinct < threshold {
             return Vec::new();
@@ -124,6 +160,7 @@ impl Analyzer for ArpScan {
                     "window_secs": window.as_secs(),
                     "latest_target": arp.target_ip.to_string(),
                     "is_gateway": is_gateway,
+                    "multi_homed": multi_homed,
                 }),
             )
             .with_interface(observation.interface.clone()),
@@ -357,6 +394,37 @@ mod tests {
         }
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].details["threshold"], 10);
+    }
+
+    #[test]
+    fn probes_and_link_local_senders_do_not_make_a_host_a_router() {
+        use crate::capture::fixtures::lan;
+        let mut analyzer = ArpScan::new(&config(), 1024);
+        let context = context();
+        let probe = std::net::Ipv4Addr::UNSPECIFIED;
+        let link_local = std::net::Ipv4Addr::new(169, 254, 7, 7);
+        let mut alerts = Vec::new();
+        for n in 1..=12u8 {
+            let sender = match n % 3 {
+                0 => probe,
+                1 => link_local,
+                _ => lan::MACBOOK_IP,
+            };
+            let obs = arp::parse_frame(
+                &lan::arp_request(
+                    lan::MACBOOK,
+                    sender,
+                    std::net::Ipv4Addr::new(10, 20, 228, n),
+                ),
+                "eth0",
+                at(0),
+            )
+            .expect("parsed");
+            alerts.extend(analyzer.analyze(&Stimulus::Observed(&obs), &context));
+        }
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        assert_eq!(alerts[0].details["threshold"], 10);
+        assert_eq!(alerts[0].details["multi_homed"], false);
     }
 
     #[test]

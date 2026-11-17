@@ -450,6 +450,47 @@ and alerted on the way past: the false positive would have moved rather than
 gone. Because the router never becomes the holder, a stranger taking a proxied
 address is still caught against the real owner.
 
+### Routers, reflectors and VIPs, after the 2026-11-17 count
+
+A read-only count of the live database on 2026-11-17 found 21,249 security
+events in the week before, 93% of them `arp_scan` from one MAC, and 527,210
+`ip_changed` rows from the same MAC. It is a second router: a Ubiquiti with a
+leg on three segments of one wire, which also reflects mDNS between them. Four
+root causes, each fixed where it lives:
+
+- **A device can hold several addresses at once.** The device table had one
+  current IPv4 address, so a router asking from 10.20.0.2, 10.30.0.1 and
+  10.40.0.1 in turn changed address every few seconds. Each device now keeps the
+  IPv4 addresses it has used within an hour; a sighting at one it holds is a
+  sighting, and `ip_changed` is raised only for an address it has not used in
+  that time. The first sighting of a second address still reads as a move,
+  because nothing on the wire can tell it from one until the first is used
+  again. A MetalLB node answering for its VIP is the same case.
+- **The gateway is not the only router.** `arp_scan` gave the gateway's looser
+  threshold to the one MAC the gateway tracker names. A MAC that asks from two
+  or more addresses of its own within ten minutes is routing, and now gets the
+  same threshold under the same rule: looser, never exempt.
+- **A gateway proxy-ARPing is not the gateway changing address.** The
+  analyzers already asked `GatewayTracker::proxy_arp_for` and declined to call
+  proxy ARP a conflict; the device table did not ask, so the gateway's
+  `last_ip` and history followed every address it answered for. It now asks the
+  same question of the same packet, and the frame records presence only. The
+  tracker's rules are untouched: a forged reply still cannot replace a known
+  gateway MAC, and nobody but the learned gateway gets the exemption.
+- **A reflector proves it speaks for others once and then re-sends records
+  that name nobody.** The per-frame rule above forfeits a frame's unaddressed
+  records when that frame proves the sender speaks for somebody else. A
+  reflector's proof and its unaddressed records arrive in different frames, so
+  the router held 4,278 other hosts' mDNS names. The forfeit now lasts an hour
+  from the last proof.
+
+The same count showed `identity_change` firing hourly on ordinary Apple
+devices, an iMac a NAS and a media player by turns. The classifier read each
+rank's evidence in the order the signals were stored, most recently confirmed
+first, so the device type was whichever service the device announced last.
+Within a rank the table now decides, which is the precedence the tables were
+always documented to have.
+
 ## IPv6 addressing, revisited
 
 The milestone 1 note asked for the IPv4-only `last_ip` decision to be revisited

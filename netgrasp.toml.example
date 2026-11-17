@@ -209,7 +209,9 @@ threshold = 10
 # A router legitimately ARPs for everything it forwards to, so holding it to the
 # same threshold as a laptop means an alert a minute forever. A looser threshold
 # rather than an exemption, because a compromised router sweeping the subnet is
-# exactly what you want to hear about.
+# exactly what you want to hear about. Also applies to any MAC that ARPs from
+# two or more addresses of its own within ten minutes, which is a router with a
+# leg on several segments whether or not it is the gateway.
 gateway_threshold = 100
 
 [security.arp_spoof]
