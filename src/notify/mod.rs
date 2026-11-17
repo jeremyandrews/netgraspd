@@ -636,6 +636,34 @@ mod tests {
         assert_eq!(d.suppressed().debounced, 0);
     }
 
+    // Jamie's phone coming back is two events for one MAC in the same instant:
+    // `returned`, then `person_arrived`. With a debounce keyed by MAC alone the
+    // arrival was always swallowed by the device alert in front of it, so on the
+    // default config nobody was ever told that Jamie was home.
+    #[test]
+    fn a_device_coming_back_does_not_debounce_its_owners_arrival() {
+        let mut d = Dispatcher::new(config(), security(), utc());
+        let _ = d.offer(event(1, &mac_of(1), EventType::Returned), base());
+        let _ = d.offer(event(2, &mac_of(1), EventType::PersonArrived), base());
+        assert_eq!(d.suppressed().debounced, 0);
+        assert_eq!(d.pending(), 2);
+        let ids: Vec<i64> = d
+            .tick(at(60))
+            .iter()
+            .flat_map(|delivery| delivery.events().iter().map(|e| e.id).collect::<Vec<_>>())
+            .collect();
+        assert_eq!(ids, [1, 2]);
+    }
+
+    #[test]
+    fn a_person_event_is_still_debounced_against_the_last_person_event() {
+        let mut d = Dispatcher::new(config(), security(), utc());
+        let _ = d.offer(event(1, &mac_of(1), EventType::PersonArrived), base());
+        let _ = d.offer(event(2, &mac_of(1), EventType::PersonDeparted), at(10));
+        assert_eq!(d.suppressed().debounced, 1);
+        assert_eq!(d.pending(), 1);
+    }
+
     #[test]
     fn quiet_hours_suppress_and_release_on_the_boundary() {
         let cfg = NotifyConfig {
