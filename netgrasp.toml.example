@@ -133,13 +133,19 @@ debounce = "5m"
 batch_threshold = 10
 batch_window = "60s"
 
-# Which events are worth telling a human about. The full set is new_device,
-# returned, ip_changed, went_offline, name_updated.
+# Which events are worth telling a human about. A filter on top of the rule
+# that decides what can be delivered at all, never a way round it:
+#
+# - new_device is delivered for every device that appears after learning.
+# - returned and went_offline are delivered only for a device whose notify a
+#   person turned on in Trovato. Every device starts with it off.
+# - ip_changed, name_updated and device_location_changed are recorded and never
+#   delivered, whether they are listed here or not.
 #
 # Security events are NOT governed by this list. They are governed by
 # [security.notifications] below, so that a missing entry here cannot silently
 # disable them.
-event_types = ["new_device", "returned"]
+event_types = ["new_device", "returned", "went_offline"]
 
 # Optional. Local time, and the period may wrap midnight.
 # [notify.quiet_hours]

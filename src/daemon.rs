@@ -1410,7 +1410,7 @@ fn after_learning_notice(notify: &crate::config::NotifyConfig) -> &'static str {
     } else if !notify.event_types.iter().any(|t| t == "new_device") {
         "New devices from now on are recorded; new_device is not in notify.event_types."
     } else {
-        "New devices from now on will notify."
+        "New devices from now on will notify. A device comes and goes without an alert until its notify is turned on."
     }
 }
 
@@ -1483,7 +1483,7 @@ mod tests {
         };
         assert_eq!(
             after_learning_notice(&notify),
-            "New devices from now on will notify."
+            "New devices from now on will notify. A device comes and goes without an alert until its notify is turned on."
         );
 
         notify.event_types = vec!["returned".into()];

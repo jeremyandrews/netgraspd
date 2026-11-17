@@ -313,13 +313,15 @@ async fn an_arrival_reaches_ntfy_in_words() {
 #[tokio::test]
 async fn notify_tables_the_plugin_created_first_do_not_stop_the_daemon_migrating() {
     // The plugin ships a guarded copy of these two tables. A site that upgrades
-    // the plugin before the daemon has them already when V4 runs.
+    // the plugin before the daemon has them already when V4 runs. A daemon that
+    // has not yet run V4 has run nothing after it either, so the history is cut
+    // back to V3.
     let Some(db) = common::test_db().await else {
         return;
     };
     db.execute(
         "INSERT INTO ng_notify_requests (requested_by) VALUES ('before the upgrade');
-         DELETE FROM refinery_schema_history WHERE version = 4;",
+         DELETE FROM refinery_schema_history WHERE version >= 4;",
     )
     .await;
     netgraspd::db::Db::migrate(&common::test_url())

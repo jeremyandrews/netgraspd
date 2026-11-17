@@ -122,7 +122,11 @@ pub struct DeviceEvent {
     pub baseline: bool,
     /// True when the daemon was inside a learning window, likewise.
     pub during_learning: bool,
-    /// The user's per-device notification toggle.
+    /// The user's per-device notification toggle, or for a person event the
+    /// person's `notify_arrive` or `notify_depart`.
+    ///
+    /// Off until a person turns it on: a device nobody has chosen comes and
+    /// goes without an alert.
     pub notify: bool,
     /// How loudly to deliver this, when the transport understands priority.
     pub priority: EventPriority,
@@ -133,6 +137,23 @@ pub struct DeviceEvent {
 impl DeviceEvent {
     /// Whether this event should reach a notifier at all.
     ///
+    /// Every event is recorded in `ng_events` whatever this says; it decides only
+    /// whether somebody's phone hears about it. Outside a learning window:
+    ///
+    /// - `new_device` always. Something new joining is the alert Netgrasp exists
+    ///   for, and a device that has only just appeared has had no chance to be
+    ///   chosen or muted by anybody.
+    /// - `returned` and `went_offline` only when a person turned the device's
+    ///   `notify` on. A network has dozens of devices coming and going all day,
+    ///   and the ones worth hearing about are the ones somebody asked about.
+    /// - `person_arrived` and `person_departed` when the person's
+    ///   `notify_arrive` or `notify_depart` is on, which is what `notify` carries
+    ///   for them; `person_location_changed` never, because it is recorded with
+    ///   `notify` false.
+    /// - `ip_changed`, `name_updated` and `device_location_changed` never. They
+    ///   are information for the event log, not alerts, and listing them in
+    ///   `notify.event_types` does not change that.
+    ///
     /// Learning-window suppression happens here and nowhere else, so that the
     /// record in `ng_events` is written either way. A security tool that forgets
     /// events during its own warm-up is worse than one that stays quiet.
@@ -140,14 +161,34 @@ impl DeviceEvent {
     /// Security events are never suppressed. A learning window is Netgrasp
     /// deciding which devices are normal; it is not a reason to stay quiet while
     /// one of them poisons the ARP table. The per-device `notify` toggle is
-    /// likewise ignored for them: it means "stop telling me when this device
-    /// comes and goes", not "let this device attack the network in silence".
+    /// likewise ignored for them: it means "tell me when this device comes and
+    /// goes", not "let this device attack the network in silence".
     #[must_use]
     pub const fn deliverable(&self) -> bool {
         if self.event_type.is_security() {
             return true;
         }
-        self.notify && !self.during_learning
+        if self.during_learning {
+            return false;
+        }
+        match self.event_type {
+            EventType::NewDevice => true,
+            EventType::Returned
+            | EventType::WentOffline
+            | EventType::PersonArrived
+            | EventType::PersonDeparted
+            | EventType::PersonLocationChanged => self.notify,
+            EventType::IpChanged | EventType::NameUpdated | EventType::DeviceLocationChanged => {
+                false
+            }
+            // Answered above, before the learning window was consulted.
+            EventType::ArpScan
+            | EventType::ArpSpoof
+            | EventType::RogueDhcp
+            | EventType::IdentityChange
+            | EventType::IpConflict
+            | EventType::GratuitousArp => true,
+        }
     }
 }
 
@@ -1282,7 +1323,9 @@ impl Manager {
             current_ap: None,
             current_location: None,
             baseline: self.learning,
-            notify: true,
+            // The column default. Nobody has chosen this device yet, so it
+            // comes and goes without an alert until somebody turns it on.
+            notify: false,
             offline_transitions: 0,
             observations_since_flush: 0,
             dirty: true,
@@ -1316,7 +1359,8 @@ impl Manager {
             at,
             baseline: learning,
             during_learning: learning,
-            notify: true,
+            // Recorded as it is; a new device is delivered whatever it says.
+            notify: false,
             priority: EventPriority::Normal,
             details: json!({
                 "source": obs.source,

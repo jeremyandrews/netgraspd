@@ -641,19 +641,20 @@ async fn a_change_made_in_trovato_reaches_a_running_daemon() {
         .expect("query")
         .expect("the device was discovered");
     assert!(
-        before.notify,
-        "devices notify until somebody says otherwise"
+        !before.notify,
+        "a device comes and goes in silence until somebody chooses it"
     );
 
-    // Somebody opens the device in Trovato, renames it, mutes it, and says it
-    // is theirs. The plugin writes its own columns and nothing else.
+    // Somebody opens the device in Trovato, renames it, asks to hear when it
+    // comes and goes, and says it is theirs. The plugin writes its own columns
+    // and nothing else.
     let person = queries::ensure_person(&client, "Jeremy", true, true)
         .await
         .expect("a person");
     as_the_plugin(
         &db,
         &format!(
-            "UPDATE ng_devices SET display_name = 'Jeremy''s phone', notify = false, \
+            "UPDATE ng_devices SET display_name = 'Jeremy''s phone', notify = true, \
              hidden = true, notes = 'in the loft', \
              owner_item_id = '{person}'::uuid WHERE mac = '{phone}'"
         ),
@@ -694,6 +695,10 @@ async fn a_change_made_in_trovato_reaches_a_running_daemon() {
         "hidden is the plugin's and stays as it set it"
     );
     assert_eq!(after.notes.as_deref(), Some("in the loft"));
+    assert!(
+        after.notify,
+        "notify is the plugin's and stays as it set it"
+    );
     assert!(p.manager.take_dirty().is_empty());
 }
 
@@ -716,6 +721,14 @@ async fn muting_a_device_in_trovato_silences_the_next_alert_without_a_restart() 
         1
     );
 
+    // Somebody chose it, and the running daemon has that...
+    as_the_plugin(
+        &db,
+        &format!("UPDATE ng_devices SET notify = true WHERE mac = '{phone}'"),
+    )
+    .await;
+    netgraspd::daemon::reconcile_user_state(&db.db, &mut p.manager, &mut registry).await;
+    // ...and then thought better of it.
     as_the_plugin(
         &db,
         &format!("UPDATE ng_devices SET notify = false WHERE mac = '{phone}'"),

@@ -604,6 +604,11 @@ pub struct NotifyConfig {
     /// The window over which `batch_threshold` is counted.
     pub batch_window: HumanDuration,
     /// Which event types are worth a notification at all.
+    ///
+    /// A filter on top of the per-event rule, never a way round it: `returned`
+    /// and `went_offline` still need the device's `notify` on, and
+    /// `ip_changed`, `name_updated` and `device_location_changed` are never
+    /// delivered whether listed or not.
     pub event_types: Vec<String>,
     /// Optional daily quiet period.
     pub quiet_hours: Option<QuietHours>,
@@ -618,7 +623,11 @@ impl Default for NotifyConfig {
             debounce: HumanDuration::from_secs(5 * 60),
             batch_threshold: 10,
             batch_window: HumanDuration::from_secs(60),
-            event_types: vec!["new_device".into(), "returned".into()],
+            event_types: vec![
+                "new_device".into(),
+                "returned".into(),
+                "went_offline".into(),
+            ],
             quiet_hours: None,
             ntfy: None,
         }

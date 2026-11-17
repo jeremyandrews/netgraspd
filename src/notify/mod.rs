@@ -7,8 +7,11 @@
 //!
 //! The dispatcher applies, in order:
 //!
-//! 1. The master switch, the per-device `notify` toggle, and learning-window
-//!    suppression (via [`DeviceEvent::deliverable`]).
+//! 1. The master switch, then the per-event rule in
+//!    [`DeviceEvent::deliverable`]: a learning window suppresses everything but
+//!    security events; after it, `new_device` always delivers, `returned` and
+//!    `went_offline` only for a device whose `notify` a person turned on, and
+//!    `ip_changed`, `name_updated` and `device_location_changed` never.
 //! 2. The configured event-type allowlist.
 //! 3. Quiet hours.
 //! 4. Per-device debounce, kept apart for person events (see below).
@@ -271,7 +274,8 @@ impl Delivery {
 pub struct SuppressionCounts {
     /// Notifications are switched off entirely.
     pub disabled: usize,
-    /// The device's `notify` flag is off, or a learning window was in progress.
+    /// The per-event rule said no: a learning window, a device nobody turned
+    /// `notify` on for, or a type that is never delivered.
     pub not_deliverable: usize,
     /// The event type is not in the configured allowlist.
     pub wrong_type: usize,
@@ -724,7 +728,8 @@ mod tests {
     #[test]
     fn events_outside_the_configured_types_are_dropped() {
         let mut d = Dispatcher::new(config(), security(), utc());
-        let _ = d.offer(event(1, &mac_of(1), EventType::IpChanged), base());
+        // Deliverable (notify is on) but not in this allowlist.
+        let _ = d.offer(event(1, &mac_of(1), EventType::WentOffline), base());
         assert_eq!(d.suppressed().wrong_type, 1);
         assert_eq!(d.pending(), 0);
     }
