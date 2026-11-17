@@ -22,8 +22,13 @@ shipped rather than a release that was tagged at the time.
 
 ## [Unreleased]
 
+### Upgrade note
+
+- **Schema V5 turns `ng_devices.notify` off on every existing device, and makes `FALSE` its default.** Any choice an installation made about which devices it hears coming and going is reset and has to be made again in Trovato. It was done this way because under V1's `DEFAULT TRUE` no row was ever a choice: on the one installation this was measured against, all 166 devices had `notify` on, none of them set by a person, and no alert had ever been delivered. Nothing is renamed, dropped or retyped; the column keeps its name, type and `NOT NULL`.
+
 ### Changed
 
+- **Alerts are safe to switch on: a new device, a device somebody chose, a person, an attack.** After the learning window, `new_device` is delivered for every device whatever its `notify` says, because nobody has had a chance to choose anything about a device that has only just appeared (before, a device with `notify` off was not announced even when new). `returned` and `went_offline` are delivered only for a device whose `notify` a person turned on, and `notify` now starts off. `ip_changed`, `name_updated` and `device_location_changed` are recorded and never delivered, even when listed in `notify.event_types`. Person and security events are unchanged. Replayed through the dispatcher over the live network's last seven days with the default configuration, device lifecycle alerts fall from about 57 a day (54 `returned`, 2 batch summaries, 1 `new_device`) to about 1 (`new_device`); security events are not changed by this. The default `notify.event_types` gains `went_offline`, so a device somebody chose is heard leaving as well as coming back, and the line printed when learning ends says that a device comes and goes without an alert until its notify is turned on.
 - **Arrival and departure alerts are one sentence on the local clock**: "Jamie is home: Jamie's iPhone joined at 18:42" and "Jamie left: last seen 07:55", where they were "Jamie arrived" and "Jamie left" with a UTC time in the body. Person events now carry `device_name` and `last_seen_at` in `details`.
 
 ### Added
