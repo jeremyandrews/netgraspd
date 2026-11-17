@@ -11,7 +11,7 @@
 //!    suppression (via [`DeviceEvent::deliverable`]).
 //! 2. The configured event-type allowlist.
 //! 3. Quiet hours.
-//! 4. Per-device debounce.
+//! 4. Per-device debounce, kept apart for person events (see below).
 //! 5. Batching: events are held for `batch_window`, and a window that
 //!    accumulated at least `batch_threshold` of them collapses into one summary
 //!    instead of a storm. This is what makes a network restart one notification.
@@ -49,6 +49,10 @@
 //! trap: an operator turns the flag on, nothing arrives, and there is nothing in
 //! the logs to say why. So they skip the allowlist and obey everything else,
 //! because somebody coming home is a lifecycle event and quiet hours mean quiet.
+//!
+//! Their debounce is their own. A phone coming back is `returned` and then
+//! `person_arrived` for the same MAC in the same instant, and a debounce shared
+//! with device events would always let the first through and drop the second.
 //!
 //! `person_location_changed` has no flag of its own, and adding one would need a
 //! column the plugin has not seen. It is recorded with `notify` false, so it is
@@ -300,7 +304,11 @@ pub struct Dispatcher {
     config: NotifyConfig,
     security: SecurityNotifyConfig,
     offset: Offset,
-    last_accepted: HashMap<MacAddr, Timestamp>,
+    /// When an alert was last accepted, per device and per audience: a person
+    /// event and a device event about the same MAC are debounced separately,
+    /// because the one about the device always comes first and would otherwise
+    /// swallow the one about the person.
+    last_accepted: HashMap<(MacAddr, bool), Timestamp>,
     pending: Vec<RecordedEvent>,
     window_opened_at: Option<Timestamp>,
     suppressed: SuppressionCounts,
@@ -387,7 +395,7 @@ impl Dispatcher {
             return self.tick(now);
         }
         if !(security && self.security.bypass_debounce)
-            && let Some(previous) = self.last_accepted.get(&event.event.mac)
+            && let Some(previous) = self.last_accepted.get(&(event.event.mac, person))
             && std::time::Duration::try_from(now.since(*previous)).unwrap_or_default()
                 < self.config.debounce.get()
         {
@@ -404,7 +412,7 @@ impl Dispatcher {
             return deliveries;
         }
 
-        self.last_accepted.insert(event.event.mac, now);
+        self.last_accepted.insert((event.event.mac, person), now);
         self.pending.push(event);
         self.window_opened_at.get_or_insert(now);
         self.tick(now)
