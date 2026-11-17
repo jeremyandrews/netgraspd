@@ -126,7 +126,7 @@ pub fn mdns_response(
 /// SRV rdata pointing at a target host, with the fixed fields zeroed except the
 /// port.
 #[must_use]
-fn srv_rdata(port: u16, target: &[&str]) -> Vec<u8> {
+pub fn srv_rdata(port: u16, target: &[&str]) -> Vec<u8> {
     let mut rdata = vec![0x00, 0x00, 0x00, 0x00]; // priority, weight
     rdata.extend_from_slice(&port.to_be_bytes());
     rdata.extend_from_slice(&dns_name(target));

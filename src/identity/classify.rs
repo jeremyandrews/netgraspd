@@ -486,6 +486,47 @@ mod tests {
     }
 
     #[test]
+    fn the_device_type_does_not_depend_on_which_service_was_announced_last() {
+        // An iMac on the home LAN advertises AirPlay and AFP. Its signals are
+        // kept most recently confirmed first, and each re-announcement moves
+        // one service to the front. On 2026-11-17 that was 151 identity_change
+        // events in a week for this one machine, media_player and nas taking
+        // turns every hour. The table says which service decides; the order
+        // the device last said them in must not.
+        let airplay = signal(SignalKind::MdnsService, "_airplay._tcp");
+        let afp = signal(SignalKind::MdnsService, "_afpovertcp._tcp");
+        let smb = signal(SignalKind::MdnsService, "_smb._tcp");
+        let one = classify_with(&[airplay.clone(), afp.clone(), smb.clone()], None);
+        let two = classify_with(&[afp.clone(), smb.clone(), airplay.clone()], None);
+        let three = classify_with(&[smb, airplay, afp], None);
+        assert_eq!(one.device_type.as_deref(), Some("media_player"));
+        assert_eq!(two.device_type, one.device_type, "{two:?}");
+        assert_eq!(three.device_type, one.device_type, "{three:?}");
+        assert_eq!(two.reason, one.reason);
+    }
+
+    #[test]
+    fn the_device_type_does_not_depend_on_the_order_of_two_ssdp_urns_or_models() {
+        let renderer = signal(
+            SignalKind::SsdpDeviceType,
+            "urn:schemas-upnp-org:device:MediaRenderer:1",
+        );
+        let server = signal(
+            SignalKind::SsdpDeviceType,
+            "urn:schemas-upnp-org:device:MediaServer:1",
+        );
+        let a = classify_with(&[renderer.clone(), server.clone()], None);
+        let b = classify_with(&[server, renderer], None);
+        assert_eq!(a.device_type, b.device_type, "{a:?} {b:?}");
+
+        let tv = signal(SignalKind::MdnsModel, "AppleTV14,1");
+        let mac = signal(SignalKind::MdnsModel, "iMac21,1");
+        let a = classify_with(&[tv.clone(), mac.clone()], None);
+        let b = classify_with(&[mac, tv], None);
+        assert_eq!(a.device_type, b.device_type, "{a:?} {b:?}");
+    }
+
+    #[test]
     fn nothing_known_classifies_as_nothing() {
         let out = classify_with(&[], None);
         assert_eq!(out.device_type, None);

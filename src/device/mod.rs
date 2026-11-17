@@ -1084,6 +1084,17 @@ impl Manager {
         effects
     }
 
+    /// Folds one observation into the table, knowing what the gateway tracker
+    /// believes.
+    #[must_use]
+    pub fn observe_with_gateway(
+        &mut self,
+        obs: &Observation,
+        _gateway: &crate::analyze::GatewayTracker,
+    ) -> Vec<Effect> {
+        self.observe(obs)
+    }
+
     /// Creates an entry for a MAC never seen before.
     fn discover(&mut self, obs: &Observation) -> Vec<Effect> {
         let at = obs.observed_at;
@@ -1593,6 +1604,151 @@ mod tests {
             .get(&mac(who))
             .map(|e| e.snapshot().display())
             .unwrap_or_default()
+    }
+
+    fn arp_frame(frame: &[u8], when: DateTime<Utc>) -> Observation {
+        crate::capture::arp::parse_frame(frame, "eth0", when).expect("an ARP frame")
+    }
+
+    fn mdns_frame(frame: &[u8], when: DateTime<Utc>) -> Observation {
+        crate::capture::mdns::parse_frame(frame, "eth0", when).expect("an mDNS frame")
+    }
+
+    fn ip_changes(effects: &[Effect]) -> usize {
+        events(effects)
+            .into_iter()
+            .filter(|e| *e == EventType::IpChanged)
+            .count()
+    }
+
+    #[test]
+    fn a_reflector_that_has_spoken_for_others_takes_none_of_their_unaddressed_records() {
+        // Issue #10. The router re-sends other segments' mDNS from its own MAC.
+        // One frame proves it: its A record names the MacBook's address, not
+        // the router's. The frames after it carry PTR, TXT and probe records
+        // that name no address at all, and the router used to collect every
+        // one of them: 4,278 mDNS names on the live database by 2026-11-17.
+        use crate::capture::fixtures::lan;
+        let mut m = Manager::new(config(), false);
+        let _ = m.observe(&mdns_frame(&lan::mdns_macbook_announcement(), at(0)));
+        let _ = m.observe(&mdns_frame(&lan::mdns_reflected_addressed(), at(1)));
+        let _ = m.observe(&mdns_frame(&lan::mdns_reflected_unaddressed(), at(2)));
+        let _ = m.observe(&mdns_frame(&lan::mdns_reflected_probe(), at(3)));
+
+        let router = m.devices.get(&MacAddr(lan::ROUTER)).expect("the router");
+        let carried: Vec<&Signal> = router
+            .signals
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.kind,
+                    SignalKind::MdnsName | SignalKind::MdnsService | SignalKind::MdnsModel
+                )
+            })
+            .collect();
+        assert!(
+            carried.is_empty(),
+            "a reflector carries nobody's mDNS identity: {carried:?}"
+        );
+        assert_eq!(router.classification.device_type, None);
+        assert_ne!(display_of(&m, "d0:21:f9:dc:a1:19"), lan::MACBOOK_HOST);
+        // The addressed record still reached its owner.
+        assert_eq!(display_of(&m, "3a:6a:31:8e:75:0d"), lan::MACBOOK_HOST);
+    }
+
+    #[test]
+    fn a_router_on_several_addresses_at_once_is_one_device_not_a_stream_of_ip_changed() {
+        // Issue #11: 527,210 ip_changed rows in the week to 2026-11-17 from one
+        // router ARPing from its three addresses in turn.
+        use crate::capture::fixtures::lan;
+        let mut m = Manager::new(config(), false);
+        let mut changed_in_round = Vec::new();
+        for round in 0..20i64 {
+            for (n, ip) in lan::ROUTER_IPS.iter().enumerate() {
+                let when = at(round * 10 + i64::try_from(n).expect("small"));
+                let frame = lan::arp_request(lan::ROUTER, *ip, lan::GATEWAY_IP);
+                for _ in 0..ip_changes(&m.observe(&arp_frame(&frame, when))) {
+                    changed_in_round.push(round);
+                }
+            }
+        }
+        // The first sighting of a second and a third address cannot yet be
+        // told from a move. Every sighting after that can.
+        assert!(
+            changed_in_round.len() <= 2 && changed_in_round.iter().all(|r| *r == 0),
+            "ip_changed in rounds {changed_in_round:?}"
+        );
+        assert_eq!(m.len(), 1);
+
+        // Holding all three, a name proved for any of them is the router's.
+        let claim = claiming(
+            "d0:21:f9:dc:a1:19",
+            Some("10.20.0.2"),
+            at(300),
+            vec![named("unifi", "10.30.0.1")],
+        );
+        let _ = m.observe(&claim);
+        assert_eq!(display_of(&m, "d0:21:f9:dc:a1:19"), "unifi");
+    }
+
+    #[test]
+    fn the_gateway_proxy_arping_for_a_vip_keeps_its_own_address_and_history() {
+        // Issue #12. MetalLB's VIP is answered for by the node and, across
+        // the VLANs, by the gateway's proxy ARP. The gateway is not moving.
+        use crate::capture::fixtures::lan;
+        let gateway =
+            crate::analyze::GatewayTracker::new(Some(lan::GATEWAY_IP), Some(MacAddr(lan::GATEWAY)));
+        let mut m = Manager::new(config(), false);
+        let own = arp_frame(
+            &lan::arp_reply(lan::GATEWAY, lan::GATEWAY_IP, lan::NODE, lan::NODE_IP),
+            at(0),
+        );
+        let _ = m.observe_with_gateway(&own, &gateway);
+        let proxied = arp_frame(
+            &lan::arp_reply(lan::GATEWAY, lan::VIP, lan::MACBOOK, lan::MACBOOK_IP),
+            at(1),
+        );
+        let effects = m.observe_with_gateway(&proxied, &gateway);
+        assert_eq!(ip_changes(&effects), 0, "{effects:?}");
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::Address { ip, .. } if ip == "10.20.250.1")),
+            "no history row for an address the gateway answers for on somebody's behalf: {effects:?}"
+        );
+        let snapshot = m.snapshot();
+        let gw = snapshot
+            .iter()
+            .find(|d| d.mac == MacAddr(lan::GATEWAY))
+            .expect("gateway");
+        assert_eq!(gw.last_ip.as_deref(), Some("10.20.0.1"));
+        assert_eq!(
+            gw.last_seen_at,
+            at(1),
+            "the frame still says the gateway is there"
+        );
+    }
+
+    #[test]
+    fn a_node_answering_for_a_vip_holds_a_second_address_rather_than_changing_address() {
+        // Issue #12's second question: the MetalLB node answers for its own
+        // address and for the VIP, both at once, for as long as it is leader.
+        use crate::capture::fixtures::lan;
+        let gateway =
+            crate::analyze::GatewayTracker::new(Some(lan::GATEWAY_IP), Some(MacAddr(lan::GATEWAY)));
+        let mut m = Manager::new(config(), false);
+        let mut changes = 0;
+        for round in 0..10i64 {
+            for (n, ip) in [lan::NODE_IP, lan::VIP].into_iter().enumerate() {
+                let frame = lan::arp_reply(lan::NODE, ip, lan::MACBOOK, lan::MACBOOK_IP);
+                let when = at(round * 30 + i64::try_from(n).expect("small"));
+                changes += ip_changes(&m.observe_with_gateway(&arp_frame(&frame, when), &gateway));
+            }
+        }
+        assert!(
+            changes <= 1,
+            "{changes} ip_changed for one node holding two addresses"
+        );
     }
 
     #[test]

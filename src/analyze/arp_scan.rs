@@ -293,6 +293,73 @@ mod tests {
     }
 
     #[test]
+    fn a_second_router_arping_from_several_of_its_own_addresses_gets_the_router_threshold() {
+        // Issue #11. The gateway is known and is somebody else; this router
+        // routes three segments on the same wire and ARPs for hosts on each
+        // from its address there. Sixty distinct targets in one window is the
+        // most the live database recorded for it in a week.
+        use crate::capture::fixtures::lan;
+        let mut analyzer = ArpScan::new(&config(), 1024);
+        let context = Context {
+            gateway: GatewayTracker::new(Some(lan::GATEWAY_IP), Some(MacAddr(lan::GATEWAY))),
+            ..context()
+        };
+        let frame = |n: usize, second: i64| {
+            let sender = lan::ROUTER_IPS[n % 3];
+            let [a, b, c, _] = sender.octets();
+            let target = std::net::Ipv4Addr::new(a, b, c, u8::try_from(10 + n).expect("small"));
+            arp::parse_frame(
+                &lan::arp_request(lan::ROUTER, sender, target),
+                "eth0",
+                at(second),
+            )
+            .expect("parsed")
+        };
+        let mut alerts = Vec::new();
+        for n in 0..60 {
+            alerts.extend(analyzer.analyze(&Stimulus::Observed(&frame(n, 0)), &context));
+        }
+        assert!(
+            alerts.is_empty(),
+            "a router forwarding for three segments is not sweeping one: {alerts:?}"
+        );
+
+        // Not an exemption: past the router threshold it is a sweep.
+        for n in 60..240 {
+            alerts.extend(analyzer.analyze(&Stimulus::Observed(&frame(n, 1)), &context));
+        }
+        assert_eq!(alerts.len(), 1, "a router sweeping is still worth an alert");
+        assert_eq!(alerts[0].details["threshold"], 100);
+        assert_eq!(alerts[0].details["is_gateway"], false);
+    }
+
+    #[test]
+    fn a_host_on_one_address_still_gets_the_ordinary_threshold_beside_a_second_router() {
+        use crate::capture::fixtures::lan;
+        let mut analyzer = ArpScan::new(&config(), 1024);
+        let context = Context {
+            gateway: GatewayTracker::new(Some(lan::GATEWAY_IP), Some(MacAddr(lan::GATEWAY))),
+            ..context()
+        };
+        let mut alerts = Vec::new();
+        for n in 1..=12u8 {
+            let obs = arp::parse_frame(
+                &lan::arp_request(
+                    lan::MACBOOK,
+                    lan::MACBOOK_IP,
+                    std::net::Ipv4Addr::new(10, 20, 228, n),
+                ),
+                "eth0",
+                at(0),
+            )
+            .expect("parsed");
+            alerts.extend(analyzer.analyze(&Stimulus::Observed(&obs), &context));
+        }
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].details["threshold"], 10);
+    }
+
+    #[test]
     fn a_sustained_sweep_alerts_once_per_window_not_once_per_packet() {
         let mut analyzer = ArpScan::new(&config(), 1024);
         let context = context();
