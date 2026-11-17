@@ -452,8 +452,8 @@ address is still caught against the real owner.
 
 ### Routers, reflectors and VIPs, after the 2026-11-17 count
 
-A read-only count of the live database on 2026-11-17 found 21,249 security
-events in the week before, 93% of them `arp_scan` from one MAC, and 527,210
+A read-only count of the live database on 2026-11-17 found 22,249 security
+events in the week before, 89% of them `arp_scan` from one MAC, and 527,210
 `ip_changed` rows from the same MAC. It is a second router: a Ubiquiti with a
 leg on three segments of one wire, which also reflects mDNS between them. Four
 root causes, each fixed where it lives:

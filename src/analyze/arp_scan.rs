@@ -19,7 +19,7 @@
 //! LAN routed across several segments has others: on the home LAN of issue #11
 //! a second router ARPed from 10.20.0.2, 10.30.0.1 and 10.40.0.1 for hosts on
 //! each, and as an ordinary host it was 19,857 `arp_scan` alerts in a week,
-//! 93% of every security event. What marks a router out on the wire is that it
+//! 89% of every security event. What marks a router out on the wire is that it
 //! **asks from more than one address of its own**: it has a leg on each segment
 //! it routes, and asks for that segment's hosts from its address there. A host
 //! asks from the one address it has. So a MAC that has asked from two or more
