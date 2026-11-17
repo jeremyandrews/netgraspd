@@ -204,6 +204,18 @@ impl Cli {
     }
 }
 
+/// Whether log lines carry ANSI colour.
+///
+/// Only when the log stream is a terminal and `NO_COLOR` is unset or empty
+/// (<https://no-color.org>). Under systemd or `docker logs` the stream is a
+/// pipe, and colour there is escape bytes in the journal, in `grep` and in
+/// every log shipper downstream.
+#[must_use]
+pub fn log_colour(log_stream_is_terminal: bool, no_color: Option<&std::ffi::OsStr>) -> bool {
+    let no_color = no_color.is_some_and(|value| !value.is_empty());
+    log_stream_is_terminal && !no_color
+}
+
 /// Logs where the configuration came from and which database it names.
 ///
 /// Runs for every subcommand, before anything connects. A read command that
@@ -725,6 +737,17 @@ mod tests {
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).expect("arguments parse")
+    }
+
+    #[test]
+    fn logs_are_coloured_only_on_a_terminal_without_no_color() {
+        use std::ffi::OsStr;
+        assert!(log_colour(true, None), "a terminal, nothing said");
+        assert!(!log_colour(false, None), "a pipe: journald, docker logs");
+        assert!(!log_colour(true, Some(OsStr::new("1"))), "NO_COLOR set");
+        assert!(!log_colour(false, Some(OsStr::new("1"))));
+        // The convention: an empty NO_COLOR is the same as an absent one.
+        assert!(log_colour(true, Some(OsStr::new(""))));
     }
 
     #[test]
