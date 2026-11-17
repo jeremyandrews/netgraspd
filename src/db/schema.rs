@@ -193,6 +193,32 @@ pub const EXPECTED: &[(&str, &[ExpectedColumn])] = &[
             null("last_departed_at", TS),
         ],
     ),
+    (
+        "ng_notify_status",
+        &[
+            not_null("id", "bigint"),
+            not_null("notify_configured", "boolean"),
+            null("notify_backend", "text"),
+            null("last_delivery_ok", "boolean"),
+            null("last_delivery_at", TS),
+            not_null("updated_at", TS),
+            null("last_delivery_at_epoch", "bigint"),
+            null("updated_at_epoch", "bigint"),
+        ],
+    ),
+    (
+        "ng_notify_requests",
+        &[
+            not_null("id", "bigint"),
+            not_null("kind", "text"),
+            null("requested_by", "text"),
+            not_null("requested_at", TS),
+            null("handled_at", TS),
+            null("outcome", "text"),
+            null("requested_at_epoch", "bigint"),
+            null("handled_at_epoch", "bigint"),
+        ],
+    ),
 ];
 
 /// The name refinery records applied migrations under.

@@ -22,7 +22,13 @@ shipped rather than a release that was tagged at the time.
 
 ## [Unreleased]
 
+### Changed
+
+- **Arrival and departure alerts are one sentence on the local clock**: "Jamie is home: Jamie's iPhone joined at 18:42" and "Jamie left: last seen 07:55", where they were "Jamie arrived" and "Jamie left" with a UTC time in the body. Person events now carry `device_name` and `last_seen_at` in `details`.
+
 ### Added
+
+- **Delivery status and a test alert the web side can ask for**, schema V4 (additive). `ng_notify_status` is one daemon-owned row: whether delivery is configured, by which transport, and whether the last attempt was accepted and when. The plugin inserts into `ng_notify_requests` to ask for a test; the daemon answers on its reconcile tick with one test alert for however many requests are waiting, and marks each `sent`, `failed` or `not_configured`. Neither table holds the topic, the server or the token, and an outcome is never the transport's error text, because that names the URL.
 
 - **A profile for a network you do not own**, `netgrasp.foreign.toml.example`. It is an ordinary configuration file, not a mode. Notifications, enrichment and reverse DNS are off; all six sources are on; events and rollup are kept for one day; the unknown-device sample is on. It names its own database, and its status file and sample are relative paths an ordinary user can write. The image ships it beside the home example ([#18](https://github.com/jeremyandrews/netgraspd/pull/18)).
 - **The visibility report**, in the status file and in `netgraspd stats`. For each interface and each source it gives frames delivered, distinct source MACs (at most 4096 kept per set, then reported as "at least"), and how long the interface has been listening. It also gives the gateway the daemon believes in and where that belief came from. Each interface then gets one plain verdict, so an isolated guest network ("capture is working: 1 sender seen (the gateway), consistent with client isolation") no longer looks like broken capture ("nothing received on en0 in 10m: capture may be broken"). The new status fields are defaulted on read, so an older status file still parses ([#18](https://github.com/jeremyandrews/netgraspd/pull/18)).

@@ -64,6 +64,8 @@ use async_trait::async_trait;
 use jiff::tz::Offset;
 
 use crate::config::{NotifyConfig, SecurityNotifyConfig};
+use crate::db::Db;
+use crate::db::queries;
 use crate::device::DeviceEvent;
 use crate::device::persist::RecordedEvent;
 use crate::types::MacAddr;
@@ -102,6 +104,141 @@ pub trait Notifier: Send + Sync {
     fn supports_priority(&self) -> bool {
         false
     }
+
+    /// Sends a test alert, so that somebody can see delivery work without
+    /// waiting for a device to come home.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when delivery fails, or when the transport has no way
+    /// to send one.
+    async fn send_test(&self, at: Timestamp) -> Result<()> {
+        let _ = at;
+        anyhow::bail!("{} cannot send a test alert", self.name())
+    }
+}
+
+/// What became of a test alert somebody asked for.
+///
+/// Stored in `ng_notify_requests.outcome` as [`TestOutcome::as_str`]. A word,
+/// never an error message: a transport error names the URL, and the URL
+/// contains the topic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestOutcome {
+    /// At least one notifier accepted it.
+    Sent,
+    /// Every notifier refused it or could not be reached.
+    Failed,
+    /// There is nowhere to send it.
+    NotConfigured,
+}
+
+impl TestOutcome {
+    /// The word stored in `ng_notify_requests.outcome`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            TestOutcome::Sent => "sent",
+            TestOutcome::Failed => "failed",
+            TestOutcome::NotConfigured => "not_configured",
+        }
+    }
+}
+
+/// Whether anything will actually be delivered.
+fn configured(notifiers: &[Box<dyn Notifier>], enabled: bool) -> bool {
+    enabled && !notifiers.is_empty()
+}
+
+/// Writes `ng_notify_status`: whether delivery is configured, and by what.
+///
+/// Names the transport and nothing else. The topic, the server and the token
+/// stay in the daemon's configuration.
+///
+/// # Errors
+///
+/// Returns an error when there is no database connection or the write fails.
+pub async fn publish_status(
+    db: &Db,
+    notifiers: &[Box<dyn Notifier>],
+    enabled: bool,
+    now: Timestamp,
+) -> Result<()> {
+    let is_configured = configured(notifiers, enabled);
+    let backend = if is_configured {
+        Some(
+            notifiers
+                .iter()
+                .map(|n| n.name())
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    } else {
+        None
+    };
+    let client = db.client().await?;
+    queries::publish_notify_status(&client, is_configured, backend.as_deref(), now).await
+}
+
+/// Records the outcome of one delivery attempt in `ng_notify_status`.
+///
+/// # Errors
+///
+/// Returns an error when there is no database connection or the write fails.
+pub async fn record_delivery(db: &Db, ok: bool, at: Timestamp) -> Result<()> {
+    let client = db.client().await?;
+    queries::record_notify_delivery(&client, ok, at).await
+}
+
+/// Answers every test request waiting in `ng_notify_requests` with one test
+/// alert.
+///
+/// Several presses of the button before the tick comes round are one test, not
+/// several: the person asked whether alerts work, and one alert answers that.
+///
+/// Returns `None` when nothing was waiting.
+///
+/// # Errors
+///
+/// Returns an error when there is no database connection or a query fails. A
+/// transport failure is an outcome, not an error.
+pub async fn handle_test_requests(
+    db: &Db,
+    notifiers: &[Box<dyn Notifier>],
+    enabled: bool,
+    now: Timestamp,
+) -> Result<Option<TestOutcome>> {
+    let client = db.client().await?;
+    let pending = queries::pending_notify_requests(&client).await?;
+    if pending.is_empty() {
+        return Ok(None);
+    }
+    let outcome = if configured(notifiers, enabled) {
+        let mut sent = false;
+        for notifier in notifiers {
+            match notifier.send_test(now).await {
+                Ok(()) => sent = true,
+                Err(err) => {
+                    tracing::warn!(notifier = notifier.name(), %err, "test alert failed");
+                }
+            }
+        }
+        queries::record_notify_delivery(&client, sent, now).await?;
+        if sent {
+            TestOutcome::Sent
+        } else {
+            TestOutcome::Failed
+        }
+    } else {
+        TestOutcome::NotConfigured
+    };
+    queries::complete_notify_requests(&client, &pending, outcome.as_str(), now).await?;
+    tracing::info!(
+        requests = pending.len(),
+        outcome = outcome.as_str(),
+        "answered a test alert request"
+    );
+    Ok(Some(outcome))
 }
 
 /// What the dispatcher decided to deliver.

@@ -102,8 +102,9 @@ async fn fake_ntfy(status: u16) -> (String, Arc<Mutex<Vec<Logged>>>) {
                     body: String::from_utf8_lossy(&buffer[head_len..]).to_string(),
                 });
                 let reason = if status == 200 { "OK" } else { "Error" };
-                let reply =
-                    format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}");
+                let reply = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                );
                 let _ = socket.write_all(reply.as_bytes()).await;
             });
         }
@@ -388,5 +389,8 @@ async fn an_arrival_reaches_ntfy_in_words() {
     };
     notifier.send(&event).await.expect("delivered");
     let sent = log.lock().expect("log").clone();
-    assert_eq!(sent[0].title, "Jamie is home: Jamie's iPhone joined at 18:42");
+    assert_eq!(
+        sent[0].title,
+        "Jamie is home: Jamie's iPhone joined at 18:42"
+    );
 }

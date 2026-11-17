@@ -1305,6 +1305,14 @@ impl Manager {
     #[must_use]
     pub fn person_event(&self, event: &crate::people::PersonEvent) -> Vec<Effect> {
         let entry = self.devices.get(&event.mac);
+        // The alert names the device as well as the person ("Jamie is home:
+        // Jamie's iPhone joined at 18:42") and a departure says when the device
+        // was last heard from, which is earlier than when it was declared gone.
+        let mut details = event.details.clone();
+        if let (Some(entry), Some(object)) = (entry, details.as_object_mut()) {
+            object.insert("device_name".into(), json!(entry.snapshot().display()));
+            object.insert("last_seen_at".into(), json!(entry.last_seen_at));
+        }
         vec![Effect::Event(Box::new(DeviceEvent {
             event_type: event.event_type,
             mac: event.mac,
@@ -1319,7 +1327,7 @@ impl Manager {
             during_learning: false,
             notify: event.notify,
             priority: EventPriority::Normal,
-            details: event.details.clone(),
+            details,
         }))]
     }
 
