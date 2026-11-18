@@ -25,11 +25,13 @@ suite asserts it.
 
 ## Status
 
-Version 1.0.0: milestone 3, which closes v1, plus the reconcile tick that makes
-an edit in Trovato reach a running daemon and the fixes from the first run on a
-real home network. It is the code that was 0.4.1, released: `CHANGELOG.md` has
-the history and the versioning rule, which from 1.0.0 is semantic versioning
-over the command line, the configuration file and the `ng_` schema.
+Version 1.1.0. 1.0.0 was milestone 3, which closes v1, plus the reconcile tick
+that makes an edit in Trovato reach a running daemon. 1.1.0 adds delivery status
+and a test alert the web side can ask for, the profile and `export` for a
+network you do not own, schema version 5 (which only adds), and the fixes from
+running on a real home network. `CHANGELOG.md` has the history and the
+versioning rule, which from 1.0.0 is semantic versioning over the command line,
+the configuration file and the `ng_` schema.
 
 **No real UniFi controller has ever been contacted**, and the daemon has not yet
 run unattended on a real network for longer than an evening. Read
@@ -94,23 +96,23 @@ and point `database.url` at it:
 ### The image
 
 ```sh
-docker pull ghcr.io/jeremyandrews/netgraspd:1.0.0
+docker pull ghcr.io/jeremyandrews/netgraspd:1.1.0
 
 # The example configuration ships inside the image.
-docker run --rm --entrypoint cat ghcr.io/jeremyandrews/netgraspd:1.0.0 \
+docker run --rm --entrypoint cat ghcr.io/jeremyandrews/netgraspd:1.1.0 \
     /usr/share/netgraspd/netgrasp.toml.example > netgrasp.toml
 $EDITOR netgrasp.toml          # at minimum, database.url
 ```
 
 Then run it as [Docker](#docker) below describes, substituting
-`ghcr.io/jeremyandrews/netgraspd:1.0.0` for the locally built `netgraspd`, or
-with [Compose](#compose). Tags are the version (`1.0.0`), the minor line
-(`1.0`) and `latest`; pin the version.
+`ghcr.io/jeremyandrews/netgraspd:1.1.0` for the locally built `netgraspd`, or
+with [Compose](#compose). Tags are the version (`1.1.0`), the minor line
+(`1.1`) and `latest`; pin the version.
 
 ### The binary, under systemd
 
 ```sh
-v=1.0.0
+v=1.1.0
 arch=x86_64-unknown-linux-gnu          # or aarch64-unknown-linux-gnu
 base=https://github.com/jeremyandrews/netgraspd/releases/download/v$v
 curl -fLO "$base/netgraspd-$v-$arch"
@@ -170,13 +172,13 @@ have to agree on one thing, the `ng_` tables.
 
 | netgraspd | netgrasp-trovato | `ng_` schema | Trovato kernel |
 |---|---|---|---|
+| 1.1.0 | 1.1.0 | version 5 (`V5__people_epochs_event_person_daemon_status.sql`) | 0.102.0 or a later 0.x |
 | 1.0.0 | 1.0.0 | version 3 (`V3__enrichment_location_people.sql`) | 0.102.0 or a later 0.x |
 
-Unreleased: `main` is at schema version 5 (`V4__notify_status_and_requests.sql`
-and `V5__people_epochs_event_person_daemon_status.sql`), both of which only add.
-A plugin built for version 3 keeps working against it, because it names the columns it
-reads and reads none of the new ones; it has not adopted them yet, and the
-paired release lands when it does.
+Versions 4 and 5 only add. Plugin 1.1.0 reads version 4's notify tables (the
+Alerts page and its Send test) and none of version 5's yet; it names the columns
+it reads, so it runs on version 5 unchanged, and a plugin built for version 3
+keeps working too. Migrate the daemon to 1.1.0 first, then upgrade the plugin.
 
 **The rule.** A daemon and a plugin pair when they are built for the same `ng_`
 schema version, which is the highest migration under `migrations/` here.
@@ -780,9 +782,10 @@ netgrasp_trip` and delete the run directory. Nothing else was written.
   can capture the Mac's own network.
 - **On a Linux host, from the image**, with host networking and the one
   capability, the trip directory mounted as the working directory so the
-  relative paths land in it. The profile and `export` are newer than 1.0.0, so
-  use an image built from this repository (`docker build -t netgraspd .`, as in
-  [Docker](#docker)) until the next release:
+  relative paths land in it. The profile and `export` are in 1.1.0 and later.
+  `netgraspd` below is a local tag: `docker pull
+  ghcr.io/jeremyandrews/netgraspd:1.1.0` and `docker tag` it, or build one from
+  this repository (`docker build -t netgraspd .`, as in [Docker](#docker)):
 
   ```sh
   mkdir trip && cd trip
