@@ -149,6 +149,21 @@ impl DeviceEvent {
         }
         self.notify && !self.during_learning
     }
+
+    /// The person a `person_*` event is about, as their Item id.
+    ///
+    /// `None` for every other event type, even one whose details happen to
+    /// carry the key: only a person event is about a person.
+    #[must_use]
+    pub fn person_item_id(&self) -> Option<String> {
+        if !self.event_type.is_person() {
+            return None;
+        }
+        self.details
+            .get("person_item_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    }
 }
 
 /// A device whose classification changed.
@@ -1691,6 +1706,48 @@ mod tests {
 
     fn at(offset_secs: i64) -> Timestamp {
         base() + SignedDuration::from_secs(offset_secs)
+    }
+
+    fn event_of(event_type: EventType, details: serde_json::Value) -> DeviceEvent {
+        DeviceEvent {
+            event_type,
+            mac: "3c:22:fb:00:00:01".parse().expect("mac"),
+            display_name: "phone".into(),
+            vendor: None,
+            ip: None,
+            interface: None,
+            at: base(),
+            baseline: false,
+            during_learning: false,
+            notify: true,
+            priority: EventPriority::Normal,
+            details,
+        }
+    }
+
+    #[test]
+    fn only_a_person_event_names_a_person() {
+        let id = "11111111-2222-3333-4444-555555555555";
+        let details = serde_json::json!({ "person": "Jeremy", "person_item_id": id });
+        for kind in [
+            EventType::PersonArrived,
+            EventType::PersonDeparted,
+            EventType::PersonLocationChanged,
+        ] {
+            assert_eq!(
+                event_of(kind, details.clone()).person_item_id().as_deref(),
+                Some(id)
+            );
+        }
+        assert_eq!(
+            event_of(EventType::NewDevice, details).person_item_id(),
+            None,
+            "a device event whose details carry the key is still not about a person"
+        );
+        assert_eq!(
+            event_of(EventType::PersonArrived, serde_json::json!({})).person_item_id(),
+            None
+        );
     }
 
     fn config() -> StateConfig {

@@ -652,3 +652,97 @@ async fn a_stay_left_open_by_a_crash_is_closed_at_startup() {
         "the online device keeps its stay"
     );
 }
+
+#[tokio::test]
+async fn every_person_event_names_its_person_in_a_column_of_its_own() {
+    let Some(db) = common::test_db().await else {
+        return;
+    };
+    // "Who came home today" is a question about people. Before this column the
+    // only way to answer it from SQL was to dig the person out of `details`, or
+    // to join through the device that happened to trigger the event.
+    let mut h = Harness::new();
+    let jeremy = h.add_person(&db, "Jeremy", &[PHONE]).await;
+    h.see(&db, PHONE, base()).await;
+    h.place(&db, PHONE, "Living Room AP", at(60)).await;
+    h.sweep(&db, at(20_000)).await;
+    h.see(&db, LAPTOP, at(20_100)).await;
+    let kinds = h.kinds();
+    assert!(kinds.contains(&EventType::PersonArrived), "{kinds:?}");
+    assert!(kinds.contains(&EventType::PersonDeparted), "{kinds:?}");
+    assert!(
+        kinds.contains(&EventType::PersonLocationChanged),
+        "{kinds:?}"
+    );
+
+    assert_eq!(
+        db.scalar(&format!(
+            "SELECT COUNT(*) FROM ng_events
+              WHERE event_type LIKE 'person\\_%'
+                AND person_item_id IS DISTINCT FROM '{jeremy}'::uuid"
+        ))
+        .await,
+        0,
+        "a person event without its person_item_id"
+    );
+    assert_eq!(
+        db.scalar(
+            "SELECT COUNT(*) FROM ng_events
+              WHERE event_type NOT LIKE 'person\\_%' AND person_item_id IS NOT NULL"
+        )
+        .await,
+        0,
+        "a device event claims a person"
+    );
+
+    // And the plugin's question, answered with one equality join.
+    let client = db.client().await;
+    let rows = client
+        .query(
+            "SELECT p.name FROM ng_events e JOIN ng_people p ON p.item_id = e.person_item_id
+              WHERE e.event_type = 'person_arrived'",
+            &[],
+        )
+        .await
+        .expect("who arrived");
+    let names: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(names, vec!["Jeremy".to_string()]);
+}
+
+#[tokio::test]
+async fn a_person_renamed_in_trovato_is_announced_under_the_new_name_without_a_restart() {
+    let Some(db) = common::test_db().await else {
+        return;
+    };
+    let mut h = Harness::new();
+    let person = h.add_person(&db, "Jeremy", &[PHONE]).await;
+    h.see(&db, PHONE, base()).await;
+    h.sweep(&db, at(20_000)).await;
+
+    // The plugin renames the person and records the ownership it already
+    // holds, writing only its own columns.
+    let client = db.client().await;
+    client
+        .batch_execute(&format!(
+            "UPDATE ng_people SET name = 'Jeremy Andrews' WHERE item_id = '{person}'::uuid;
+             UPDATE ng_devices SET owner_item_id = '{person}'::uuid WHERE mac = '{PHONE}';"
+        ))
+        .await
+        .expect("the plugin's write");
+    netgraspd::daemon::reconcile_user_state(&db.db, &mut h.manager, &mut h.registry).await;
+
+    h.see(&db, PHONE, at(20_100)).await;
+    let arrival = h
+        .person_events
+        .iter()
+        .rev()
+        .find(|e| e.event_type == EventType::PersonArrived)
+        .expect("an arrival after the rename");
+    assert_eq!(arrival.name, "Jeremy Andrews", "the notification's name");
+    assert_eq!(arrival.details["person"], "Jeremy Andrews");
+    let effects = h.manager.person_event(arrival);
+    let Some(Effect::Event(event)) = effects.first() else {
+        panic!("a person event is one recordable event: {effects:?}");
+    };
+    assert_eq!(event.display_name, "Jeremy Andrews");
+}

@@ -18,6 +18,9 @@ use hickory_resolver::TokioResolver;
 use hickory_resolver::proto::rr::RData;
 use tokio::sync::Mutex;
 
+use crate::clock::Timestamp;
+use crate::enrich::{EnricherStatus, REVERSE_DNS};
+
 /// A caching reverse resolver.
 ///
 /// Cloning shares the cache and the underlying resolver.
@@ -30,6 +33,10 @@ struct Inner {
     resolver: TokioResolver,
     ttl: Duration,
     cache: Mutex<HashMap<IpAddr, CacheEntry>>,
+    /// How the lookups that reached the network fared, for
+    /// `ng_enrichment_status`. A plain mutex: it is held for a field update and
+    /// never across an await.
+    status: std::sync::Mutex<EnricherStatus>,
 }
 
 #[derive(Clone)]
@@ -54,6 +61,7 @@ impl ReverseResolver {
                 resolver,
                 ttl,
                 cache: Mutex::new(HashMap::new()),
+                status: std::sync::Mutex::new(EnricherStatus::starting(REVERSE_DNS)),
             }),
         })
     }
@@ -72,19 +80,31 @@ impl ReverseResolver {
             }
         }
 
-        let resolved = match self.inner.resolver.reverse_lookup(arpa_name(ip)).await {
-            Ok(answer) => answer
-                .answers()
-                .iter()
-                .find_map(|record| match &record.data {
-                    RData::PTR(ptr) => clean_ptr(&ptr.to_string()),
-                    _ => None,
-                }),
+        let (resolved, outcome) = match self.inner.resolver.reverse_lookup(arpa_name(ip)).await {
+            Ok(answer) => (
+                answer
+                    .answers()
+                    .iter()
+                    .find_map(|record| match &record.data {
+                        RData::PTR(ptr) => clean_ptr(&ptr.to_string()),
+                        _ => None,
+                    }),
+                Ok(()),
+            ),
             Err(err) => {
                 tracing::debug!(%ip, %err, "reverse lookup failed");
-                None
+                // No record is the common case and an answer like any other:
+                // the resolver is working. Anything else (a timeout, a refused
+                // connection, no nameserver) is the resolver failing.
+                let outcome = if err.is_no_records_found() || err.is_nx_domain() {
+                    Ok(())
+                } else {
+                    Err(err.to_string())
+                };
+                (None, outcome)
             }
         };
+        self.record(outcome);
 
         let mut cache = self.inner.cache.lock().await;
         cache.insert(
@@ -95,6 +115,29 @@ impl ReverseResolver {
             },
         );
         resolved
+    }
+
+    /// How the lookups have fared, for `ng_enrichment_status`.
+    #[must_use]
+    pub fn status(&self) -> EnricherStatus {
+        self.inner
+            .status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Counts one lookup that reached the network.
+    fn record(&self, outcome: Result<(), String>) {
+        let mut status = self
+            .inner
+            .status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match outcome {
+            Ok(()) => status.succeeded(Timestamp::now()),
+            Err(error) => status.failed(Timestamp::now(), error),
+        }
     }
 
     /// Number of cached answers, positive and negative. Exposed for the status

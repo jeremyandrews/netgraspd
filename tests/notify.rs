@@ -402,9 +402,15 @@ async fn notify_tables_the_plugin_created_first_do_not_stop_the_daemon_migrating
     let Some(db) = common::test_db().await else {
         return;
     };
+    // Back to a V3 site whose plugin already created V4's tables: V5 is undone
+    // first, because refinery refuses a history with V5 applied and V4 not.
     db.execute(
         "INSERT INTO ng_notify_requests (requested_by) VALUES ('before the upgrade');
-         DELETE FROM refinery_schema_history WHERE version = 4;",
+         DROP TABLE IF EXISTS ng_enrichment_status, ng_daemon_status;
+         ALTER TABLE ng_events DROP COLUMN IF EXISTS person_item_id;
+         ALTER TABLE ng_people DROP COLUMN IF EXISTS last_arrived_at_epoch,
+                               DROP COLUMN IF EXISTS last_departed_at_epoch;
+         DELETE FROM refinery_schema_history WHERE version >= 4;",
     )
     .await;
     netgraspd::db::Db::migrate(&common::test_url())
