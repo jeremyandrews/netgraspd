@@ -313,14 +313,19 @@ async fn an_arrival_reaches_ntfy_in_words() {
 #[tokio::test]
 async fn notify_tables_the_plugin_created_first_do_not_stop_the_daemon_migrating() {
     // The plugin ships a guarded copy of these two tables. A site that upgrades
-    // the plugin before the daemon has them already when V4 runs. A daemon that
-    // has not yet run V4 has run nothing after it either, so the history is cut
-    // back to V3.
+    // the plugin before the daemon has them already when V4 runs.
     let Some(db) = common::test_db().await else {
         return;
     };
+    // Back to a V3 site whose plugin already created V4's tables: V5 and V6 are
+    // undone first, because refinery refuses a history with a later version
+    // applied and V4 not. V6 created nothing, and runs again harmlessly.
     db.execute(
         "INSERT INTO ng_notify_requests (requested_by) VALUES ('before the upgrade');
+         DROP TABLE IF EXISTS ng_enrichment_status, ng_daemon_status;
+         ALTER TABLE ng_events DROP COLUMN IF EXISTS person_item_id;
+         ALTER TABLE ng_people DROP COLUMN IF EXISTS last_arrived_at_epoch,
+                               DROP COLUMN IF EXISTS last_departed_at_epoch;
          DELETE FROM refinery_schema_history WHERE version >= 4;",
     )
     .await;

@@ -150,6 +150,7 @@ pub const EXPECTED: &[(&str, &[ExpectedColumn])] = &[
             not_null("notified", "boolean"),
             not_null("sync_state", "text"),
             null("timestamp_epoch", "bigint"),
+            null("person_item_id", "uuid"),
         ],
     ),
     (
@@ -191,6 +192,38 @@ pub const EXPECTED: &[(&str, &[ExpectedColumn])] = &[
             null("current_location", "text"),
             null("last_arrived_at", TS),
             null("last_departed_at", TS),
+            null("last_arrived_at_epoch", "bigint"),
+            null("last_departed_at_epoch", "bigint"),
+        ],
+    ),
+    (
+        "ng_daemon_status",
+        &[
+            not_null("id", "bigint"),
+            not_null("version", "text"),
+            not_null("timezone", "text"),
+            not_null("timezone_source", "text"),
+            not_null("started_at", TS),
+            not_null("updated_at", TS),
+            null("started_at_epoch", "bigint"),
+            null("updated_at_epoch", "bigint"),
+        ],
+    ),
+    (
+        "ng_enrichment_status",
+        &[
+            not_null("enricher", "text"),
+            not_null("configured", "boolean"),
+            not_null("state", "text"),
+            not_null("polls", "bigint"),
+            not_null("failures", "bigint"),
+            null("last_success_at", TS),
+            null("last_failure_at", TS),
+            null("last_error", "text"),
+            not_null("updated_at", TS),
+            null("last_success_at_epoch", "bigint"),
+            null("last_failure_at_epoch", "bigint"),
+            null("updated_at_epoch", "bigint"),
         ],
     ),
     (
@@ -659,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn the_nine_tables_the_plugin_reads_are_all_covered() {
+    fn the_eleven_tables_the_plugin_reads_are_all_covered() {
         let names: Vec<&str> = EXPECTED.iter().map(|(t, _)| *t).collect();
         for required in [
             "ng_devices",
@@ -671,10 +704,12 @@ mod tests {
             "ng_people",
             "ng_notify_status",
             "ng_notify_requests",
+            "ng_daemon_status",
+            "ng_enrichment_status",
         ] {
             assert!(names.contains(&required), "{required} is not in EXPECTED");
         }
-        assert_eq!(names.len(), 9, "an unexpected table joined the contract");
+        assert_eq!(names.len(), 11, "an unexpected table joined the contract");
     }
 
     #[test]

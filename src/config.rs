@@ -267,6 +267,16 @@ impl From<ClockTime> for String {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    /// The household's time zone, as an IANA name such as `Europe/Rome`.
+    ///
+    /// Published in `ng_daemon_status.timezone`, which is what every day
+    /// boundary over the `ng_` tables is measured in: "today" on the web side is
+    /// today in this zone, whatever `TimeZone` the reading session carries.
+    /// Unset, the daemon publishes the database's own `TimeZone`. Checked
+    /// against Postgres at startup; a name it does not know stops the daemon.
+    ///
+    /// A top-level key, so in a TOML file it goes above the first `[section]`.
+    pub timezone: Option<String>,
     /// Postgres connection and pool settings.
     pub database: DatabaseConfig,
     /// Which interfaces and protocols to listen to.
@@ -1705,6 +1715,28 @@ mod tests {
             let c = Config::load(None, &[]).expect("load");
             assert_eq!(c.database.url, "postgres://from-env/db");
             assert_eq!(c.state.idle_timeout.as_secs(), 420);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn the_time_zone_is_a_top_level_key_and_unset_by_default() {
+        assert_eq!(Config::default().timezone, None);
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "netgrasp.toml",
+                r#"
+                timezone = "Europe/Rome"
+
+                [database]
+                url = "postgres://from-file/db"
+                "#,
+            )?;
+            let c = Config::load(None, &[]).expect("load");
+            assert_eq!(c.timezone.as_deref(), Some("Europe/Rome"));
+            jail.set_env("NETGRASP_TIMEZONE", "America/New_York");
+            let c = Config::load(None, &[]).expect("load");
+            assert_eq!(c.timezone.as_deref(), Some("America/New_York"));
             Ok(())
         });
     }

@@ -93,7 +93,7 @@ Practical consequences, so they are not mistaken for oversights:
 - There is no daemon-side way to set `display_name`, `notes`, `hidden` or
   `notify`. The daemon reads them and never writes them. `notify` starts
   `FALSE`: a device comes and goes without an alert until a person turns it on,
-  and a new device is announced whatever it says. Schema V5 set it `FALSE` on
+  and a new device is announced whatever it says. Schema V6 set it `FALSE` on
   every existing row once, because under V1's `DEFAULT TRUE` none of those was a
   choice anybody made.
 - A daemon-only deployment is a deliberately reduced thing: capture, state,
@@ -619,6 +619,34 @@ numbers that are meaningless the moment the daemon stops. So the daemon writes a
 small JSON file atomically and `stats` reads it, says plainly when it is missing
 or stale, and answers the database half regardless.
 
+Two facts are the exception, because the web side needs them and cannot read a
+file on another machine: `ng_daemon_status` (version, the published time zone,
+started and updated times) and `ng_enrichment_status` (one row per known
+enricher: configured, `starting`/`ok`/`failing`, counts, the last error). They
+are small and fixed in size, rewritten on the status tick beside the file, and
+added in V5 as new tables so nothing the plugin already reads changes. A row
+whose `updated_at` has stopped moving is how a reader tells the daemon has
+stopped, which is the same staleness rule `stats` applies to the file. Uptime,
+memory and capture rates stay in the file only.
+
+### Day boundaries have one owner
+
+"Today" over these tables is measured in `ng_daemon_status.timezone`, never in a
+reading session's `TimeZone`. Two other owners were possible and both were
+worse. The daemon cannot set the reading sessions' zone: they are the kernel's
+connections, and `ALTER DATABASE ... SET timezone` is an operator's decision about
+a database the daemon shares, not one it should take on its way up. The plugin
+choosing its own zone would make a second source of truth for a fact about the
+household, which the daemon's configuration already describes. So the daemon
+publishes one zone, from its `timezone` setting or, unset, from the database's own
+`TimeZone`, and every reader writes `AT TIME ZONE` with it. A configured zone is
+checked against `pg_timezone_names` at startup, because Postgres is who will be
+asked to apply it.
+
+Quiet hours do not use it yet: they are evaluated at the host's UTC offset as it
+stood when the daemon started, which is a separate defect (it is wrong across a
+daylight-saving change) recorded under open questions.
+
 Resident memory scales with interfaces × sources × `capture.buffer_size`, since
 each is a pcap handle with a kernel buffer: 15 MB on one interface with all six
 sources, 185 MB on a Docker host with twenty-three.
@@ -686,3 +714,8 @@ not identified, a warning says why, and it is recorded per interface as before.
    fields and tolerates missing ones, which is the most that can be done from
    published response shapes; the first contact with real firmware is the thing
    most likely to need a fix.
+4. Quiet hours are evaluated at a fixed UTC offset, read from the host when the
+   notifier starts, so a daemon running across a daylight-saving change applies
+   them an hour out until it restarts. The fix is to evaluate them in the
+   published zone (`ng_daemon_status.timezone`), which needs a zone database on
+   the Rust side; it was left out of V5 to keep that change to the schema.

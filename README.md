@@ -25,11 +25,13 @@ suite asserts it.
 
 ## Status
 
-Version 1.0.0: milestone 3, which closes v1, plus the reconcile tick that makes
-an edit in Trovato reach a running daemon and the fixes from the first run on a
-real home network. It is the code that was 0.4.1, released: `CHANGELOG.md` has
-the history and the versioning rule, which from 1.0.0 is semantic versioning
-over the command line, the configuration file and the `ng_` schema.
+Version 1.1.0. 1.0.0 was milestone 3, which closes v1, plus the reconcile tick
+that makes an edit in Trovato reach a running daemon. 1.1.0 adds delivery status
+and a test alert the web side can ask for, the profile and `export` for a
+network you do not own, schema version 5 (which only adds), and the fixes from
+running on a real home network. `CHANGELOG.md` has the history and the
+versioning rule, which from 1.0.0 is semantic versioning over the command line,
+the configuration file and the `ng_` schema.
 
 **No real UniFi controller has ever been contacted**, and the daemon has not yet
 run unattended on a real network for longer than an evening. Read
@@ -94,23 +96,23 @@ and point `database.url` at it:
 ### The image
 
 ```sh
-docker pull ghcr.io/jeremyandrews/netgraspd:1.0.0
+docker pull ghcr.io/jeremyandrews/netgraspd:1.1.0
 
 # The example configuration ships inside the image.
-docker run --rm --entrypoint cat ghcr.io/jeremyandrews/netgraspd:1.0.0 \
+docker run --rm --entrypoint cat ghcr.io/jeremyandrews/netgraspd:1.1.0 \
     /usr/share/netgraspd/netgrasp.toml.example > netgrasp.toml
 $EDITOR netgrasp.toml          # at minimum, database.url
 ```
 
 Then run it as [Docker](#docker) below describes, substituting
-`ghcr.io/jeremyandrews/netgraspd:1.0.0` for the locally built `netgraspd`, or
-with [Compose](#compose). Tags are the version (`1.0.0`), the minor line
-(`1.0`) and `latest`; pin the version.
+`ghcr.io/jeremyandrews/netgraspd:1.1.0` for the locally built `netgraspd`, or
+with [Compose](#compose). Tags are the version (`1.1.0`), the minor line
+(`1.1`) and `latest`; pin the version.
 
 ### The binary, under systemd
 
 ```sh
-v=1.0.0
+v=1.1.0
 arch=x86_64-unknown-linux-gnu          # or aarch64-unknown-linux-gnu
 base=https://github.com/jeremyandrews/netgraspd/releases/download/v$v
 curl -fLO "$base/netgraspd-$v-$arch"
@@ -170,7 +172,19 @@ have to agree on one thing, the `ng_` tables.
 
 | netgraspd | netgrasp-trovato | `ng_` schema | Trovato kernel |
 |---|---|---|---|
+| 1.1.0 | 1.1.0 | version 5 (`V5__people_epochs_event_person_daemon_status.sql`) | 0.102.0 or a later 0.x |
 | 1.0.0 | 1.0.0 | version 3 (`V3__enrichment_location_people.sql`) | 0.102.0 or a later 0.x |
+
+Versions 4 and 5 only add. Plugin 1.1.0 reads version 4's notify tables (the
+Alerts page and its Send test) and none of version 5's yet; it names the columns
+it reads, so it runs on version 5 unchanged, and a plugin built for version 3
+keeps working too. Migrate the daemon to 1.1.0 first, then upgrade the plugin.
+
+Version 6 (unreleased) adds no table and no column: it changes
+`ng_devices.notify` to `DEFAULT FALSE` and sets it `FALSE` on every existing
+device. Every column keeps its name, type and nullability, so plugin 1.1.0 runs
+on it unchanged. The plugin's test fixture, `daemon_schema.sql`, still declares
+`DEFAULT TRUE`; bringing it up to date is a follow up on the plugin side.
 
 **The rule.** A daemon and a plugin pair when they are built for the same `ng_`
 schema version, which is the highest migration under `migrations/` here.
@@ -400,7 +414,54 @@ Every `timestamptz` the plugin reads has a generated `bigint` twin named
 `<column>_epoch`, because the Trovato kernel's database host function decodes a
 fixed list of types and returns null for a `timestamptz`. They are
 `GENERATED ALWAYS ... STORED`, so nothing can write one out of step with its
-source and the `timestamptz` column stays canonical.
+source and the `timestamptz` column stays canonical. Since V5 that includes
+`ng_people.last_arrived_at_epoch` and `last_departed_at_epoch`, which V3 left
+out.
+
+### What V5 adds for the web side
+
+V5 is additive: two columns, two twins and two tables, and nothing V1 to V4
+created is renamed, dropped or retyped. Everything below is daemon owned.
+
+- **`ng_events.person_item_id`** (`uuid`, null on every event that is not
+  `person_arrived`, `person_departed` or `person_location_changed`). The person
+  a person event is about, so "who came home today" is one equality join to
+  `ng_people` rather than a dig through `details`. Not a foreign key: an event
+  outlives the person it names. The migration backfills it from
+  `details ->> 'person_item_id'` for every person event already recorded, and
+  leaves a value that is not a UUID null rather than failing the upgrade.
+- **`ng_daemon_status`**, one row: `version`, `timezone`, `timezone_source`
+  (`config` or `database`), `started_at` and `updated_at`, with epoch twins.
+  Rewritten every `runtime.status_interval`, so an `updated_at` that has stopped
+  moving means the daemon has stopped.
+- **`ng_enrichment_status`**, one row per enricher this build knows (`unifi`,
+  `reverse_dns`), configured or not: `configured`, `state` (`not_configured`,
+  `starting`, `ok`, `failing`), `polls` and `failures` since the daemon
+  started, `last_success_at`, `last_failure_at`, `last_error`, `updated_at`,
+  with epoch twins. This is how a device page can say why a device has no
+  location: UniFi is not configured, or it is failing and here is the error.
+  For reverse DNS a lookup that finds no PTR record counts as a success; a
+  timeout or an unreachable resolver is a failure.
+
+**What "today" means.** A day boundary over these tables is measured in
+`ng_daemon_status.timezone`, as `ts AT TIME ZONE <that zone>`, and never in the
+reading session's own `TimeZone`. The kernel's connections, a `psql` session and
+the daemon can each carry a different one; the published zone is the same for
+all of them. Set it with the top-level `timezone` key (for example
+`timezone = "Europe/Rome"`); unset, the daemon publishes the database's own
+`TimeZone` as its session sees it, so a database already set to the household's
+zone needs nothing. The daemon's own SQL never depends on a session zone: the
+nightly rollups bucket by UTC day.
+
+```sql
+-- Who arrived today, in the household's day.
+SELECT p.name, e.timestamp_epoch
+  FROM ng_events e
+  JOIN ng_people p ON p.item_id = e.person_item_id
+ CROSS JOIN ng_daemon_status s
+ WHERE e.event_type = 'person_arrived'
+   AND (e."timestamp" AT TIME ZONE s.timezone)::date = (now() AT TIME ZONE s.timezone)::date;
+```
 
 ### Backup and restore
 
@@ -499,6 +560,7 @@ The blocks this milestone adds:
 | `[[people]]` | a person and the MACs they own, for an install with no Trovato plugin |
 | `[maintenance]` | when the nightly jobs run, and how long presence and events are kept |
 | `[runtime]` | where the daemon publishes the counters `netgraspd stats` reads |
+| `timezone` | top-level key: the IANA zone published in `ng_daemon_status` for day boundaries |
 
 `[enrichment.unifi.locations]` is a TOML table, so it must come after every
 plain key in `[enrichment.unifi]`.
@@ -726,9 +788,10 @@ netgrasp_trip` and delete the run directory. Nothing else was written.
   can capture the Mac's own network.
 - **On a Linux host, from the image**, with host networking and the one
   capability, the trip directory mounted as the working directory so the
-  relative paths land in it. The profile and `export` are newer than 1.0.0, so
-  use an image built from this repository (`docker build -t netgraspd .`, as in
-  [Docker](#docker)) until the next release:
+  relative paths land in it. The profile and `export` are in 1.1.0 and later.
+  `netgraspd` below is a local tag: `docker pull
+  ghcr.io/jeremyandrews/netgraspd:1.1.0` and `docker tag` it, or build one from
+  this repository (`docker build -t netgraspd .`, as in [Docker](#docker)):
 
   ```sh
   mkdir trip && cd trip

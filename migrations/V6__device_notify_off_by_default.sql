@@ -1,4 +1,4 @@
--- Netgrasp daemon schema, V5: a device comes and goes without an alert until a
+-- Netgrasp daemon schema, V6: a device comes and goes without an alert until a
 -- person chooses it.
 --
 -- Additive in shape. No table, column or type changes: ng_devices.notify keeps
