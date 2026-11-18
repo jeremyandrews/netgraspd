@@ -22,6 +22,8 @@ shipped rather than a release that was tagged at the time.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-18
+
 ### Changed
 
 - **Arrival and departure alerts are one sentence on the local clock**: "Jamie is home: Jamie's iPhone joined at 18:42" and "Jamie left: last seen 07:55", where they were "Jamie arrived" and "Jamie left" with a UTC time in the body. Person events now carry `device_name` and `last_seen_at` in `details`.
