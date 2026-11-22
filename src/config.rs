@@ -614,6 +614,11 @@ pub struct NotifyConfig {
     /// The window over which `batch_threshold` is counted.
     pub batch_window: HumanDuration,
     /// Which event types are worth a notification at all.
+    ///
+    /// A filter on top of the per-event rule, never a way round it: `returned`
+    /// and `went_offline` still need the device's `notify` on, and
+    /// `ip_changed`, `name_updated` and `device_location_changed` are never
+    /// delivered whether listed or not.
     pub event_types: Vec<String>,
     /// Optional daily quiet period.
     pub quiet_hours: Option<QuietHours>,
@@ -628,7 +633,11 @@ impl Default for NotifyConfig {
             debounce: HumanDuration::from_secs(5 * 60),
             batch_threshold: 10,
             batch_window: HumanDuration::from_secs(60),
-            event_types: vec!["new_device".into(), "returned".into()],
+            event_types: vec![
+                "new_device".into(),
+                "returned".into(),
+                "went_offline".into(),
+            ],
             quiet_hours: None,
             ntfy: None,
         }
@@ -1976,6 +1985,17 @@ mod tests {
         assert_eq!(
             c.offline_timeout_for(Some("weird")),
             Duration::from_secs(9999)
+        );
+    }
+
+    #[test]
+    fn the_default_allowlist_is_a_new_device_and_a_chosen_device_coming_and_going() {
+        // ip_changed and name_updated are not here because they never deliver;
+        // returned and went_offline are both here because they deliver only for a
+        // device whose notify a person turned on, and that person asked for both.
+        assert_eq!(
+            NotifyConfig::default().event_types,
+            vec!["new_device", "returned", "went_offline"]
         );
     }
 

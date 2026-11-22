@@ -91,7 +91,11 @@ Practical consequences, so they are not mistaken for oversights:
   operator and debugging surface, not the dashboard; hiding is a display
   concern the plugin's gather applies.
 - There is no daemon-side way to set `display_name`, `notes`, `hidden` or
-  `notify`. The daemon reads them and never writes them.
+  `notify`. The daemon reads them and never writes them. `notify` starts
+  `FALSE`: a device comes and goes without an alert until a person turns it on,
+  and a new device is announced whatever it says. Schema V6 set it `FALSE` on
+  every existing row once, because under V1's `DEFAULT TRUE` none of those was a
+  choice anybody made.
 - A daemon-only deployment is a deliberately reduced thing: capture, state,
   events and notifications, with a bare CLI over the top.
 

@@ -7,8 +7,11 @@
 //!
 //! The dispatcher applies, in order:
 //!
-//! 1. The master switch, the per-device `notify` toggle, and learning-window
-//!    suppression (via [`DeviceEvent::deliverable`]).
+//! 1. The master switch, then the per-event rule in
+//!    [`DeviceEvent::deliverable`]: a learning window suppresses everything but
+//!    security events; after it, `new_device` always delivers, `returned` and
+//!    `went_offline` only for a device whose `notify` a person turned on, and
+//!    `ip_changed`, `name_updated` and `device_location_changed` never.
 //! 2. The configured event-type allowlist.
 //! 3. Quiet hours.
 //! 4. Per-device debounce, kept apart for person events (see below).
@@ -271,7 +274,8 @@ impl Delivery {
 pub struct SuppressionCounts {
     /// Notifications are switched off entirely.
     pub disabled: usize,
-    /// The device's `notify` flag is off, or a learning window was in progress.
+    /// The per-event rule said no: a learning window, a device nobody turned
+    /// `notify` on for, or a type that is never delivered.
     pub not_deliverable: usize,
     /// The event type is not in the configured allowlist.
     pub wrong_type: usize,
@@ -724,7 +728,8 @@ mod tests {
     #[test]
     fn events_outside_the_configured_types_are_dropped() {
         let mut d = Dispatcher::new(config(), security(), utc());
-        let _ = d.offer(event(1, &mac_of(1), EventType::IpChanged), base());
+        // Deliverable (notify is on) but not in this allowlist.
+        let _ = d.offer(event(1, &mac_of(1), EventType::WentOffline), base());
         assert_eq!(d.suppressed().wrong_type, 1);
         assert_eq!(d.pending(), 0);
     }
@@ -742,10 +747,62 @@ mod tests {
     #[test]
     fn a_device_with_notifications_turned_off_is_silent() {
         let mut d = Dispatcher::new(config(), security(), utc());
-        let mut e = event(1, &mac_of(1), EventType::NewDevice);
+        let mut e = event(1, &mac_of(1), EventType::Returned);
         e.event.notify = false;
         let _ = d.offer(e, base());
         assert_eq!(d.suppressed().not_deliverable, 1);
+    }
+
+    #[test]
+    fn a_new_device_is_delivered_even_when_its_notify_is_off() {
+        let mut d = Dispatcher::new(config(), security(), utc());
+        let mut e = event(1, &mac_of(1), EventType::NewDevice);
+        e.event.notify = false;
+        let _ = d.offer(e, base());
+        assert_eq!(d.suppressed().not_deliverable, 0);
+        assert_eq!(d.tick(at(60)).len(), 1);
+    }
+
+    #[test]
+    fn an_informational_event_is_never_delivered_even_when_listed() {
+        let mut d = Dispatcher::new(
+            NotifyConfig {
+                event_types: [
+                    "ip_changed",
+                    "name_updated",
+                    "device_location_changed",
+                    "went_offline",
+                ]
+                .map(String::from)
+                .to_vec(),
+                ..config()
+            },
+            security(),
+            utc(),
+        );
+        for (n, kind) in [
+            EventType::IpChanged,
+            EventType::NameUpdated,
+            EventType::DeviceLocationChanged,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = i64::try_from(n).expect("small");
+            let mac = mac_of(u8::try_from(n).expect("small"));
+            let _ = d.offer(event(id, &mac, kind), base());
+        }
+        assert_eq!(d.suppressed().not_deliverable, 3);
+        assert!(d.drain().is_empty());
+    }
+
+    #[test]
+    fn the_default_allowlist_carries_a_chosen_device_coming_and_going() {
+        let mut d = Dispatcher::new(NotifyConfig::default(), security(), utc());
+        let _ = d.offer(event(1, &mac_of(1), EventType::WentOffline), base());
+        let _ = d.offer(event(2, &mac_of(2), EventType::Returned), base());
+        assert_eq!(d.suppressed(), SuppressionCounts::default());
+        assert_eq!(d.drain().len(), 2);
     }
 
     #[test]

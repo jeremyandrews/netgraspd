@@ -1012,3 +1012,76 @@ async fn ng_people_carries_epoch_twins_of_its_arrival_and_departure_times() {
         "{message}"
     );
 }
+
+/// The name refinery records the migration that turned `notify` off under. Looked
+/// up by name rather than version, so the test survives a renumbering.
+const NOTIFY_OFF_MIGRATION: &str = "device_notify_off_by_default";
+
+#[tokio::test]
+async fn a_new_device_row_starts_with_notify_off() {
+    let Some(db) = common::test_db().await else {
+        return;
+    };
+    // The daemon's insert names no notify column, so the column default is
+    // what a newly discovered device gets.
+    db.seed_device("3c:22:fb:00:00:05", "online").await;
+    assert_eq!(
+        db.scalar("SELECT COUNT(*) FROM ng_devices WHERE notify")
+            .await,
+        0,
+        "nobody has chosen to hear about this device yet"
+    );
+}
+
+#[tokio::test]
+async fn the_upgrade_turns_notify_off_on_every_existing_device() {
+    let Some(db) = common::test_db().await else {
+        return;
+    };
+    // A database as the previous release left it: the column defaults to on,
+    // and every device has it on.
+    db.execute("ALTER TABLE ng_devices ALTER COLUMN notify SET DEFAULT TRUE")
+        .await;
+    db.execute(&format!(
+        "DELETE FROM refinery_schema_history WHERE name = '{NOTIFY_OFF_MIGRATION}'"
+    ))
+    .await;
+    db.seed_device("3c:22:fb:00:00:06", "online").await;
+    db.seed_device("3c:22:fb:00:00:07", "offline").await;
+    assert_eq!(
+        db.scalar("SELECT COUNT(*) FROM ng_devices WHERE notify")
+            .await,
+        2
+    );
+
+    Db::migrate(&common::test_url())
+        .await
+        .expect("the upgrade applies");
+
+    assert_eq!(
+        db.scalar(&format!(
+            "SELECT COUNT(*) FROM refinery_schema_history WHERE name = '{NOTIFY_OFF_MIGRATION}'"
+        ))
+        .await,
+        1,
+        "the migration ran"
+    );
+    assert_eq!(
+        db.scalar("SELECT COUNT(*) FROM ng_devices WHERE notify")
+            .await,
+        0,
+        "every existing device comes and goes in silence until somebody chooses it"
+    );
+    db.seed_device("3c:22:fb:00:00:08", "online").await;
+    assert_eq!(
+        db.scalar("SELECT COUNT(*) FROM ng_devices WHERE notify")
+            .await,
+        0,
+        "and so does every device found after it"
+    );
+    // The column is still what the plugin's fixture declares.
+    let client = db.client().await;
+    schema::preflight(&client)
+        .await
+        .expect("the contract still holds");
+}

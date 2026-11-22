@@ -180,6 +180,12 @@ Alerts page and its Send test) and none of version 5's yet; it names the columns
 it reads, so it runs on version 5 unchanged, and a plugin built for version 3
 keeps working too. Migrate the daemon to 1.1.0 first, then upgrade the plugin.
 
+Version 6 (unreleased) adds no table and no column: it changes
+`ng_devices.notify` to `DEFAULT FALSE` and sets it `FALSE` on every existing
+device. Every column keeps its name, type and nullability, so plugin 1.1.0 runs
+on it unchanged. The plugin's test fixture, `daemon_schema.sql`, still declares
+`DEFAULT TRUE`; bringing it up to date is a follow up on the plugin side.
+
 **The rule.** A daemon and a plugin pair when they are built for the same `ng_`
 schema version, which is the highest migration under `migrations/` here.
 This repository owns that schema and its migrations are the canonical DDL; the
@@ -400,7 +406,7 @@ the columns above, and it never writes.
 **What `hidden` does, exactly:** it hides the device from the Trovato listings
 and nothing else. A hidden device is still captured, still recorded, still
 produces presence sessions, and still notifies. `notify` is the flag that
-silences alerts. The two are separate on purpose: a checkbox labelled "hide"
+decides whether you hear it come and go, and it starts off. The two are separate on purpose: a checkbox labelled "hide"
 that also stopped alerts would be a blind spot in a security tool created by
 somebody tidying up a dashboard.
 
@@ -991,13 +997,28 @@ but "passive" should mean passive unless you said otherwise.
 
 ## Notifications
 
+What reaches your phone, once the learning window is over:
+
+| Event | Delivered |
+|---|---|
+| `new_device` | always, whatever the device's `notify` says: nobody has chosen anything about a device that has only just appeared |
+| `returned`, `went_offline` | only for a device whose `notify` a person turned on in Trovato; it starts off |
+| `person_arrived`, `person_departed` | when the person's `notify_arrive` or `notify_depart` is on; they start off |
+| security events | always, under `[security.notifications]` (below) |
+| `ip_changed`, `name_updated`, `device_location_changed`, `person_location_changed` | never |
+
+Everything is recorded in `ng_events` either way. `notify.event_types` is a
+filter on top of this, never a way round it: listing `ip_changed` there does not
+make it deliver, and the default, `["new_device", "returned", "went_offline"]`,
+lets a device you chose be heard both coming and going.
+
 All rate limiting lives in the dispatcher, not in any notifier:
 
 - per-device debounce, five minutes by default;
 - batching, so ten or more devices appearing inside a minute collapse into one
   summary rather than a storm (this is what makes a router reboot one message);
 - quiet hours, evaluated in local time;
-- a per-device `notify` toggle you set from Trovato.
+- a per-device `notify` toggle you set from Trovato, off until you turn it on.
 
 The batch window costs up to `notify.batch_window` of latency on every
 notification. Set `notify.batch_threshold = 0` to turn batching off if you would
