@@ -454,6 +454,18 @@ impl Default for CaptureConfig {
     }
 }
 
+/// How many typical silences a regular announcer may miss before it counts as
+/// offline: `state.offline_gap_multiple`'s default.
+///
+/// Two. A device whose silences between announcements are regular (see
+/// `device::Manager::sweep`) is offline after the larger of its type's offline
+/// timeout and twice its typical silence. Once is not enough: the next
+/// announcement lands at one typical silence give or take its jitter, and on
+/// the home LAN of issue #26 the jitter was up to a quarter of the interval.
+/// Twice lets one announcement be late by a whole interval, or be lost, and
+/// still marks a device that has left offline one interval after it was due.
+pub const OFFLINE_GAP_MULTIPLE_DEFAULT: u32 = 2;
+
 /// State machine timings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -467,6 +479,14 @@ pub struct StateConfig {
     pub flush_interval: HumanDuration,
     /// How often the sweep looks for devices that have timed out.
     pub sweep_interval: HumanDuration,
+    /// How many of its own typical silences a regular announcer may stay
+    /// quiet before it is offline, when that is longer than its offline
+    /// timeout. `0` turns the adaptation off. See
+    /// [`OFFLINE_GAP_MULTIPLE_DEFAULT`].
+    pub offline_gap_multiple: u32,
+    /// The most an adapted offline limit may reach, whatever the device's
+    /// cadence. Never shortens a device type's own offline timeout.
+    pub adaptive_offline_max: HumanDuration,
     /// How often the user-owned columns are read back from Postgres, which is
     /// what makes a change made in Trovato reach a running daemon.
     pub reconcile_interval: HumanDuration,
@@ -496,6 +516,8 @@ impl Default for StateConfig {
             offline_timeout: HumanDuration::from_secs(180 * 60),
             flush_interval: HumanDuration::from_secs(60),
             sweep_interval: HumanDuration::from_secs(30),
+            offline_gap_multiple: OFFLINE_GAP_MULTIPLE_DEFAULT,
+            adaptive_offline_max: HumanDuration::from_secs(24 * 3600),
             // Ten seconds, because this is the latency of "I muted that device"
             // and anything slower feels broken to somebody watching the page
             // they just saved. The read costs well under a millisecond of server

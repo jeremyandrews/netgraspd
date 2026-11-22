@@ -15,7 +15,7 @@
 
 pub mod persist;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
@@ -337,6 +337,19 @@ const MAX_HELD_ADDRESSES: usize = 8;
 /// own announcements again afterwards.
 const SPOKE_FOR_OTHERS_MEMORY: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
+/// How many of a device's recent long silences the offline adaptation keeps.
+const ADAPTIVE_GAP_SAMPLES: usize = 8;
+
+/// How many long silences a device must have shown before its offline limit
+/// adapts to them. Until then the fixed timeout applies, so a regular announcer
+/// newly seen (or seen since a restart: the silences are kept in memory only)
+/// goes offline and comes back at most this many times while it is learned.
+pub(crate) const ADAPTIVE_MIN_GAPS: usize = 3;
+
+/// Device types that come and go with a person. Their long silences are
+/// absences, however regular, and their offline limit never adapts.
+const CARRIED_TYPES: [&str; 3] = ["phone", "tablet", "wearable"];
+
 /// One device's in-memory state.
 #[derive(Debug, Clone)]
 struct Entry {
@@ -354,9 +367,16 @@ struct Entry {
     /// the scorer breaks ties in.
     signals: Vec<Signal>,
     identity: Identity,
-    /// An equal-rank candidate waiting out the settle window, and when it first
-    /// won. See `rescore`.
-    pending_identity: Option<(Identity, Timestamp)>,
+    /// When the name in `identity` was last announced, or adopted. An
+    /// equal-rank rival replaces it only once this is [`identity::NAME_HOLD`]
+    /// old. See `rescore`.
+    shown_confirmed_at: Timestamp,
+    /// The device's most recent long silences, in seconds, oldest first: every
+    /// gap between two of its frames at least as long as its offline timeout
+    /// divided by `state.offline_gap_multiple`, whether or not it went offline
+    /// in between. Shorter gaps could never lengthen its offline limit. Kept in
+    /// memory only. See [`Entry::offline_after`].
+    silences: VecDeque<u64>,
     classification: Classification,
     display_name: Option<String>,
     current_ap: Option<String>,
@@ -441,6 +461,68 @@ impl Entry {
         self.offline_transitions == 0
             && self.state != DeviceState::Offline
             && (now - self.first_seen_at).as_hours() >= ALWAYS_ON_HOURS
+    }
+
+    /// The silence after which this device is offline.
+    ///
+    /// The device type's offline timeout, or, for a device that announces on a
+    /// regular cadence longer than that, `state.offline_gap_multiple` times its
+    /// typical silence, capped at `state.adaptive_offline_max`; whichever is
+    /// larger. Issue #26: seven access points and an IoT module speaking every
+    /// three to four hours against a three hour timeout went offline and came
+    /// back on every cycle.
+    ///
+    /// Regular means: at least [`ADAPTIVE_MIN_GAPS`] long silences recorded,
+    /// and among the last [`ADAPTIVE_GAP_SAMPLES`] the upper quartile is no
+    /// more than one and a half times the lower quartile. The upper quartile is
+    /// the typical silence, so jitter in the announcer's own timing is inside
+    /// it. Irregular long silences are what a device that leaves and comes
+    /// back looks like, and keep the fixed timeout; so does a device on a
+    /// locally administered (private) address or of a type a person carries,
+    /// whose silences are absences however regular they are.
+    fn offline_after(&self, config: &StateConfig) -> Duration {
+        let device_type = self.classification.device_type.as_deref();
+        let base = config.offline_timeout_for(device_type);
+        let multiple = u64::from(config.offline_gap_multiple);
+        if multiple == 0
+            || self.mac.is_locally_administered()
+            || device_type.is_some_and(|t| CARRIED_TYPES.contains(&t))
+            || self.silences.len() < ADAPTIVE_MIN_GAPS
+        {
+            return base;
+        }
+        let mut sorted: Vec<u64> = self.silences.iter().copied().collect();
+        sorted.sort_unstable();
+        let n = sorted.len();
+        let lower = sorted[n / 4];
+        let upper = sorted[n - 1 - n / 4];
+        if upper.saturating_mul(2) > lower.saturating_mul(3) {
+            return base;
+        }
+        let adapted = Duration::from_secs(upper.saturating_mul(multiple))
+            .min(config.adaptive_offline_max.get());
+        base.max(adapted)
+    }
+
+    /// Records the silence that a frame at `at` ends, when it is long enough
+    /// to matter to [`Entry::offline_after`].
+    fn note_silence(&mut self, at: Timestamp, config: &StateConfig) {
+        let multiple = config.offline_gap_multiple;
+        if multiple == 0 {
+            return;
+        }
+        let Ok(gap) = Duration::try_from(at - self.last_seen_at) else {
+            return;
+        };
+        let floor =
+            config.offline_timeout_for(self.classification.device_type.as_deref()) / multiple;
+        if gap.is_zero() || gap < floor {
+            return;
+        }
+        if self.silences.len() >= ADAPTIVE_GAP_SAMPLES {
+            self.silences.pop_front();
+        }
+        self.silences.push_back(gap.as_secs());
     }
 
     /// Recomputes the device type and OS family, returning the previous
@@ -547,7 +629,14 @@ impl Entry {
     /// would silently reverse the batch.
     ///
     /// Returns true when any of them was new evidence rather than a repeat.
-    fn record_signals(&mut self, incoming: &[Signal]) -> bool {
+    fn record_signals(&mut self, incoming: &[Signal], at: Timestamp) -> bool {
+        if incoming
+            .iter()
+            .any(|s| s.kind == self.identity.source && s.value.trim() == self.identity.display_name)
+            && at > self.shown_confirmed_at
+        {
+            self.shown_confirmed_at = at;
+        }
         let mut any_new = false;
         let mut batch: Vec<Signal> = Vec::with_capacity(incoming.len());
         for signal in incoming {
@@ -579,45 +668,31 @@ impl Entry {
     /// actually changed.
     ///
     /// A candidate that wins on rank is adopted at once. A candidate of *equal*
-    /// rank is held pending until it has been the winner continuously for
-    /// [`identity::SETTLE_WINDOW`], because two equal-rank mDNS names take turns
-    /// winning the scorer's same-kind tie-break as consecutive frames reorder
-    /// the signal list. Adopting each turn is what produced 385 `name_updated`
-    /// events in thirty minutes; a rival that alternates never settles, and a
-    /// device somebody genuinely renamed settles once and emits one event.
+    /// rank replaces the shown name only once the shown name has gone
+    /// unannounced for [`identity::NAME_HOLD`]. Two equal-rank names of one
+    /// device take turns winning the scorer's same-kind tie-break as frames
+    /// reorder the signal list, and adopting each turn is what produced 385
+    /// `name_updated` events in thirty minutes (2026-09-17) and, under the five
+    /// minute settle window that followed, 618 in a day when the turns were ten
+    /// minutes apart (issue #27). Keeping the name shown while the device still
+    /// uses it ends both; a device somebody genuinely renamed stops announcing
+    /// the old name, and gets the new one with one event.
     fn rescore(&mut self, now: Timestamp) -> Option<Identity> {
         let candidate = identity::resolve(&identity::IdentityInput {
             mac: self.mac,
             signals: &self.signals,
             device_type: self.classification.device_type.as_deref(),
         });
-        match identity::compare(&candidate, &self.identity) {
-            identity::Verdict::Worse | identity::Verdict::Same => {
-                self.pending_identity = None;
-                None
-            }
-            identity::Verdict::Better => {
-                self.pending_identity = None;
-                Some(std::mem::replace(&mut self.identity, candidate))
-            }
-            identity::Verdict::Rival => {
-                // Only an unbroken run counts. A different rival, or the
-                // incumbent winning back even once, starts the clock again.
-                let since = match &self.pending_identity {
-                    Some((pending, since)) if pending.display_name == candidate.display_name => {
-                        *since
-                    }
-                    _ => now,
-                };
-                if identity::settled(since, now) {
-                    self.pending_identity = None;
-                    Some(std::mem::replace(&mut self.identity, candidate))
-                } else {
-                    self.pending_identity = Some((candidate, since));
-                    None
-                }
-            }
+        let adopt = match identity::compare(&candidate, &self.identity) {
+            identity::Verdict::Worse | identity::Verdict::Same => false,
+            identity::Verdict::Better => true,
+            identity::Verdict::Rival => identity::lapsed(self.shown_confirmed_at, now),
+        };
+        if !adopt {
+            return None;
         }
+        self.shown_confirmed_at = now;
+        Some(std::mem::replace(&mut self.identity, candidate))
     }
 }
 
@@ -1002,7 +1077,11 @@ impl Manager {
                     last_interface: record.last_interface,
                     signals: stored,
                     identity,
-                    pending_identity: None,
+                    // The name shown at the restart is taken as announced
+                    // when the device was last heard, so it holds for
+                    // NAME_HOLD after that like any other.
+                    shown_confirmed_at: record.last_seen_at,
+                    silences: VecDeque::new(),
                     classification,
                     display_name: record.display_name,
                     current_ap: record.current_ap.filter(|_| placed),
@@ -1186,6 +1265,7 @@ impl Manager {
         // Clock skew between capture sources, or a replayed capture, must not
         // drag last_seen_at backwards.
         if at > entry.last_seen_at {
+            entry.note_silence(at, &config);
             entry.last_seen_at = at;
         }
         entry.observations_since_flush += 1;
@@ -1290,7 +1370,7 @@ impl Manager {
             .cloned()
             .collect();
         usable.extend(attributed.mine.iter().cloned());
-        entry.record_signals(&usable);
+        entry.record_signals(&usable, at);
         for signal in usable {
             effects.push(Effect::Signal {
                 mac: entry.mac,
@@ -1374,7 +1454,8 @@ impl Manager {
             last_interface: Some(obs.interface.clone()),
             signals,
             identity,
-            pending_identity: None,
+            shown_confirmed_at: at,
+            silences: VecDeque::new(),
             classification: Classification::default(),
             display_name: None,
             current_ap: None,
@@ -1445,7 +1526,7 @@ impl Manager {
         let Some(entry) = self.devices.get_mut(&mac) else {
             return Vec::new();
         };
-        let is_new = entry.record_signals(std::slice::from_ref(signal));
+        let is_new = entry.record_signals(std::slice::from_ref(signal), at);
         entry.dirty = true;
         let mut effects = vec![Effect::Signal {
             mac,
@@ -1666,7 +1747,7 @@ impl Manager {
             }
             let silence = Duration::try_from(now - entry.last_seen_at).unwrap_or(Duration::ZERO);
             let device_type = entry.classification.device_type.as_deref();
-            let offline_after = self.config.offline_timeout_for(device_type);
+            let offline_after = entry.offline_after(&self.config);
             let idle_after = self.config.idle_timeout_for(device_type);
 
             // Offline is checked first so that a sweep delayed past both
@@ -1707,6 +1788,7 @@ impl Manager {
                     details: json!({
                         "last_seen_at": entry.last_seen_at,
                         "silent_for_secs": silence.as_secs(),
+                        "offline_after_secs": offline_after.as_secs(),
                     }),
                 })));
             } else if silence >= idle_after && entry.state == DeviceState::Online {
@@ -1790,7 +1872,7 @@ fn is_recordable(ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{HumanDuration, StateConfig};
+    use crate::config::{HumanDuration, OFFLINE_GAP_MULTIPLE_DEFAULT, StateConfig};
     use crate::types::{NameClaim, ObservationKind};
     use jiff::SignedDuration;
 
@@ -2316,9 +2398,10 @@ mod tests {
     }
 
     #[test]
-    fn a_name_that_stays_won_for_the_settle_window_is_adopted_once() {
+    fn a_name_that_replaces_one_no_longer_announced_is_adopted_once() {
         // The other side of the same rule: a device somebody genuinely renamed
-        // must still get its new name, and exactly one event for it.
+        // must still get its new name, and exactly one event for it, once the
+        // old name has gone unannounced for the hold.
         let mut m = Manager::new(config(), false);
         let _ = m.observe(&claiming(
             "3c:22:fb:00:00:01",
@@ -2327,26 +2410,30 @@ mod tests {
             vec![named("Old Name", "192.168.1.40")],
         ));
 
+        let hold = i64::try_from(identity::NAME_HOLD.as_secs()).expect("small");
         let mut renames = 0;
-        for round in 1..40i64 {
+        for round in 1..(hold / 30 + 40) {
             let effects = m.observe(&claiming(
                 "3c:22:fb:00:00:01",
                 Some("192.168.1.40"),
                 at(round * 30),
                 vec![named("New Name", "192.168.1.40")],
             ));
+            if round * 30 < hold {
+                assert_eq!(display_of(&m, "3c:22:fb:00:00:01"), "Old Name");
+            }
             renames += events(&effects)
                 .iter()
                 .filter(|e| **e == EventType::NameUpdated)
                 .count();
         }
-        assert_eq!(renames, 1, "adopted once, when the window elapsed");
+        assert_eq!(renames, 1, "adopted once, when the hold elapsed");
         assert_eq!(display_of(&m, "3c:22:fb:00:00:01"), "New Name");
     }
 
     #[test]
     fn a_higher_ranked_name_is_adopted_without_waiting() {
-        // The settle window is for equal-rank rivals only. mDNS arriving on a
+        // The name hold is for equal-rank rivals only. mDNS arriving on a
         // device known by its vendor is a promotion and happens at once.
         let mut m = Manager::new(config(), false);
         let _ = m.observe(&obs_at("3c:22:fb:00:00:01", Some("192.168.1.40"), base()));
@@ -2466,12 +2553,14 @@ mod tests {
 
     #[test]
     fn rapid_flapping_produces_one_event_per_real_transition() {
+        // Absences of different lengths, so the offline limit does not adapt
+        // to them as it would to a regular cadence.
         let mut m = Manager::new(config(), false);
         let mut seen = Vec::new();
         let mut t = 0i64;
         let _ = m.observe(&obs_at("3c:22:fb:00:00:01", None, at(t)));
-        for _ in 0..5 {
-            t += 20_000;
+        for away in [20_000, 40_000, 25_000, 60_000, 30_000] {
+            t += away;
             seen.extend(events(&m.sweep(at(t))));
             t += 1;
             seen.extend(events(&m.observe(&obs_at(
@@ -3198,5 +3287,192 @@ mod tests {
         });
         let e = event(&effects, EventType::PersonDeparted);
         assert!(e.details.get("device_name").is_none(), "{}", e.details);
+    }
+
+    // ---- Issue 26: presence that follows a device's own cadence ----------
+
+    /// A burned-in address in the range IEEE reserves for documentation.
+    const ANNOUNCER: &str = "00:00:5e:00:53:01";
+    const ANNOUNCER_IP: &str = "192.0.2.10";
+
+    /// Drives one device that speaks only at `speaks_at` (seconds from
+    /// `base`), sweeping every minute up to `until`, and returns every event
+    /// with the second it happened at.
+    fn presence_run(who: &str, speaks_at: &[i64], until: i64) -> Vec<(i64, EventType)> {
+        let mut m = Manager::new(config(), false);
+        let mut out = Vec::new();
+        let mut next = speaks_at.iter().copied().peekable();
+        let mut t = 0;
+        while t <= until {
+            while let Some(&s) = next.peek()
+                && s <= t
+            {
+                next.next();
+                out.extend(
+                    events(&m.observe(&obs_at(who, Some(ANNOUNCER_IP), at(s))))
+                        .into_iter()
+                        .map(|e| (s, e)),
+                );
+            }
+            out.extend(events(&m.sweep(at(t))).into_iter().map(|e| (t, e)));
+            t += 60;
+        }
+        out
+    }
+
+    fn offline_count(run: &[(i64, EventType)], from: i64, to: i64) -> usize {
+        run.iter()
+            .filter(|(t, e)| *e == EventType::WentOffline && (from..to).contains(t))
+            .count()
+    }
+
+    #[test]
+    fn a_device_announcing_every_four_hours_stays_online_once_its_cadence_is_known() {
+        // Issue 26: a device that speaks every four hours against a three hour
+        // offline timeout went offline and came back on every cycle. Its first
+        // cycles are how its cadence is learned; the day after that is quiet.
+        const FOUR_HOURS: i64 = 4 * 3600;
+        let warm_up = FOUR_HOURS * i64::try_from(ADAPTIVE_MIN_GAPS).expect("small");
+        let day = 24 * 3600;
+        let speaks: Vec<i64> = (0..=(warm_up + day) / FOUR_HOURS)
+            .map(|n| n * FOUR_HOURS)
+            .collect();
+        let run = presence_run(ANNOUNCER, &speaks, warm_up + day);
+        assert!(
+            offline_count(&run, 0, warm_up) <= ADAPTIVE_MIN_GAPS,
+            "learning costs at most one flap per gap it needs: {run:?}"
+        );
+        assert_eq!(
+            offline_count(&run, warm_up, warm_up + day + 1),
+            0,
+            "a day of four hourly announcements, no went_offline: {run:?}"
+        );
+    }
+
+    #[test]
+    fn a_regular_announcer_silent_past_its_adapted_limit_goes_offline() {
+        // The other side: the adapted limit is a limit. A device with a four
+        // hour cadence that stops speaking goes offline at twice its cadence,
+        // not before and not much after.
+        const FOUR_HOURS: i64 = 4 * 3600;
+        let cycles = 6;
+        let speaks: Vec<i64> = (0..=cycles).map(|n| n * FOUR_HOURS).collect();
+        let last = cycles * FOUR_HOURS;
+        let run = presence_run(ANNOUNCER, &speaks, last + 2 * 24 * 3600);
+        let after_last: Vec<i64> = run
+            .iter()
+            .filter(|(t, e)| *e == EventType::WentOffline && *t > last)
+            .map(|(t, _)| *t)
+            .collect();
+        assert_eq!(after_last.len(), 1, "{run:?}");
+        let silent = after_last[0] - last;
+        let limit = i64::from(OFFLINE_GAP_MULTIPLE_DEFAULT) * FOUR_HOURS;
+        assert!(
+            (limit..limit + 120).contains(&silent),
+            "offline after {silent}s of silence, limit {limit}s"
+        );
+    }
+
+    #[test]
+    fn a_device_with_irregular_silences_keeps_the_fixed_timeout() {
+        // A phone that leaves for different lengths of time is not a periodic
+        // announcer: its long silences are absences, and it must keep going
+        // offline after the ordinary timeout.
+        let gaps = [5 * 3600, 11 * 3600, 4 * 3600, 9 * 3600, 14 * 3600, 6 * 3600];
+        let mut speaks = vec![0];
+        for gap in gaps {
+            speaks.push(speaks.last().copied().unwrap_or_default() + gap);
+        }
+        let end = speaks.last().copied().unwrap_or_default();
+        let run = presence_run(ANNOUNCER, &speaks, end + 4 * 3600);
+        assert_eq!(
+            offline_count(&run, 0, end + 4 * 3600),
+            gaps.len() + 1,
+            "{run:?}"
+        );
+        let last_offline = run
+            .iter()
+            .rev()
+            .find(|(_, e)| *e == EventType::WentOffline)
+            .map(|(t, _)| *t)
+            .unwrap_or_default();
+        assert!((end + 10_800..end + 10_800 + 120).contains(&last_offline));
+    }
+
+    #[test]
+    fn a_device_on_a_private_address_keeps_the_fixed_timeout() {
+        // A locally administered MAC is a phone, tablet or laptop hiding its
+        // hardware address: something that leaves with a person. However
+        // regular its silences, it is not given a longer leash.
+        const FOUR_HOURS: i64 = 4 * 3600;
+        let speaks: Vec<i64> = (0..=12).map(|n| n * FOUR_HOURS).collect();
+        let run = presence_run("02:00:5e:00:53:01", &speaks, 12 * FOUR_HOURS);
+        assert_eq!(offline_count(&run, 0, 12 * FOUR_HOURS + 1), 12, "{run:?}");
+    }
+
+    // ---- Issue 27: the shown name holds while it is still announced ------
+
+    const RECEIVER: &str = "00:00:5e:00:53:02";
+    const RECEIVER_IP: &str = "192.0.2.20";
+
+    /// Every minute an unnamed frame, and on the given minutes a name, as a
+    /// device on a LAN actually sounds. Returns the `name_updated` count.
+    fn naming_run(
+        m: &mut Manager,
+        from_min: i64,
+        to_min: i64,
+        name_at: impl Fn(i64) -> Option<&'static str>,
+    ) -> usize {
+        let mut renames = 0;
+        for minute in from_min..to_min {
+            let when = at(minute * 60);
+            let effects = match name_at(minute) {
+                Some(name) => m.observe(&claiming(
+                    RECEIVER,
+                    Some(RECEIVER_IP),
+                    when,
+                    vec![named(name, RECEIVER_IP)],
+                )),
+                None => m.observe(&obs_at(RECEIVER, Some(RECEIVER_IP), when)),
+            };
+            renames += events(&effects)
+                .iter()
+                .filter(|e| **e == EventType::NameUpdated)
+                .count();
+        }
+        renames
+    }
+
+    #[test]
+    fn two_own_names_announced_in_turn_ten_minutes_apart_keep_one_display_name() {
+        // Issue 27: a receiver announces its service instance name and its zone
+        // name in turn, ten minutes apart, with ordinary traffic in between.
+        // Each name used to win the five minute settle window in turn.
+        let mut m = Manager::new(config(), false);
+        let renames = naming_run(&mut m, 0, 24 * 60, |minute| match minute % 20 {
+            0 => Some("Name A"),
+            10 => Some("Name B"),
+            _ => None,
+        });
+        assert!(renames <= 1, "{renames} name_updated in a day");
+        assert_eq!(display_of(&m, RECEIVER), "Name A", "the first name holds");
+    }
+
+    #[test]
+    fn a_shown_name_that_stops_being_announced_is_replaced_exactly_once() {
+        // A genuine rename after a spell of alternating: once the shown name is
+        // no longer announced, the other one takes over, with one event.
+        let mut m = Manager::new(config(), false);
+        let mut renames = naming_run(&mut m, 0, 6 * 60, |minute| match minute % 20 {
+            0 => Some("Name A"),
+            10 => Some("Name B"),
+            _ => None,
+        });
+        assert_eq!(display_of(&m, RECEIVER), "Name A");
+        renames += naming_run(&mut m, 6 * 60, 24 * 60, |minute| {
+            (minute % 20 == 10).then_some("Name B")
+        });
+        assert_eq!(renames, 1, "exactly one name_updated for the rename");
+        assert_eq!(display_of(&m, RECEIVER), "Name B");
     }
 }

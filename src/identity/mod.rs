@@ -18,7 +18,7 @@ pub use classify::{Classification, ClassifyInput, classify};
 pub use fingerprint::FingerprintDb;
 pub use rdns::ReverseResolver;
 pub use scorer::{
-    Identity, IdentityInput, SETTLE_WINDOW, Verdict, compare, improves_on, resolve, settled,
+    Identity, IdentityInput, NAME_HOLD, Verdict, compare, improves_on, lapsed, resolve,
 };
 
 use crate::types::{MacAddr, Signal, SignalKind};
