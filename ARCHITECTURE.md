@@ -265,9 +265,14 @@ rule rather than its ranking. `improves_on` treated any equal-confidence change
 of text as an improvement, and because each frame's signals are re-inserted at
 the front of the list, two equal-weight mDNS names take turns winning the
 same-kind tie-break. 385 `name_updated` events in thirty minutes. Rank still
-promotes immediately; an equal-rank rival must now hold the win for five minutes
-before it is adopted, and loses the accumulated time the moment it stops winning.
-Alternating candidates never settle, a genuine rename settles once.
+promotes immediately. An equal-rank rival was first made to hold the win for
+five minutes; on a later field run (issue #27) devices that announce two of
+their own names ten minutes apart still flipped, 618 events in a day, because
+each name won for five minutes in turn. The rule now asks about the incumbent:
+the name shown stays while the device still announces it, and an equal-rank
+rival replaces it only after the shown name has gone unannounced for
+`identity::NAME_HOLD` (two hours). A genuine rename stops the old name, so it
+lands once.
 
 ### Classifying signals, added in milestone 2
 
@@ -688,7 +693,9 @@ Edge crossings supply evidence rather than changing the rule. The subtlety that
 cost a rewrite: **an arrival and a departure measure the evidence window against
 different things.** An arrival is decided the moment a device is heard from, so
 the crossing is minutes old. A departure is decided a whole `offline_timeout`
-after the device fell silent, three hours by default, which puts every crossing
+after the device fell silent, three hours by default (longer for a device with a
+regular announcement cadence, see `state.offline_gap_multiple`; never for a
+phone, tablet, wearable or private address), which puts every crossing
 outside a fifteen-minute window forever. So a departure measures the crossing
 against the *device's own last activity*: not "did they cross an edge recently"
 but "did they cross an edge shortly before they stopped talking".

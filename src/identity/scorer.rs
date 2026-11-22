@@ -122,7 +122,7 @@ pub enum Verdict {
     /// names of equal weight take turns winning the same-kind tie-break as
     /// consecutive frames reorder the signal list, and adopting each turn
     /// produced 385 `name_updated` events in thirty minutes on a real network.
-    /// See [`settled`].
+    /// See [`lapsed`].
     Rival,
     /// The candidate is worse and is ignored.
     Worse,
@@ -133,7 +133,7 @@ pub enum Verdict {
 /// Rank is the whole of the comparison, and rank alone can promote a name
 /// immediately: a device that was `Apple, Inc. device` and has just announced
 /// over mDNS should be renamed on the spot. An equal-rank rival is a different
-/// question, answered by [`settled`] rather than here.
+/// question, answered by [`lapsed`] rather than here.
 #[must_use]
 pub fn compare(candidate: &Identity, current: &Identity) -> Verdict {
     if candidate.confidence > current.confidence {
@@ -147,34 +147,44 @@ pub fn compare(candidate: &Identity, current: &Identity) -> Verdict {
     }
 }
 
-/// How long an equal-rank rival must stay the winner before it is adopted.
+/// How long the shown name must go unannounced before an equal-rank rival
+/// may replace it.
 ///
-/// Five minutes. The number is a compromise between the two ways of being
-/// wrong. Shorter, and a pair of alternating mDNS names still gets through:
-/// responders re-announce on the order of a minute, so a window under a couple
-/// of announcement intervals does not prove anything settled. Longer, and a
-/// person who genuinely renames their laptop waits too long to see it. Nothing
-/// is lost by waiting either way, because the name itself is already stored as a
-/// signal the moment it arrives; only the display identity and its event are
-/// held back.
+/// Two hours. A device announcing two of its own mDNS names (a receiver's
+/// service instance name and its zone name, a Raspberry Pi's several host and
+/// service names) offers both for as long as it is on the network, in an order
+/// that depends on who asked last. The five minute settle window this replaces
+/// asked whether the rival had *kept winning* for five minutes, and two names
+/// announced in turn ten minutes apart each did: on the home LAN of issue #27
+/// that was 618 `name_updated` events in one day, 71% of all events. The
+/// question is now whether the name already shown is *still being announced*.
+/// While it is, nothing equal in rank replaces it; once it has gone unheard for
+/// this long, the device has stopped using it and the current winner takes
+/// over, once.
+///
+/// Two hours is well beyond the 75 minute TTL RFC 6762 recommends for
+/// service records, so a name still in use has been re-announced or answered
+/// for several times over by then, and short enough that a person who renames
+/// a device sees the new name the same afternoon. Nothing is lost while
+/// waiting: the new name is stored as a signal the moment it arrives; only the
+/// display identity and its event wait.
 ///
 /// A rival that wins on *rank* is never delayed by this.
-pub const SETTLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+pub const NAME_HOLD: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
 
-/// Whether an equal-rank rival has been the winner for long enough to adopt.
-///
-/// `since` is when this same rival first won. A rival that loses even once
-/// resets it, so alternating candidates never settle and never produce an event.
+/// Whether the shown name, last announced at `confirmed`, has gone unheard
+/// for [`NAME_HOLD`] by `now`, so an equal-rank rival may replace it.
 #[must_use]
-pub fn settled(since: crate::clock::Timestamp, now: crate::clock::Timestamp) -> bool {
-    std::time::Duration::try_from(now.since(since)).is_ok_and(|elapsed| elapsed >= SETTLE_WINDOW)
+pub fn lapsed(confirmed: crate::clock::Timestamp, now: crate::clock::Timestamp) -> bool {
+    std::time::Duration::try_from(now.since(confirmed)).is_ok_and(|elapsed| elapsed >= NAME_HOLD)
 }
 
 /// True when `candidate` is a strictly better identity than `current`.
 ///
 /// Kept as the rank-only question, which is what callers outside the device
 /// manager mean when they ask. The manager itself uses [`compare`] and
-/// [`settled`], because it is the only caller that can hold a rival pending.
+/// [`lapsed`], because it is the only caller that knows when the shown name
+/// was last announced.
 #[must_use]
 pub fn improves_on(candidate: &Identity, current: &Identity) -> bool {
     matches!(

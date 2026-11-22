@@ -85,6 +85,32 @@ flush_interval = "60s"
 # How often timeouts are applied.
 sweep_interval = "30s"
 
+# Devices that announce on a fixed cadence longer than their offline timeout
+# (access points and IoT modules speaking every three or four hours, against
+# the three hour default) would otherwise go offline and come back on every
+# cycle. A device whose long silences are regular is offline only after the
+# larger of its offline timeout and offline_gap_multiple times its typical
+# silence, capped at adaptive_offline_max.
+#
+# - A long silence is a gap between two frames of at least the device's
+#   offline timeout divided by offline_gap_multiple (90 minutes by default);
+#   shorter ones could never lengthen the limit. The last eight are kept.
+# - Regular means at least three recorded, and the upper quartile of the last
+#   eight no more than 1.5 times the lower quartile. The upper quartile is the
+#   typical silence.
+# - Never adapted: a device on a locally administered (private) MAC, or of
+#   device_type phone, tablet or wearable. Their long silences are absences.
+# - Two typical silences lets one announcement be late by a whole interval, or
+#   be lost, and still marks a device that has left offline one interval after
+#   it was due: a device speaking every four hours is offline eight hours after
+#   it stops.
+# - The silences are kept in memory, so after a restart a regular announcer
+#   goes offline and comes back up to three times while it is learned again.
+#
+# 0 turns the adaptation off and every device uses its offline timeout alone.
+offline_gap_multiple = 2
+adaptive_offline_max = "24h"
+
 # How often the columns a person owns (display_name, notes, hidden, notify, and
 # which person owns the device) are read back from Postgres. This is the delay
 # between muting a device in Trovato and the daemon acting on it; the read costs

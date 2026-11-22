@@ -945,14 +945,19 @@ its unqualified records.
 A name that wins on **rank** is adopted immediately: mDNS arriving on a device
 known only by its vendor is a straight promotion.
 
-A name of **equal** rank is held for five minutes before it is adopted. Two mDNS
-names of the same weight take turns winning the scorer's same-kind tie-break as
-consecutive frames reorder the signal list, and adopting each turn produced 385
-`name_updated` events in thirty minutes on a real network. A candidate that
-loses even once starts the clock again, so an alternating pair never settles and
-never emits. A device somebody genuinely renamed settles once and emits one
-event. Nothing is lost by waiting: the name is stored as a signal the moment it
-arrives, and only the display identity and its event are held back.
+A name of **equal** rank replaces the name shown only once the device has
+stopped announcing the shown one for two hours. Many devices announce two or
+more of their own mDNS names (a receiver's service instance name and its zone
+name, a Raspberry Pi's host and service names), and which of them a frame lists
+first depends on who asked last. Adopting each turn produced 385 `name_updated`
+events in thirty minutes on one network; holding a rival for a five minute
+settle window still let two names announced ten minutes apart take turns, 618
+events in a day on another. So the question is not whether the rival keeps
+winning but whether the name shown is still in use: while it is announced it
+stays. A device somebody genuinely renamed stops announcing the old name, and
+two hours later shows the new one with one event. Nothing is lost by waiting:
+the name is stored as a signal the moment it arrives, and only the display
+identity and its event are held back.
 
 The SSDP friendly name deserves its footnote. The UPnP `friendlyName` lives in
 the device description XML at the `LOCATION` URL, and fetching it means an HTTP
