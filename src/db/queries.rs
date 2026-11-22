@@ -285,8 +285,14 @@ pub async fn find_device_by_mac(client: &Client, mac: MacAddr) -> Result<Option<
 /// `trovato_item_id` is the plugin's own join key rather than something a person
 /// edits, so it is not here: nothing in the daemon reads it and the write guards
 /// name it separately.
-pub const USER_OWNED_DEVICE_COLUMNS: [&str; 5] =
-    ["display_name", "notes", "hidden", "notify", "owner_item_id"];
+pub const USER_OWNED_DEVICE_COLUMNS: [&str; 6] = [
+    "display_name",
+    "notes",
+    "hidden",
+    "notify",
+    "owner_item_id",
+    "counts_for_presence",
+];
 
 /// The user-owned columns of one device, as the reconcile read returns them.
 ///
@@ -315,6 +321,9 @@ pub struct UserSettings {
     pub notify: bool,
     /// The person Item that owns this device, as UUID text.
     pub owner_item_id: Option<String>,
+    /// Whether this device decides if its owner is home. `None` decides by
+    /// device type; see [`crate::people::counts_for_presence`].
+    pub counts_for_presence: Option<bool>,
 }
 
 /// The one statement that reads the user-owned columns back.
@@ -324,7 +333,7 @@ pub struct UserSettings {
 /// [`UPDATE_DEVICE_SQL`]: that one may not write these columns, this one may not
 /// read any other.
 const LOAD_USER_SETTINGS_SQL: &str = "SELECT mac, display_name, notes, hidden, notify,
-                owner_item_id::text AS owner_item_id
+                owner_item_id::text AS owner_item_id, counts_for_presence
            FROM ng_devices";
 
 /// Loads the user-owned columns of every device.
@@ -354,6 +363,7 @@ pub async fn load_user_settings(client: &Client) -> Result<Vec<UserSettings>> {
                 hidden: row.try_get("hidden")?,
                 notify: row.try_get("notify")?,
                 owner_item_id: row.try_get("owner_item_id")?,
+                counts_for_presence: row.try_get("counts_for_presence")?,
             })
         })
         .collect()
@@ -857,7 +867,9 @@ pub struct PersonRecord {
     pub notify_arrive: bool,
     /// Notify on departure. Plugin owned.
     pub notify_depart: bool,
-    /// Whether they are home. Daemon owned.
+    /// Whether presence is tracked for them at all. Plugin owned.
+    pub track_presence: bool,
+    /// `home`, `away` or `untracked`. Daemon owned.
     pub state: String,
     /// Where they are. Daemon owned.
     pub current_location: Option<String>,
@@ -875,8 +887,9 @@ pub struct PersonRecord {
 pub async fn load_people(client: &Client) -> Result<Vec<PersonRecord>> {
     let rows = client
         .query(
-            "SELECT item_id::text AS item_id, name, notify_arrive, notify_depart, state,
-                    current_location, last_arrived_at, last_departed_at
+            "SELECT item_id::text AS item_id, name, notify_arrive, notify_depart,
+                    track_presence, state, current_location, last_arrived_at,
+                    last_departed_at
                FROM ng_people
               ORDER BY name",
             &[],
@@ -890,6 +903,7 @@ pub async fn load_people(client: &Client) -> Result<Vec<PersonRecord>> {
                 name: row.try_get("name")?,
                 notify_arrive: row.try_get("notify_arrive")?,
                 notify_depart: row.try_get("notify_depart")?,
+                track_presence: row.try_get("track_presence")?,
                 state: row.try_get("state")?,
                 current_location: row.try_get("current_location")?,
                 last_arrived_at: row.try_get("last_arrived_at")?,
@@ -1327,7 +1341,13 @@ mod tests {
         // owns the identity and the notification flags, the daemon owns the
         // state. A daemon write that touched notify_arrive would silently undo
         // somebody's choice in the admin UI.
-        for column in ["name", "notes", "notify_arrive", "notify_depart"] {
+        for column in [
+            "name",
+            "notes",
+            "notify_arrive",
+            "notify_depart",
+            "track_presence",
+        ] {
             assert!(
                 !UPDATE_PERSON_SQL.contains(&format!("{column} ")),
                 "the person update writes the plugin-owned column {column}"

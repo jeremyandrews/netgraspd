@@ -686,10 +686,25 @@ point produces nothing at all.
 
 ### People, and what the edge evidence is measured against
 
-A person is home when any device they own is online; the first online after all
-were offline is an arrival and the last offline is a departure. Every
-elaboration of that anybody has tried announces you have left while you are
-sitting in the house.
+A tracked person is home when any device of theirs that counts is online; the
+first online after all were offline is an arrival and the last offline is a
+departure. Every elaboration of that anybody has tried announces you have left
+while you are sitting in the house.
+
+**Which devices count, and who is tracked** (V7). Counting every owned device
+alike kept the owner of a laptop left at home "home" all day, with their
+location following the laptop. `people::counts_for_presence` is the one place
+the rule lives: a person's `ng_devices.counts_for_presence` override when there
+is one, otherwise `device_type` is `phone` or `wearable`. Tracking is opt in on
+two levels, the `presence_tracking` config key and `ng_people.track_presence`,
+and a person with either off, or with no device that counts, is `untracked`:
+a third state, never treated as away, with no location and no events. A change
+to any of those inputs leaves the person *unsettled*; the reconcile tick reseeds
+their devices from the device table and `Registry::settle` writes the state the
+devices now imply, with updates and no events. That is why a settings change is
+never delivered as an arrival or a departure, and why its timestamps stay
+untouched. Startup does the same for everybody, which is how a restart, or
+turning the global switch off, changes nobody's history.
 
 Edge crossings supply evidence rather than changing the rule. The subtlety that
 cost a rewrite: **an arrival and a departure measure the evidence window against

@@ -103,6 +103,9 @@ pub struct DaemonStatus {
     pub timezone: ResolvedTimezone,
     /// When this daemon process started.
     pub started_at: Timestamp,
+    /// The install's `presence_tracking` switch, so the web side can say that
+    /// nobody is tracked because it is off.
+    pub presence_tracking: bool,
 }
 
 /// Writes the `ng_daemon_status` row, stamping it `now`.
@@ -118,20 +121,23 @@ pub async fn write_daemon_status(
     client
         .execute(
             "INSERT INTO ng_daemon_status
-                 (id, version, timezone, timezone_source, started_at, updated_at)
-             VALUES (1, $1, $2, $3, $4, $5)
+                 (id, version, timezone, timezone_source, started_at, updated_at,
+                  presence_tracking)
+             VALUES (1, $1, $2, $3, $4, $5, $6)
              ON CONFLICT (id) DO UPDATE SET
                  version = EXCLUDED.version,
                  timezone = EXCLUDED.timezone,
                  timezone_source = EXCLUDED.timezone_source,
                  started_at = EXCLUDED.started_at,
-                 updated_at = EXCLUDED.updated_at",
+                 updated_at = EXCLUDED.updated_at,
+                 presence_tracking = EXCLUDED.presence_tracking",
             &[
                 &status.version,
                 &status.timezone.name,
                 &status.timezone.source.as_str(),
                 &status.started_at,
                 &now,
+                &status.presence_tracking,
             ],
         )
         .await

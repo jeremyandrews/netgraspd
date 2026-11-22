@@ -714,10 +714,10 @@ struct UserOwnedColumn {
 
 /// The user-owned columns the in-memory table holds.
 ///
-/// The other three are elsewhere by design: `owner_item_id` belongs to the
-/// people registry, and `hidden` and `notes` have no daemon-side consumer at all
-/// (see [`UserSettings`]). `USER_OWNED_COLUMNS_NOT_STORED` below names those
-/// three so a test can assert the two lists together still account for every
+/// The other four are elsewhere by design: `owner_item_id` and
+/// `counts_for_presence` belong to the people registry, and `hidden` and
+/// `notes` have no daemon-side consumer at all (see [`UserSettings`]).
+/// `USER_OWNED_COLUMNS_NOT_STORED` below names those four so a test can assert the two lists together still account for every
 /// user-owned column.
 const USER_OWNED_COLUMNS: &[UserOwnedColumn] = &[
     UserOwnedColumn {
@@ -749,7 +749,8 @@ const USER_OWNED_COLUMNS: &[UserOwnedColumn] = &[
 /// Only the drift guard reads it: its whole job is to fail when somebody adds a
 /// user-owned column and puts it in neither list.
 #[cfg(test)]
-const USER_OWNED_COLUMNS_NOT_STORED: [&str; 3] = ["notes", "hidden", "owner_item_id"];
+const USER_OWNED_COLUMNS_NOT_STORED: [&str; 4] =
+    ["notes", "hidden", "owner_item_id", "counts_for_presence"];
 
 /// One user-owned value a reconcile changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1162,6 +1163,23 @@ impl Manager {
         self.devices
             .get(&mac)
             .map(|entry| (entry.state, entry.last_seen_at))
+    }
+
+    /// One device's classified type, which is what decides whether it counts
+    /// for its owner's presence when nobody chose.
+    #[must_use]
+    pub fn device_type_of(&self, mac: MacAddr) -> Option<String> {
+        self.devices
+            .get(&mac)
+            .and_then(|entry| entry.classification.device_type.clone())
+    }
+
+    /// Where one device is: its access point and that access point's place.
+    #[must_use]
+    pub fn place_of(&self, mac: MacAddr) -> (Option<String>, Option<String>) {
+        self.devices.get(&mac).map_or((None, None), |entry| {
+            (entry.current_ap.clone(), entry.current_location.clone())
+        })
     }
 
     /// Folds one observation into the table.
@@ -2932,6 +2950,7 @@ mod tests {
             hidden: false,
             notify: true,
             owner_item_id: None,
+            counts_for_presence: None,
         }
     }
 

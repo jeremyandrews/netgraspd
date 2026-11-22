@@ -16,6 +16,17 @@
 # startup. A top-level key, so it must stay above the first [section].
 # timezone = "Europe/Rome"
 
+# Whether the daemon keeps track of who is home at all. Off by default: with it
+# off every person is "untracked", has no location, is never home or away, and
+# no person_arrived, person_departed or person_location_changed event is ever
+# recorded. With it on, a person is tracked only when their own switch is on as
+# well ("Track whether they are home" on their Trovato person page, or
+# track_presence = true in their [[people]] entry below) and they own a device
+# that counts: a phone or a wearable, unless a person changed that for the
+# device. Published in ng_daemon_status.presence_tracking. A top-level key, so
+# it must stay above the first [section].
+# presence_tracking = true
+
 [database]
 url = "postgres://netgrasp:netgrasp@localhost:5432/netgrasp"
 # The daemon is not connection-hungry: the flush task and the CLI readers are
@@ -469,14 +480,26 @@ edge_aps = ["Driveway AP", "Garage AP"]
 # than chosen between, and a person named here who already exists in ng_people
 # is adopted rather than duplicated, so it is safe to list somebody in both.
 #
-# A person is home when any device they own is online. The first owned device
-# online after all were offline is an arrival; the last one going offline is a
-# departure. notify_arrive and notify_depart gate the notification and default
-# to off.
+# Nobody is tracked unless presence_tracking (top of this file) is on and the
+# person's own switch is on: track_presence = true here, or the person's
+# ng_people.track_presence, which the Trovato person page sets. Either turns it
+# on.
+#
+# Only devices that count decide: by default a device counts when it is
+# classified as a phone or a wearable, and a laptop, desktop, tablet or TV left
+# at home does not keep anybody home. ng_devices.counts_for_presence, set from
+# the Trovato device page, overrides that per device. A person who owns no
+# device that counts is untracked.
+#
+# A tracked person is home when any device of theirs that counts is online. The
+# first one online after all were offline is an arrival; the last one going
+# offline is a departure. notify_arrive and notify_depart gate the notification
+# and default to off.
 
 # [[people]]
-# name = "Jeremy"
+# name = "Alex"
 # macs = ["3c:22:fb:00:00:01", "b8:27:eb:00:00:02"]
+# track_presence = true
 # notify_arrive = true
 # notify_depart = false
 

@@ -4,10 +4,30 @@
 //! has tried produces a system that announces you have left the house while you
 //! are sitting in it:
 //!
-//! - A person is **home** when any device they own is online.
-//! - The first owned device to come online after all of them were offline is an
-//!   arrival.
-//! - The last owned device to go offline is a departure.
+//! - A person is **home** when any device they own *that counts* is online.
+//! - The first counting device to come online after all of them were offline is
+//!   an arrival.
+//! - The last counting device to go offline is a departure.
+//!
+//! ## Which devices count, and who is tracked at all
+//!
+//! Only a device a person carries says whether they are in. A laptop, a desktop
+//! or a tablet left on the kitchen table is online all day while its owner is at
+//! work, and when every owned device counted alike it kept them home all day and
+//! dragged their location to the kitchen. [`counts_for_presence`] is the one
+//! place that decides: by device type unless a person overrode it for that
+//! device.
+//!
+//! Tracking where household members are is something people choose. A person
+//! is [`PersonState::Untracked`] unless the install's `presence_tracking`
+//! switch is on, their own `track_presence` is on, and they own at least one
+//! device that counts. An untracked person has no location, is neither home nor
+//! away, and produces no person events.
+//!
+//! A change to any of those settings re-evaluates the person at once, from the
+//! devices that count now, and records the result without an event: switching
+//! a laptop off as a presence device is not somebody leaving the house. See
+//! [`Registry::settle`].
 //!
 //! Edge access points do not change that rule. They supply the *evidence* for
 //! it: a device that crossed the driveway on its way in makes the arrival read
@@ -34,7 +54,7 @@
 //! events and rows-to-write out. Every rule above is therefore a plain test.
 
 use jiff::SignedDuration;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::clock::Timestamp;
 use serde_json::json;
@@ -62,13 +82,42 @@ use crate::types::{EventType, MacAddr};
 /// against the device's own last activity instead.
 pub const EDGE_EVIDENCE_WINDOW: SignedDuration = SignedDuration::from_mins(15);
 
-/// Whether a person is in the house.
+/// The device types that decide, unless a person says otherwise, whether their
+/// owner is home: the ones that leave the house in a pocket or on a wrist.
+///
+/// Tablets are deliberately absent. In a household a tablet lives on the sofa
+/// far more often than it travels, and one that does travel can be switched on
+/// per device. This list is not the device manager's list of carried types,
+/// which answers a different question (whose long silences are absences).
+pub const PRESENCE_DEVICE_TYPES: [&str; 2] = ["phone", "wearable"];
+
+/// Whether a device decides if its owner is home.
+///
+/// `counts_override` is `ng_devices.counts_for_presence`, which a person sets:
+/// `Some(true)` and `Some(false)` are their explicit choice and win outright.
+/// `None` means "decide by type": the device counts when its classified
+/// `device_type` is one of [`PRESENCE_DEVICE_TYPES`] (`phone` or `wearable`),
+/// and does not count for any other type or when the type is unknown.
+///
+/// This is the only place the rule lives. Everything in the registry that asks
+/// whether a device is a presence device asks this.
+#[must_use]
+pub fn counts_for_presence(counts_override: Option<bool>, device_type: Option<&str>) -> bool {
+    counts_override
+        .unwrap_or_else(|| device_type.is_some_and(|t| PRESENCE_DEVICE_TYPES.contains(&t)))
+}
+
+/// Whether a person is in the house, or whether anybody is asking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PersonState {
-    /// At least one owned device is online.
+    /// At least one owned device that counts is online.
     Home,
-    /// Every owned device is offline.
+    /// Every owned device that counts is offline.
     Away,
+    /// Presence is not tracked for this person: the install's switch is off,
+    /// their own switch is off, or they own no device that counts. Never home
+    /// and never away; no location and no person events.
+    Untracked,
 }
 
 impl PersonState {
@@ -78,16 +127,20 @@ impl PersonState {
         match self {
             PersonState::Home => "home",
             PersonState::Away => "away",
+            PersonState::Untracked => "untracked",
         }
     }
 
     /// Inverse of [`PersonState::as_str`]. Anything unrecognised reads as
     /// `Away`, the safe default: the next device sighting corrects it, and
     /// announcing an arrival that did happen is better than suppressing one.
+    /// The daemon re-evaluates every person at startup in any case, so a stored
+    /// value only ever survives when it agrees with the devices.
     #[must_use]
     pub fn from_db(s: &str) -> Self {
         match s {
             "home" => PersonState::Home,
+            "untracked" => PersonState::Untracked,
             _ => PersonState::Away,
         }
     }
@@ -110,6 +163,9 @@ pub struct Person {
     pub notify_arrive: bool,
     /// Notify when they leave. Plugin owned.
     pub notify_depart: bool,
+    /// Whether anybody is to keep track of whether they are home. Plugin owned,
+    /// off unless somebody switches it on.
+    pub track_presence: bool,
     /// Whether they are home. Daemon owned.
     pub state: PersonState,
     /// Where they are, when they are home. Daemon owned.
@@ -185,6 +241,11 @@ struct DeviceView {
     last_active: Option<Timestamp>,
     /// The last edge access point this device crossed, and when.
     last_edge: Option<(String, Timestamp)>,
+    /// `ng_devices.counts_for_presence`: a person's explicit choice, or `None`
+    /// to decide by type.
+    counts_override: Option<bool>,
+    /// The classified device type, which decides when nobody chose.
+    device_type: Option<String>,
 }
 
 /// One thing a reconcile changed about people or ownership.
@@ -217,6 +278,18 @@ pub enum RegistryChange {
         /// The name they had.
         name: String,
     },
+    /// Something that decides whether a device counts for presence changed:
+    /// its `counts_for_presence` override or its classified type.
+    PresenceSettingChanged {
+        /// Which device.
+        mac: MacAddr,
+        /// Which setting, as `ng_devices` names it.
+        column: &'static str,
+        /// What the registry held.
+        from: String,
+        /// What it holds now.
+        to: String,
+    },
     /// A device's owner changed, was set, or was cleared.
     OwnerChanged {
         /// Which device.
@@ -241,6 +314,16 @@ pub struct Registry {
     /// and quietly undo an install that has no Trovato plugin at all.
     config_owner: HashMap<MacAddr, String>,
     devices: HashMap<MacAddr, DeviceView>,
+    /// The install's `presence_tracking` switch. Off unless configured on.
+    tracking: bool,
+    /// People whose `[[people]]` entry in `netgrasp.toml` sets
+    /// `track_presence`. Either that or the database column turns tracking on
+    /// for a person, so an install with no plugin can switch somebody on.
+    config_tracked: HashSet<String>,
+    /// People whose presence inputs changed since the last
+    /// [`Registry::settle`]: who owns what, which devices count, whether they
+    /// are tracked.
+    unsettled: BTreeSet<String>,
 }
 
 impl Registry {
@@ -255,7 +338,11 @@ impl Registry {
     /// Replaces an existing entry with the same `item_id`, keeping the incoming
     /// row's daemon-owned state, which is what makes reloading from Postgres at
     /// startup a plain overwrite.
+    ///
+    /// The person is left unsettled: the next [`Registry::settle`] checks the
+    /// stored state against the devices, silently.
     pub fn insert_person(&mut self, person: Person) {
+        self.unsettled.insert(person.item_id.clone());
         self.people.insert(person.item_id.clone(), person);
     }
 
@@ -285,6 +372,68 @@ impl Registry {
         self.owner.insert(mac, item_id);
     }
 
+    /// Sets the install's `presence_tracking` switch.
+    ///
+    /// Turning it either way leaves every person unsettled, so the next
+    /// [`Registry::settle`] re-evaluates them all.
+    pub fn set_tracking(&mut self, on: bool) {
+        if self.tracking != on {
+            self.tracking = on;
+            self.unsettled.extend(self.people.keys().cloned());
+        }
+    }
+
+    /// Whether the install's `presence_tracking` switch is on.
+    #[must_use]
+    pub fn tracking(&self) -> bool {
+        self.tracking
+    }
+
+    /// Records that `netgrasp.toml` switches tracking on for a person.
+    pub fn set_config_tracked(&mut self, item_id: impl Into<String>) {
+        let item_id = item_id.into();
+        self.unsettled.insert(item_id.clone());
+        self.config_tracked.insert(item_id);
+    }
+
+    /// Records what decides whether a device counts for presence, without
+    /// re-evaluating anybody. For seeding at startup; a reconcile uses
+    /// [`Registry::reconcile_presence`], which reports what changed.
+    pub fn set_presence_settings(
+        &mut self,
+        mac: MacAddr,
+        counts_override: Option<bool>,
+        device_type: Option<String>,
+    ) {
+        let view = self.devices.entry(mac).or_default();
+        view.counts_override = counts_override;
+        view.device_type = device_type;
+    }
+
+    /// Whether this device decides if its owner is home. See
+    /// [`counts_for_presence`].
+    #[must_use]
+    pub fn counts(&self, mac: MacAddr) -> bool {
+        self.devices.get(&mac).is_some_and(|view| {
+            counts_for_presence(view.counts_override, view.device_type.as_deref())
+        })
+    }
+
+    /// Whether anybody is keeping track of whether this person is home: the
+    /// install's switch is on, theirs is on, and they own a device that counts.
+    #[must_use]
+    pub fn is_tracked(&self, item_id: &str) -> bool {
+        let Some(person) = self.people.get(item_id) else {
+            return false;
+        };
+        self.tracking
+            && (person.track_presence || self.config_tracked.contains(item_id))
+            && self
+                .owner
+                .iter()
+                .any(|(mac, owner)| owner.as_str() == item_id && self.counts(*mac))
+    }
+
     /// Folds the plugin's half of `ng_people` and `ng_devices.owner_item_id`
     /// back in, without disturbing the daemon's half.
     ///
@@ -295,8 +444,8 @@ impl Registry {
     ///
     /// What moves and what does not:
     ///
-    /// - For somebody already known, only `name`, `notify_arrive` and
-    ///   `notify_depart` are taken. `state`, `current_location`,
+    /// - For somebody already known, only `name`, `notify_arrive`,
+    ///   `notify_depart` and `track_presence` are taken. `state`, `current_location`,
     ///   `last_arrived_at` and `last_departed_at` are the daemon's, and the copy
     ///   in memory is ahead of the database's.
     /// - Somebody new is taken whole: their stored state is all there is.
@@ -336,6 +485,11 @@ impl Registry {
                         fields.push(format!("notify_depart={}", person.notify_depart));
                         known.notify_depart = person.notify_depart;
                     }
+                    if known.track_presence != person.track_presence {
+                        fields.push(format!("track_presence={}", person.track_presence));
+                        known.track_presence = person.track_presence;
+                        self.unsettled.insert(person.item_id.clone());
+                    }
                     if !fields.is_empty() {
                         changes.push(RegistryChange::PersonEdited {
                             item_id: person.item_id.clone(),
@@ -349,6 +503,9 @@ impl Registry {
                         item_id: person.item_id.clone(),
                         name: person.name.clone(),
                     });
+                    // Taken whole, and then settled: the stored state is
+                    // whatever the plugin or an older daemon left there.
+                    self.unsettled.insert(person.item_id.clone());
                     self.people.insert(person.item_id.clone(), person);
                 }
             }
@@ -385,6 +542,10 @@ impl Registry {
                     self.owner.remove(mac);
                 }
             }
+            // Both sides: the old owner may have just lost the device that kept
+            // them home, and the new one may have just gained it.
+            self.unsettled.extend(current.iter().cloned());
+            self.unsettled.extend(wanted.iter().cloned());
             changes.push(RegistryChange::OwnerChanged {
                 mac: *mac,
                 from: current,
@@ -393,6 +554,117 @@ impl Registry {
         }
 
         changes
+    }
+
+    /// Folds in what decides whether each device counts for presence: the
+    /// user-owned `counts_for_presence` override and the classified
+    /// `device_type`, one entry per device row.
+    ///
+    /// The owner of a device whose answer may have changed is left unsettled,
+    /// so the caller's [`Registry::settle`] re-evaluates them on the same tick.
+    #[must_use]
+    pub fn reconcile_presence(
+        &mut self,
+        devices: &[(MacAddr, Option<bool>, Option<String>)],
+    ) -> Vec<RegistryChange> {
+        let mut changes = Vec::new();
+        for (mac, counts_override, device_type) in devices {
+            let view = self.devices.entry(*mac).or_default();
+            let mut changed = false;
+            if view.counts_override != *counts_override {
+                changes.push(RegistryChange::PresenceSettingChanged {
+                    mac: *mac,
+                    column: "counts_for_presence",
+                    from: describe_override(view.counts_override),
+                    to: describe_override(*counts_override),
+                });
+                view.counts_override = *counts_override;
+                changed = true;
+            }
+            if view.device_type != *device_type {
+                changes.push(RegistryChange::PresenceSettingChanged {
+                    mac: *mac,
+                    column: "device_type",
+                    from: view.device_type.clone().unwrap_or_default(),
+                    to: device_type.clone().unwrap_or_default(),
+                });
+                view.device_type.clone_from(device_type);
+                changed = true;
+            }
+            if changed && let Some(owner) = self.owner.get(mac) {
+                self.unsettled.insert(owner.clone());
+            }
+        }
+        changes
+    }
+
+    /// The devices of every unsettled person, so the caller can reseed them
+    /// from the device table before [`Registry::settle`] reads them.
+    #[must_use]
+    pub fn unsettled_devices(&self) -> Vec<MacAddr> {
+        let mut macs: Vec<MacAddr> = self
+            .owner
+            .iter()
+            .filter(|(_, owner)| self.unsettled.contains(owner.as_str()))
+            .map(|(mac, _)| *mac)
+            .collect();
+        macs.sort_unstable();
+        macs
+    }
+
+    /// Re-evaluates every person whose presence inputs changed since the last
+    /// call, from the devices that count now.
+    ///
+    /// The result is recorded, never announced: the outcome carries updates
+    /// and no events. A person becoming untracked, or going from home to away
+    /// because a laptop stopped counting, is a change of settings and not
+    /// somebody walking through the door. The arrival and departure timestamps
+    /// are left alone for the same reason; they keep meaning "an arrival" and
+    /// "a departure".
+    #[must_use]
+    pub fn settle(&mut self) -> Outcome {
+        let unsettled = std::mem::take(&mut self.unsettled);
+        let mut outcome = Outcome::default();
+        for item_id in unsettled {
+            outcome.merge(self.reevaluate(&item_id));
+        }
+        outcome
+    }
+
+    /// Re-evaluates every person, silently. What the daemon does at startup,
+    /// where the global switch and everybody's stored state are read fresh.
+    #[must_use]
+    pub fn settle_all(&mut self) -> Outcome {
+        self.unsettled.extend(self.people.keys().cloned());
+        self.settle()
+    }
+
+    /// One person's state as the devices that count say it should be, written
+    /// into the registry without an event.
+    fn reevaluate(&mut self, item_id: &str) -> Outcome {
+        if !self.people.contains_key(item_id) {
+            return Outcome::default();
+        }
+        let (state, location) = if !self.is_tracked(item_id) {
+            (PersonState::Untracked, None)
+        } else if self.any_online(item_id) {
+            (PersonState::Home, self.location_of_person(item_id))
+        } else {
+            (PersonState::Away, None)
+        };
+        let person = self
+            .people
+            .get_mut(item_id)
+            .expect("the person was just checked");
+        if person.state == state && person.current_location == location {
+            return Outcome::default();
+        }
+        person.state = state;
+        person.current_location = location;
+        Outcome {
+            events: Vec::new(),
+            updates: vec![update_of(person)],
+        }
     }
 
     /// How many people are known.
@@ -461,6 +733,25 @@ impl Registry {
         view.last_active = Some(at);
     }
 
+    /// Seeds where a device is without producing events, for the same reason
+    /// as [`Registry::restore_device`]: a person whose tracking was just
+    /// switched on is somewhere already, and that is not a move.
+    pub fn restore_location(
+        &mut self,
+        mac: MacAddr,
+        ap_name: Option<String>,
+        location: Option<String>,
+    ) {
+        let view = self.devices.entry(mac).or_default();
+        if view.online {
+            view.ap_name = ap_name;
+            view.location = location;
+        } else {
+            view.ap_name = None;
+            view.location = None;
+        }
+    }
+
     /// Records that a device was heard from, which is what decides whose
     /// location a person takes.
     ///
@@ -486,11 +777,21 @@ impl Registry {
             view.online = true;
             view.last_active = Some(at);
         }
+        // A laptop coming online says nothing about whether its owner walked
+        // in, and nobody asked about a person who is not tracked.
+        if !self.counts(mac) || !self.is_tracked(&item_id) {
+            return Outcome::default();
+        }
         let Some(person) = self.people.get(&item_id) else {
             return Outcome::default();
         };
 
         let mut outcome = Outcome::default();
+        if person.state == PersonState::Untracked {
+            // Tracked, but not settled since the settings changed. Settling is
+            // silent, and so is this.
+            return self.reevaluate(&item_id);
+        }
         if person.state == PersonState::Away {
             let via = self.edge_evidence(mac, at);
             let location = self.location_of_person(&item_id);
@@ -538,7 +839,7 @@ impl Registry {
             view.ap_name = None;
             view.location = None;
         }
-        if !self.people.contains_key(&item_id) {
+        if !self.people.contains_key(&item_id) || !self.counts(mac) || !self.is_tracked(&item_id) {
             return Outcome::default();
         }
 
@@ -552,7 +853,7 @@ impl Registry {
             .people
             .get_mut(&item_id)
             .expect("the person was just checked");
-        if person.state == PersonState::Away {
+        if person.state != PersonState::Home {
             return outcome;
         }
         person.state = PersonState::Away;
@@ -615,7 +916,7 @@ impl Registry {
                 "a device changed place"
             );
         }
-        if !self.people.contains_key(&item_id) {
+        if !self.people.contains_key(&item_id) || !self.counts(mac) || !self.is_tracked(&item_id) {
             return Outcome::default();
         }
         self.refresh_location(&item_id, mac, at)
@@ -665,20 +966,25 @@ impl Registry {
         outcome
     }
 
-    /// Whether any device this person owns is online.
-    fn any_online(&self, item_id: &str) -> bool {
+    /// The devices this person owns that count for presence.
+    fn counting_devices<'a>(&'a self, item_id: &'a str) -> impl Iterator<Item = MacAddr> + 'a {
         self.owner
             .iter()
-            .filter(|(_, owner)| owner.as_str() == item_id)
-            .any(|(mac, _)| self.devices.get(mac).is_some_and(|v| v.online))
+            .filter(move |(mac, owner)| owner.as_str() == item_id && self.counts(**mac))
+            .map(|(mac, _)| *mac)
     }
 
-    /// The location of the person's most recently active online device.
+    /// Whether any device this person owns that counts is online.
+    fn any_online(&self, item_id: &str) -> bool {
+        self.counting_devices(item_id)
+            .any(|mac| self.devices.get(&mac).is_some_and(|v| v.online))
+    }
+
+    /// The location of the person's most recently active online device that
+    /// counts. A laptop in the study is not where its owner is.
     fn location_of_person(&self, item_id: &str) -> Option<String> {
-        self.owner
-            .iter()
-            .filter(|(_, owner)| owner.as_str() == item_id)
-            .filter_map(|(mac, _)| self.devices.get(mac))
+        self.counting_devices(item_id)
+            .filter_map(|mac| self.devices.get(&mac))
             .filter(|view| view.online && view.location.is_some())
             .max_by(|a, b| {
                 a.last_active
@@ -707,10 +1013,8 @@ impl Registry {
     /// departure, because a departure is declared a whole offline timeout after
     /// the device fell silent. See [`EDGE_EVIDENCE_WINDOW`].
     fn edge_evidence_for_person(&self, item_id: &str) -> Option<String> {
-        self.owner
-            .iter()
-            .filter(|(_, owner)| owner.as_str() == item_id)
-            .filter_map(|(mac, _)| self.devices.get(mac))
+        self.counting_devices(item_id)
+            .filter_map(|mac| self.devices.get(&mac))
             .filter_map(|view| {
                 let (ap, crossed) = view.last_edge.clone()?;
                 let last_active = view.last_active?;
@@ -741,6 +1045,15 @@ impl Outcome {
                 self.updates.push(update);
             }
         }
+    }
+}
+
+/// An override as a log line reads it.
+fn describe_override(value: Option<bool>) -> String {
+    match value {
+        None => "by type".to_string(),
+        Some(true) => "counts".to_string(),
+        Some(false) => "does not count".to_string(),
     }
 }
 
@@ -852,6 +1165,7 @@ mod tests {
             name: name.into(),
             notify_arrive: true,
             notify_depart: true,
+            track_presence: true,
             state: PersonState::Away,
             current_location: None,
             last_arrived_at: None,
@@ -859,12 +1173,32 @@ mod tests {
         }
     }
 
-    /// One person owning a phone and a laptop, both offline.
+    /// Gives a device its classified type, with no override.
+    fn typed(r: &mut Registry, m: &str, device_type: &str) {
+        r.set_presence_settings(mac(m), None, Some(device_type.into()));
+    }
+
+    /// One person owning a phone and a laptop, both offline, with tracking on
+    /// for the install and for them. The phone counts by type; the laptop does
+    /// not.
     fn registry() -> Registry {
         let mut r = Registry::new();
+        r.set_tracking(true);
         r.insert_person(person("person-1", "Jeremy"));
         r.set_owner(mac(PHONE), "person-1");
         r.set_owner(mac(LAPTOP), "person-1");
+        typed(&mut r, PHONE, "phone");
+        typed(&mut r, LAPTOP, "computer");
+        typed(&mut r, WATCH, "wearable");
+        let _ = r.settle();
+        r
+    }
+
+    /// The same, with the laptop switched on as a presence device by choice,
+    /// for the rules about a person with two devices that both count.
+    fn registry_with_counting_laptop() -> Registry {
+        let mut r = registry();
+        r.set_presence_settings(mac(LAPTOP), Some(true), Some("computer".into()));
         r
     }
 
@@ -913,8 +1247,8 @@ mod tests {
     }
 
     #[test]
-    fn a_person_is_still_home_while_any_owned_device_is_online() {
-        let mut r = registry();
+    fn a_person_is_still_home_while_any_counting_device_is_online() {
+        let mut r = registry_with_counting_laptop();
         let _ = r.device_online(mac(PHONE), base());
         let _ = r.device_online(mac(LAPTOP), at(10));
         let outcome = r.device_offline(mac(PHONE), at(600));
@@ -929,8 +1263,8 @@ mod tests {
     }
 
     #[test]
-    fn the_last_owned_device_going_offline_is_a_departure() {
-        let mut r = registry();
+    fn the_last_counting_device_going_offline_is_a_departure() {
+        let mut r = registry_with_counting_laptop();
         let _ = r.device_online(mac(PHONE), base());
         let _ = r.device_online(mac(LAPTOP), at(10));
         let _ = r.device_offline(mac(PHONE), at(600));
@@ -1103,7 +1437,7 @@ mod tests {
 
     #[test]
     fn a_persons_location_follows_their_most_recently_active_device() {
-        let mut r = registry();
+        let mut r = registry_with_counting_laptop();
         let _ = r.device_online(mac(PHONE), base());
         let _ = r.device_online(mac(LAPTOP), at(1));
         let _ = walk(&mut r, mac(LAPTOP), &[("Kitchen AP", 10)]);
@@ -1132,7 +1466,7 @@ mod tests {
 
     #[test]
     fn a_device_going_offline_hands_the_location_to_the_one_still_online() {
-        let mut r = registry();
+        let mut r = registry_with_counting_laptop();
         let _ = r.device_online(mac(PHONE), base());
         let _ = r.device_online(mac(LAPTOP), at(1));
         let _ = walk(&mut r, mac(LAPTOP), &[("Kitchen AP", 10)]);
@@ -1218,12 +1552,14 @@ mod tests {
     #[test]
     fn person_events_carry_the_notification_flags_from_the_person_row() {
         let mut r = Registry::new();
+        r.set_tracking(true);
         r.insert_person(Person {
             notify_arrive: true,
             notify_depart: false,
             ..person("person-1", "Jamie")
         });
         r.set_owner(mac(PHONE), "person-1");
+        typed(&mut r, PHONE, "phone");
 
         let arrival = r.device_online(mac(PHONE), base());
         assert!(arrival.events[0].notify, "notify_arrive is on");
@@ -1418,7 +1754,7 @@ mod tests {
 
     #[test]
     fn person_state_round_trips_and_defaults_away() {
-        for s in [PersonState::Home, PersonState::Away] {
+        for s in [PersonState::Home, PersonState::Away, PersonState::Untracked] {
             assert_eq!(PersonState::from_db(s.as_str()), s);
         }
         assert_eq!(PersonState::from_db("nonsense"), PersonState::Away);
@@ -1439,5 +1775,290 @@ mod tests {
         let outcome = r.device_online(mac(WATCH), at(10));
         assert_eq!(kinds(&outcome), vec![EventType::PersonArrived]);
         assert_eq!(outcome.events[0].name, "Jamie");
+    }
+
+    // ---------------------------------------------------------------------
+    // Presence is opt in, and only carried devices decide who is home.
+    // ---------------------------------------------------------------------
+
+    /// Somebody with a phone and a laptop, as the issue describes them.
+    const PERSON: &str = "person-a";
+
+    fn carried_registry() -> Registry {
+        let mut r = Registry::new();
+        r.set_tracking(true);
+        r.insert_person(person(PERSON, "Alex"));
+        r.set_owner(mac(PHONE), PERSON);
+        r.set_owner(mac(LAPTOP), PERSON);
+        typed(&mut r, PHONE, "phone");
+        typed(&mut r, LAPTOP, "computer");
+        let _ = r.settle();
+        r
+    }
+
+    fn state(r: &Registry) -> PersonState {
+        r.person(PERSON).expect("the person").state
+    }
+
+    #[test]
+    fn only_phones_and_wearables_count_by_type_and_an_override_wins() {
+        for t in ["phone", "wearable"] {
+            assert!(counts_for_presence(None, Some(t)), "{t}");
+            assert!(
+                !counts_for_presence(Some(false), Some(t)),
+                "{t} switched off"
+            );
+        }
+        for t in ["computer", "tablet", "tv", "printer", "unknown"] {
+            assert!(!counts_for_presence(None, Some(t)), "{t}");
+            assert!(counts_for_presence(Some(true), Some(t)), "{t} switched on");
+        }
+        assert!(
+            !counts_for_presence(None, None),
+            "an unknown type does not count"
+        );
+        assert!(counts_for_presence(Some(true), None));
+    }
+
+    #[test]
+    fn the_phone_leaving_is_a_departure_though_the_laptop_stays_online() {
+        let mut r = carried_registry();
+        let _ = r.device_online(mac(PHONE), base());
+        let laptop = r.device_online(mac(LAPTOP), at(10));
+        assert!(
+            laptop.is_empty(),
+            "a laptop coming online is nothing: {laptop:?}"
+        );
+        let outcome = r.device_offline(mac(PHONE), at(600));
+        assert_eq!(kinds(&outcome), vec![EventType::PersonDeparted]);
+        assert_eq!(state(&r), PersonState::Away);
+    }
+
+    #[test]
+    fn a_laptop_switched_on_as_a_presence_device_keeps_them_home() {
+        let mut r = carried_registry();
+        r.set_presence_settings(mac(LAPTOP), Some(true), Some("computer".into()));
+        let _ = r.device_online(mac(PHONE), base());
+        let _ = r.device_online(mac(LAPTOP), at(10));
+        let outcome = r.device_offline(mac(PHONE), at(600));
+        assert!(outcome.events.is_empty(), "{outcome:?}");
+        assert_eq!(state(&r), PersonState::Home);
+    }
+
+    #[test]
+    fn a_laptop_alone_never_makes_an_arrival_or_a_departure() {
+        let mut r = carried_registry();
+        assert!(r.device_online(mac(LAPTOP), base()).is_empty());
+        assert_eq!(state(&r), PersonState::Away);
+        let _ = r.device_online(mac(PHONE), at(10));
+        assert!(r.device_offline(mac(LAPTOP), at(20)).is_empty());
+        assert_eq!(state(&r), PersonState::Home);
+    }
+
+    #[test]
+    fn a_phone_coming_online_for_a_person_not_tracked_is_nothing() {
+        let mut r = Registry::new();
+        r.set_tracking(true);
+        r.insert_person(Person {
+            track_presence: false,
+            ..person(PERSON, "Alex")
+        });
+        r.set_owner(mac(PHONE), PERSON);
+        typed(&mut r, PHONE, "phone");
+        let settled = r.settle();
+        assert!(settled.events.is_empty());
+        assert_eq!(state(&r), PersonState::Untracked);
+
+        let online = r.device_online(mac(PHONE), base());
+        assert!(online.is_empty(), "{online:?}");
+        let moved = walk(&mut r, mac(PHONE), &[("Kitchen AP", 10)]);
+        assert!(moved.is_empty(), "{moved:?}");
+        let offline = r.device_offline(mac(PHONE), at(60));
+        assert!(offline.is_empty(), "{offline:?}");
+        let p = r.person(PERSON).expect("the person");
+        assert_eq!(p.state, PersonState::Untracked);
+        assert_eq!(p.current_location, None);
+    }
+
+    #[test]
+    fn with_the_global_switch_off_everybody_is_untracked_and_nothing_is_said() {
+        let mut r = carried_registry();
+        r.insert_person(person("person-b", "Sam"));
+        r.set_owner(mac(WATCH), "person-b");
+        typed(&mut r, WATCH, "wearable");
+        let _ = r.device_online(mac(PHONE), base());
+        let _ = r.settle();
+
+        r.set_tracking(false);
+        let settled = r.settle();
+        assert!(settled.events.is_empty(), "{settled:?}");
+        for p in r.people() {
+            assert_eq!(p.state, PersonState::Untracked, "{}", p.name);
+            assert_eq!(p.current_location, None);
+        }
+        let mut outcome = r.device_online(mac(WATCH), at(10));
+        outcome.merge(r.device_offline(mac(PHONE), at(20)));
+        outcome.merge(walk(&mut r, mac(WATCH), &[("Kitchen AP", 30)]));
+        assert!(outcome.is_empty(), "{outcome:?}");
+    }
+
+    #[test]
+    fn switching_the_laptop_off_while_the_phone_is_away_settles_away_silently() {
+        let mut r = carried_registry();
+        r.set_presence_settings(mac(LAPTOP), Some(true), Some("computer".into()));
+        let _ = r.device_online(mac(PHONE), base());
+        let _ = r.device_online(mac(LAPTOP), at(10));
+        let _ = r.device_offline(mac(PHONE), at(600));
+        assert_eq!(state(&r), PersonState::Home, "the laptop still counts");
+        let before = r.person(PERSON).expect("the person").clone();
+
+        // The reconcile tick reads the override flipped to FALSE.
+        let changes = r.reconcile_presence(&[
+            (mac(PHONE), None, Some("phone".into())),
+            (mac(LAPTOP), Some(false), Some("computer".into())),
+        ]);
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        let settled = r.settle();
+        assert!(
+            settled.events.is_empty(),
+            "a settings change is nobody leaving"
+        );
+        assert_eq!(settled.updates.len(), 1);
+        assert_eq!(settled.updates[0].state, PersonState::Away);
+        let after = r.person(PERSON).expect("the person");
+        assert_eq!(after.state, PersonState::Away);
+        assert_eq!(after.last_departed_at, before.last_departed_at);
+        assert_eq!(after.last_arrived_at, before.last_arrived_at);
+
+        // And the phone coming back is an ordinary, announced arrival.
+        let back = r.device_online(mac(PHONE), at(900));
+        assert_eq!(kinds(&back), vec![EventType::PersonArrived]);
+    }
+
+    #[test]
+    fn a_reconcile_that_changes_nothing_settles_nobody() {
+        let mut r = carried_registry();
+        let _ = r.device_online(mac(PHONE), base());
+        let changes = r.reconcile_presence(&[
+            (mac(PHONE), None, Some("phone".into())),
+            (mac(LAPTOP), None, Some("computer".into())),
+        ]);
+        assert!(changes.is_empty(), "{changes:?}");
+        assert!(r.settle().is_empty());
+    }
+
+    #[test]
+    fn a_device_reclassified_as_a_phone_starts_counting_on_the_next_tick() {
+        let mut r = Registry::new();
+        r.set_tracking(true);
+        r.insert_person(person(PERSON, "Alex"));
+        r.set_owner(mac(PHONE), PERSON);
+        r.set_presence_settings(mac(PHONE), None, None);
+        r.restore_device(mac(PHONE), true, base());
+        assert!(r.settle_all().events.is_empty());
+        assert_eq!(
+            state(&r),
+            PersonState::Untracked,
+            "an unknown type does not count"
+        );
+
+        let _ = r.reconcile_presence(&[(mac(PHONE), None, Some("phone".into()))]);
+        let settled = r.settle();
+        assert!(settled.events.is_empty());
+        assert_eq!(state(&r), PersonState::Home);
+    }
+
+    #[test]
+    fn a_person_whose_only_device_is_a_tablet_is_untracked() {
+        let mut r = Registry::new();
+        r.set_tracking(true);
+        r.insert_person(person(PERSON, "Alex"));
+        r.set_owner(mac(LAPTOP), PERSON);
+        typed(&mut r, LAPTOP, "tablet");
+        let _ = r.settle_all();
+        assert_eq!(state(&r), PersonState::Untracked);
+        assert!(!r.is_tracked(PERSON));
+        assert!(r.device_online(mac(LAPTOP), base()).is_empty());
+        assert_eq!(state(&r), PersonState::Untracked);
+    }
+
+    #[test]
+    fn location_follows_the_phone_and_not_the_laptop() {
+        let mut r = carried_registry();
+        let _ = r.device_online(mac(PHONE), base());
+        let _ = r.device_online(mac(LAPTOP), at(1));
+        let _ = walk(&mut r, mac(PHONE), &[("Backyard AP", 10)]);
+        // The laptop is heard from last, in another room.
+        let laptop = walk(&mut r, mac(LAPTOP), &[("Kitchen AP", 20)]);
+        r.device_seen(mac(LAPTOP), at(30));
+        assert!(laptop.is_empty(), "{laptop:?}");
+        assert_eq!(
+            r.person(PERSON)
+                .expect("the person")
+                .current_location
+                .as_deref(),
+            Some("Backyard"),
+            "the laptop in the kitchen is not where they are"
+        );
+    }
+
+    #[test]
+    fn switching_tracking_on_for_somebody_at_home_is_not_an_arrival() {
+        let mut r = Registry::new();
+        r.set_tracking(true);
+        r.insert_person(Person {
+            track_presence: false,
+            ..person(PERSON, "Alex")
+        });
+        r.set_owner(mac(PHONE), PERSON);
+        typed(&mut r, PHONE, "phone");
+        let _ = r.device_online(mac(PHONE), base());
+        let _ = r.settle_all();
+        assert_eq!(state(&r), PersonState::Untracked);
+
+        let changes = r.reconcile(
+            vec![person(PERSON, "Alex")],
+            &[(mac(PHONE), Some(PERSON.into()))],
+        );
+        assert!(matches!(
+            changes.as_slice(),
+            [RegistryChange::PersonEdited { fields, .. }] if fields == &["track_presence=true"]
+        ));
+        let settled = r.settle();
+        assert!(settled.events.is_empty(), "{settled:?}");
+        assert_eq!(state(&r), PersonState::Home);
+        // ...and the next real departure is announced.
+        let gone = r.device_offline(mac(PHONE), at(60));
+        assert_eq!(kinds(&gone), vec![EventType::PersonDeparted]);
+    }
+
+    #[test]
+    fn a_restart_settles_everybody_without_announcing_anybody() {
+        let mut r = Registry::new();
+        r.set_tracking(true);
+        r.insert_person(person(PERSON, "Alex"));
+        r.set_owner(mac(PHONE), PERSON);
+        typed(&mut r, PHONE, "phone");
+        r.restore_device(mac(PHONE), true, base());
+        let settled = r.settle_all();
+        assert!(settled.events.is_empty());
+        assert_eq!(state(&r), PersonState::Home, "silently home, not arrived");
+    }
+
+    #[test]
+    fn configuration_can_switch_tracking_on_for_a_person() {
+        let mut r = Registry::new();
+        r.set_tracking(true);
+        r.insert_person(Person {
+            track_presence: false,
+            ..person(PERSON, "Alex")
+        });
+        r.set_config_owner(mac(PHONE), PERSON);
+        r.set_config_tracked(PERSON);
+        typed(&mut r, PHONE, "phone");
+        let _ = r.settle_all();
+        assert_eq!(state(&r), PersonState::Away);
+        let outcome = r.device_online(mac(PHONE), base());
+        assert_eq!(kinds(&outcome), vec![EventType::PersonArrived]);
     }
 }
