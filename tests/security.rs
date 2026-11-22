@@ -774,6 +774,7 @@ async fn any_sensitivity_fires_on_a_first_classification_and_category_does_not()
         identity_change: IdentityChangeConfig {
             enabled: true,
             sensitivity: "any".into(),
+            ..IdentityChangeConfig::default()
         },
         ..SecurityConfig::default()
     };

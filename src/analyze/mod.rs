@@ -162,6 +162,8 @@ pub trait Analyzer: Send {
 /// The configured chain.
 pub struct Chain {
     analyzers: Vec<Box<dyn Analyzer>>,
+    /// Each analyzer's own exemption list, in the same order as `analyzers`.
+    exemptions: Vec<Vec<MacAddr>>,
     context: Context,
     enabled: bool,
 }
@@ -207,8 +209,14 @@ impl Chain {
             )));
         }
 
+        let exemptions = analyzers
+            .iter()
+            .map(|analyzer| config.exempt_macs_for(analyzer.name()))
+            .collect();
+
         Chain {
             analyzers,
+            exemptions,
             context: Context {
                 gateway: GatewayTracker::new(config.gateway_ip(), config.gateway_mac())
                     .with_proxy_arp(config.proxy_arp_gateway),
@@ -272,20 +280,29 @@ impl Chain {
     }
 
     /// Runs the chain, dropping alerts about exempt MACs.
+    ///
+    /// Every analyzer still sees every stimulus, exempt or not: an exemption
+    /// silences what an analyzer says about a MAC, not what it learns from it.
     fn run(&mut self, stimulus: &Stimulus<'_>) -> Vec<SecurityAlert> {
         let mut alerts = Vec::new();
-        for analyzer in &mut self.analyzers {
-            alerts.extend(analyzer.analyze(stimulus, &self.context));
-        }
         // The exemption is applied here rather than in each analyzer, so that no
         // analyzer can forget it and adding one cannot reintroduce the bug.
-        alerts.retain(|alert| {
-            let exempt = self.context.is_exempt(alert.mac);
-            if exempt {
-                tracing::debug!(mac = %alert.mac, event = %alert.event_type, "alert suppressed: exempt MAC");
+        for (analyzer, own) in self.analyzers.iter_mut().zip(&self.exemptions) {
+            let name = analyzer.name();
+            for alert in analyzer.analyze(stimulus, &self.context) {
+                let everywhere = self.context.is_exempt(alert.mac);
+                if everywhere || own.contains(&alert.mac) {
+                    tracing::debug!(
+                        mac = %alert.mac,
+                        event = %alert.event_type,
+                        scope = if everywhere { "all analyzers" } else { name },
+                        "alert suppressed: exempt MAC"
+                    );
+                    continue;
+                }
+                alerts.push(alert);
             }
-            !exempt
-        });
+        }
         alerts
     }
 }
@@ -393,6 +410,91 @@ mod tests {
         let chain = Chain::new(&config);
         assert!(!chain.is_active());
         assert!(chain.names().is_empty());
+    }
+
+    /// A sweep of fifty new hosts plus a burst of announcements of a live
+    /// peer's address, both from one MAC. Returns the `arp_scan` and
+    /// `gratuitous_arp` alerts it raised.
+    fn sweep_and_flood(chain: &mut Chain) -> Vec<EventType> {
+        use crate::types::{ArpDetail, ArpOp, ObservationKind, ProtocolDetail};
+        use std::net::{IpAddr, Ipv4Addr};
+        let actor: MacAddr = "02:00:5e:28:de:ad".parse().expect("mac");
+        let peer: MacAddr = "02:00:5e:28:00:0a".parse().expect("mac");
+        let frame = |from: MacAddr, sender: Ipv4Addr, target: Ipv4Addr, secs: i64| {
+            let gratuitous = sender == target;
+            Observation::new(
+                from,
+                Some(IpAddr::V4(sender)),
+                "eth0",
+                "arp",
+                if gratuitous {
+                    ObservationKind::Announcement
+                } else {
+                    ObservationKind::Request
+                },
+                at(secs),
+            )
+            .with_detail(ProtocolDetail::Arp(ArpDetail {
+                op: ArpOp::Request,
+                sender_mac: from,
+                sender_ip: Some(sender),
+                target_ip: target,
+                gratuitous,
+            }))
+        };
+        let own = Ipv4Addr::new(192, 168, 1, 66);
+        let peer_ip = Ipv4Addr::new(192, 168, 1, 40);
+        let mut types = Vec::new();
+        for n in 0..50u8 {
+            let target = Ipv4Addr::new(192, 168, 1, 100 + n);
+            types.extend(
+                chain
+                    .observe(&frame(actor, own, target, 0))
+                    .into_iter()
+                    .map(|a| a.event_type),
+            );
+        }
+        for n in 0..6i64 {
+            let _ = chain.observe(&frame(peer, peer_ip, Ipv4Addr::new(192, 168, 1, 1), 10 + n));
+            types.extend(
+                chain
+                    .observe(&frame(actor, peer_ip, peer_ip, 10 + n))
+                    .into_iter()
+                    .map(|a| a.event_type),
+            );
+        }
+        // arp_spoof and ip_conflict see the flood too; they are not under test.
+        types.retain(|t| matches!(t, EventType::ArpScan | EventType::GratuitousArp));
+        types
+    }
+
+    #[test]
+    fn a_per_analyzer_exemption_exempts_only_that_analyzer() {
+        let mut config = SecurityConfig::default();
+        config.arp_scan.exempt_macs = vec!["02:00:5e:28:de:ad".to_string()];
+        let types = sweep_and_flood(&mut Chain::new(&config));
+        assert_eq!(types, vec![EventType::GratuitousArp], "{types:?}");
+
+        // Without it, both fire; with the global list, neither does.
+        let types = sweep_and_flood(&mut Chain::new(&SecurityConfig::default()));
+        assert!(types.contains(&EventType::ArpScan), "{types:?}");
+        assert!(types.contains(&EventType::GratuitousArp), "{types:?}");
+        let everywhere = SecurityConfig {
+            exempt_macs: vec!["02:00:5e:28:de:ad".to_string()],
+            ..SecurityConfig::default()
+        };
+        assert!(sweep_and_flood(&mut Chain::new(&everywhere)).is_empty());
+    }
+
+    #[test]
+    fn a_malformed_per_analyzer_exemption_is_rejected_naming_the_key() {
+        let mut config = SecurityConfig::default();
+        config.gratuitous_arp.exempt_macs = vec!["not a mac".to_string()];
+        let error = config.validate().expect_err("rejected").to_string();
+        assert!(
+            error.contains("security.gratuitous_arp.exempt_macs[0]"),
+            "{error}"
+        );
     }
 
     #[test]

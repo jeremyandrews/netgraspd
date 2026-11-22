@@ -179,6 +179,7 @@ mod tests {
         IpConflictConfig {
             enabled: true,
             active_within: HumanDuration::from_secs(60),
+            ..IpConflictConfig::default()
         }
     }
 

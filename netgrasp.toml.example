@@ -286,6 +286,10 @@ proxy_arp_gateway = true
 # MACs no analyzer ever alerts on. For the monitoring box that is meant to sweep
 # the network. Note this silences the analyzers only: the device is still
 # tracked and its arrivals and departures are still recorded.
+#
+# Every analyzer below also takes an exempt_macs list of its own, which silences
+# that one analyzer for those MACs and leaves the other five watching them. An
+# address in either list is exempt; this one is the shorthand for all six.
 exempt_macs = []
 
 # How many MACs or addresses each analyzer tracks before evicting the least
@@ -298,14 +302,30 @@ max_tracked = 4096
 # a device retrying one unanswered ARP two hundred times is not scanning.
 enabled = true
 window = "30s"
+# New addresses inside the window that make an ordinary host a scanner. New
+# means the host has not itself asked about the address within
+# neighbour_memory: a Mac or an Apple TV waking asks again for the dozen
+# neighbours it was talking to before it slept, and that is not a sweep.
 threshold = 10
 # A router legitimately ARPs for everything it forwards to, so holding it to the
 # same threshold as a laptop means an alert a minute forever. A looser threshold
 # rather than an exemption, because a compromised router sweeping the subnet is
 # exactly what you want to hear about. Also applies to any MAC that ARPs from
 # two or more addresses of its own within ten minutes, which is a router with a
-# leg on several segments whether or not it is the gateway.
+# leg on several segments whether or not it is the gateway. For a router every
+# distinct address counts, new or not. For an ordinary host it is the backstop:
+# this many distinct addresses in one window is a sweep even if the host has
+# asked about them all before.
 gateway_threshold = 100
+# How long a MAC keeps the router threshold after it was last seen ARPing from
+# two of its own addresses, so a router that goes quiet on one leg is not
+# demoted to a host and its next burst of forwarding read as a scan.
+router_memory = "1d"
+# How long an address a host asked about stays a known neighbour. A day covers
+# a night asleep. Each host remembers at most 128 neighbours, so a sweep of a
+# whole /24 cannot make itself familiar.
+neighbour_memory = "1d"
+exempt_macs = []
 
 [security.arp_spoof]
 # A MAC claiming an address that a different, still-active MAC holds.
@@ -314,6 +334,7 @@ enabled = true
 # not an attack. Only a claim on an address whose holder was heard from inside
 # this window is one. A claim on the *gateway* address fires regardless.
 grace_period = "60s"
+exempt_macs = []
 
 [security.rogue_dhcp]
 # A second DHCP server. Only a server sends an Offer, an Ack or a Nak.
@@ -322,6 +343,7 @@ enabled = true
 # a healthy network and wrong on one where a rogue is already running. Listing
 # the real server closes that window; nothing is learned when this is set.
 known_servers = []
+exempt_macs = []
 
 [security.identity_change]
 # A device becoming a different kind of device. Because stored signals are never
@@ -332,6 +354,7 @@ enabled = true
 # "any": also the first time a device is classified at all. Noisy by design, and
 # useful when hunting.
 sensitivity = "category"
+exempt_macs = []
 
 [security.ip_conflict]
 # Two active MACs using one address. Usually a static address inside the DHCP
@@ -339,14 +362,28 @@ sensitivity = "category"
 # arp_spoof: you may well want to page on one and only log the other.
 enabled = true
 active_within = "60s"
+exempt_macs = []
 
 [security.gratuitous_arp]
-# A flood of unsolicited "this address is mine". A few are normal on boot; a
-# stream of them is a failing NIC or somebody keeping a poisoned cache entry
-# alive.
+# A flood of unsolicited "this address is mine" against somebody else's
+# address: somebody keeping a poisoned cache entry alive.
+#
+# Only some announcements count. The daemon keeps a binding per address, learned
+# from ordinary ARP, RFC 5227 probes and DHCP Acks, and these do not count: a
+# device announcing the address it already holds (every wake and Wi-Fi roam), a
+# known Bonjour Sleep Proxy announcing for a sleeping device or the device
+# taking its address back, and a device taking an address whose holder has gone
+# quiet. These do: an address a different live device holds, the gateway's
+# address from anything but the gateway, and an address the daemon has no
+# binding for at all.
 enabled = true
 window = "10s"
+# Counted announcements inside the window that make a flood.
 threshold = 5
+# How recently an address's holder must have been heard from, on any protocol,
+# for another device's announcement of it to be a conflict.
+live_within = "60s"
+exempt_macs = []
 
 [security.notifications]
 # Security events are recorded whatever this says. This governs delivery.
