@@ -1042,7 +1042,8 @@ pub struct SecurityConfig {
     /// address the gateway did not proxy.
     pub proxy_arp_gateway: bool,
     /// MAC addresses no analyzer alerts on. For the monitoring box that is
-    /// meant to sweep the network.
+    /// meant to sweep the network. Each analyzer also has an `exempt_macs` of
+    /// its own, which exempts a MAC from that analyzer only.
     pub exempt_macs: Vec<String>,
     /// How many MACs or addresses each analyzer tracks before evicting the
     /// least recently seen. Bounds memory on a hostile network: a scanner
@@ -1100,10 +1101,30 @@ impl SecurityConfig {
     /// The exemption list, as parsed addresses.
     #[must_use]
     pub fn exempt_macs(&self) -> Vec<crate::types::MacAddr> {
-        self.exempt_macs
-            .iter()
-            .filter_map(|m| m.trim().parse().ok())
-            .collect()
+        parse_macs(&self.exempt_macs)
+    }
+
+    /// Each analyzer's own exemption list, by analyzer name, as written.
+    #[must_use]
+    pub fn analyzer_exempt_macs(&self) -> [(&'static str, &[String]); 6] {
+        [
+            ("arp_scan", &self.arp_scan.exempt_macs),
+            ("arp_spoof", &self.arp_spoof.exempt_macs),
+            ("rogue_dhcp", &self.rogue_dhcp.exempt_macs),
+            ("identity_change", &self.identity_change.exempt_macs),
+            ("ip_conflict", &self.ip_conflict.exempt_macs),
+            ("gratuitous_arp", &self.gratuitous_arp.exempt_macs),
+        ]
+    }
+
+    /// The exemption list of one analyzer, as parsed addresses. Empty for a
+    /// name that is not an analyzer.
+    #[must_use]
+    pub fn exempt_macs_for(&self, analyzer: &str) -> Vec<crate::types::MacAddr> {
+        self.analyzer_exempt_macs()
+            .into_iter()
+            .find(|(name, _)| *name == analyzer)
+            .map_or_else(Vec::new, |(_, macs)| parse_macs(macs))
     }
 
     /// Rejects unusable combinations.
@@ -1118,6 +1139,13 @@ impl SecurityConfig {
         for (i, mac) in self.exempt_macs.iter().enumerate() {
             if mac.trim().parse::<crate::types::MacAddr>().is_err() {
                 bail!("security.exempt_macs[{i}] is not a MAC address: {mac:?}");
+            }
+        }
+        for (analyzer, macs) in self.analyzer_exempt_macs() {
+            for (i, mac) in macs.iter().enumerate() {
+                if mac.trim().parse::<crate::types::MacAddr>().is_err() {
+                    bail!("security.{analyzer}.exempt_macs[{i}] is not a MAC address: {mac:?}");
+                }
             }
         }
         for (i, mac) in self.rogue_dhcp.known_servers.iter().enumerate() {
@@ -1140,6 +1168,9 @@ impl SecurityConfig {
         if self.gratuitous_arp.threshold == 0 {
             bail!("security.gratuitous_arp.threshold must be at least 1");
         }
+        if self.gratuitous_arp.live_within.as_secs() == 0 {
+            bail!("security.gratuitous_arp.live_within must be at least 1s");
+        }
         if self.ip_conflict.active_within.as_secs() == 0 {
             bail!("security.ip_conflict.active_within must be at least 1s");
         }
@@ -1154,6 +1185,12 @@ impl SecurityConfig {
         }
         Ok(())
     }
+}
+
+/// Parses a list of MAC addresses, dropping any that do not parse (validation
+/// has already rejected them by the time this runs).
+fn parse_macs(raw: &[String]) -> Vec<crate::types::MacAddr> {
+    raw.iter().filter_map(|m| m.trim().parse().ok()).collect()
 }
 
 /// Parses an optional address field, treating blank as absent.
@@ -1181,13 +1218,40 @@ pub struct ArpScanConfig {
     pub enabled: bool,
     /// Sliding window over which distinct targets are counted.
     pub window: HumanDuration,
-    /// Distinct target addresses inside the window that constitute a scan.
+    /// New target addresses inside the window that constitute a scan, for an
+    /// ordinary host.
+    ///
+    /// "New" means an address this MAC has not itself asked about within
+    /// `neighbour_memory`: a device waking and re-resolving the neighbours it
+    /// was talking to before it slept is not mapping anything.
     pub threshold: usize,
-    /// The same, for the gateway and anything in `exempt_macs`.
+    /// Distinct target addresses inside the window that constitute a scan for
+    /// a router (the gateway, or a MAC seen asking from two or more addresses
+    /// of its own), counting every address whether new or not. Also the
+    /// backstop for an ordinary host: one that asks about this many distinct
+    /// addresses inside the window is sweeping whether or not it has asked
+    /// about them before.
     ///
     /// A router legitimately ARPs for everything it forwards to, so holding it
     /// to the same threshold as a laptop produces one alert per minute forever.
     pub gateway_threshold: usize,
+    /// How long a MAC keeps the router threshold after it was last seen asking
+    /// from two or more addresses of its own.
+    ///
+    /// A second router that forwards for a quiet segment can go a long time
+    /// without asking from that segment's address; until 1.1 this was ten
+    /// minutes, and past it the router's ordinary forwarding read as a scan.
+    pub router_memory: HumanDuration,
+    /// How long an address a host asked about stays one of its known
+    /// neighbours, whose re-resolution does not count toward `threshold`.
+    ///
+    /// Long enough to cover a night asleep. Each host remembers at most 128
+    /// neighbours, so a sweep of a whole /24 overflows the memory and a second
+    /// sweep is counted again.
+    pub neighbour_memory: HumanDuration,
+    /// MACs this analyzer never alerts on. `security.exempt_macs` still
+    /// exempts a MAC from every analyzer.
+    pub exempt_macs: Vec<String>,
 }
 
 impl Default for ArpScanConfig {
@@ -1197,6 +1261,9 @@ impl Default for ArpScanConfig {
             window: HumanDuration::from_secs(30),
             threshold: 10,
             gateway_threshold: 100,
+            router_memory: HumanDuration::from_secs(24 * 3600),
+            neighbour_memory: HumanDuration::from_secs(24 * 3600),
+            exempt_macs: Vec::new(),
         }
     }
 }
@@ -1215,6 +1282,9 @@ pub struct ArpSpoofConfig {
     /// somebody else, and nothing is wrong. Only a claim on an address whose
     /// current holder is *still talking* is an attack.
     pub grace_period: HumanDuration,
+    /// MACs this analyzer never alerts on. `security.exempt_macs` still
+    /// exempts a MAC from every analyzer.
+    pub exempt_macs: Vec<String>,
 }
 
 impl Default for ArpSpoofConfig {
@@ -1222,6 +1292,7 @@ impl Default for ArpSpoofConfig {
         ArpSpoofConfig {
             enabled: true,
             grace_period: HumanDuration::from_secs(60),
+            exempt_macs: Vec::new(),
         }
     }
 }
@@ -1239,6 +1310,9 @@ pub struct RogueDhcpConfig {
     /// already running when the daemon starts. Listing the real server here is
     /// what closes that window.
     pub known_servers: Vec<String>,
+    /// MACs this analyzer never alerts on. `security.exempt_macs` still
+    /// exempts a MAC from every analyzer.
+    pub exempt_macs: Vec<String>,
 }
 
 impl Default for RogueDhcpConfig {
@@ -1246,6 +1320,7 @@ impl Default for RogueDhcpConfig {
         RogueDhcpConfig {
             enabled: true,
             known_servers: Vec::new(),
+            exempt_macs: Vec::new(),
         }
     }
 }
@@ -1260,6 +1335,9 @@ pub struct IdentityChangeConfig {
     /// known one. `any` also fires the first time a device is classified, which
     /// is noisy on a fresh install and useful when hunting.
     pub sensitivity: String,
+    /// MACs this analyzer never alerts on. `security.exempt_macs` still
+    /// exempts a MAC from every analyzer.
+    pub exempt_macs: Vec<String>,
 }
 
 impl Default for IdentityChangeConfig {
@@ -1267,6 +1345,7 @@ impl Default for IdentityChangeConfig {
         IdentityChangeConfig {
             enabled: true,
             sensitivity: "category".to_string(),
+            exempt_macs: Vec::new(),
         }
     }
 }
@@ -1280,6 +1359,9 @@ pub struct IpConflictConfig {
     /// How close together two MACs must use one address to count as
     /// simultaneous.
     pub active_within: HumanDuration,
+    /// MACs this analyzer never alerts on. `security.exempt_macs` still
+    /// exempts a MAC from every analyzer.
+    pub exempt_macs: Vec<String>,
 }
 
 impl Default for IpConflictConfig {
@@ -1287,6 +1369,7 @@ impl Default for IpConflictConfig {
         IpConflictConfig {
             enabled: true,
             active_within: HumanDuration::from_secs(60),
+            exempt_macs: Vec::new(),
         }
     }
 }
@@ -1299,8 +1382,22 @@ pub struct GratuitousArpConfig {
     pub enabled: bool,
     /// Sliding window over which announcements are counted.
     pub window: HumanDuration,
-    /// Announcements inside the window that constitute a flood.
+    /// Counted announcements inside the window that constitute a flood.
+    ///
+    /// Not every announcement counts. A device announcing an address it
+    /// already holds, an RFC 5227 probe, a known Bonjour Sleep Proxy taking
+    /// over or handing back a sleeping device's address, and a device taking
+    /// an address whose holder has gone quiet are all ordinary traffic. What
+    /// counts is an announcement that conflicts with a live holder, one that
+    /// claims the gateway's address from a MAC that is not the gateway, and
+    /// one for an address the daemon has no binding for at all.
     pub threshold: usize,
+    /// How recently the holder of an address must have been heard from, on
+    /// any protocol, for another MAC's announcement of it to be a conflict.
+    pub live_within: HumanDuration,
+    /// MACs this analyzer never alerts on. `security.exempt_macs` still
+    /// exempts a MAC from every analyzer.
+    pub exempt_macs: Vec<String>,
 }
 
 impl Default for GratuitousArpConfig {
@@ -1309,6 +1406,8 @@ impl Default for GratuitousArpConfig {
             enabled: true,
             window: HumanDuration::from_secs(10),
             threshold: 5,
+            live_within: HumanDuration::from_secs(60),
+            exempt_macs: Vec::new(),
         }
     }
 }

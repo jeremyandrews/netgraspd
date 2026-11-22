@@ -204,6 +204,7 @@ mod tests {
         RogueDhcpConfig {
             enabled: true,
             known_servers: Vec::new(),
+            ..RogueDhcpConfig::default()
         }
     }
 
@@ -264,6 +265,7 @@ mod tests {
         let mut analyzer = RogueDhcp::new(&RogueDhcpConfig {
             enabled: true,
             known_servers: vec!["b8:27:eb:44:55:66".into()],
+            ..RogueDhcpConfig::default()
         });
         let context = context();
         // The rogue speaks first. With nothing configured it would be trusted.
@@ -345,6 +347,7 @@ mod tests {
         let mut analyzer = RogueDhcp::new(&RogueDhcpConfig {
             enabled: true,
             known_servers: vec!["b8:27:eb:44:55:66".into()],
+            ..RogueDhcpConfig::default()
         });
         let context = context();
         for n in 0..500u32 {
@@ -367,6 +370,7 @@ mod tests {
         let analyzer = RogueDhcp::new(&RogueDhcpConfig {
             enabled: true,
             known_servers: vec!["not-a-mac".into(), "b8:27:eb:44:55:66".into()],
+            ..RogueDhcpConfig::default()
         });
         assert_eq!(analyzer.configured, vec![mac("b8:27:eb:44:55:66")]);
     }

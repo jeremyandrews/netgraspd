@@ -217,6 +217,7 @@ mod tests {
         ArpSpoofConfig {
             enabled: true,
             grace_period: HumanDuration::from_secs(60),
+            ..ArpSpoofConfig::default()
         }
     }
 

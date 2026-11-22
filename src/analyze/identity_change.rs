@@ -242,6 +242,7 @@ mod tests {
         IdentityChangeConfig {
             enabled: true,
             sensitivity: sensitivity.to_string(),
+            ..IdentityChangeConfig::default()
         }
     }
 

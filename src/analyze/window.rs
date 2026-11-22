@@ -169,6 +169,15 @@ impl<T: Eq + Clone> DistinctWindow<T> {
         self.seen.len()
     }
 
+    /// How many distinct values are inside the window as of `now`, without
+    /// recording anything.
+    pub fn count(&mut self, now: Timestamp, window: Duration) -> usize {
+        if let Ok(window) = SignedDuration::try_from(window) {
+            self.seen.retain(|(_, at)| now.since(*at) <= window);
+        }
+        self.seen.len()
+    }
+
     /// How many distinct values are currently held.
     #[must_use]
     pub fn len(&self) -> usize {

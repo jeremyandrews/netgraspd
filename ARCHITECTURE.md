@@ -478,7 +478,9 @@ root causes, each fixed where it lives:
 - **The gateway is not the only router.** `arp_scan` gave the gateway's looser
   threshold to the one MAC the gateway tracker names. A MAC that asks from two
   or more addresses of its own within ten minutes is routing, and now gets the
-  same threshold under the same rule: looser, never exempt.
+  same threshold under the same rule: looser, never exempt. Since issue #28 it
+  keeps that threshold for `security.arp_scan.router_memory` (a day) after it
+  last did, so a router quiet on one leg is not demoted to a host.
 - **A gateway proxy-ARPing is not the gateway changing address.** The
   analyzers already asked `GatewayTracker::proxy_arp_for` and declined to call
   proxy ARP a conflict; the device table did not ask, so the gateway's

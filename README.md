@@ -1179,12 +1179,12 @@ nothing, and emit events onto the same bus.
 
 | Analyzer | Fires when | The false positive it is built to avoid |
 |---|---|---|
-| `arp_scan` | one MAC asks about many *distinct* addresses in a window | a device retrying one unanswered ARP is not scanning |
+| `arp_scan` | one MAC asks about many *distinct* addresses in a window, counting for a host only addresses it has not asked about in the last day | a device retrying one unanswered ARP, or waking and re-resolving its neighbours, is not scanning |
 | `arp_spoof` | a MAC claims an address whose holder is still talking | leases change hands all day; only a live holder makes it an attack |
 | `rogue_dhcp` | an Offer, Ack or Nak from an unexpected MAC | only a server sends those, so a client never trips it |
 | `identity_change` | stronger evidence contradicts what weaker evidence said | learning what a device is for the first time is a refinement |
 | `ip_conflict` | two active MACs use one address | a handover after the window is a reassignment |
-| `gratuitous_arp` | a flood of unsolicited announcements from one MAC | devices legitimately send a few on boot |
+| `gratuitous_arp` | a flood of unsolicited announcements from one MAC of an address a different live MAC holds, of the gateway's address, or of an address nobody is known to hold | a device announcing its own address on wake or roam, and a sleep proxy answering for a sleeping Mac, claim nothing |
 
 Three properties are worth stating outright.
 
@@ -1193,10 +1193,34 @@ cross-interface dedup collapses on `(MAC, kind, second)`, which is exactly the
 shape of a scan burst. Running the analyzers downstream of it would make
 `arp_scan` useless, so the daemon feeds them before dedup decides anything.
 
+**Each detector can be silenced for one device without silencing the rest.**
+`security.exempt_macs` exempts a MAC from all six; `security.<analyzer>.exempt_macs`
+(for example `security.arp_scan.exempt_macs`) exempts it from that analyzer
+only, so the box that is meant to sweep the network can stop raising `arp_scan`
+and still be caught spoofing. Every threshold is a setting with the values in
+`netgrasp.toml.example` as defaults; that file documents each one.
+
+**ARP from Apple devices doing what Apple devices do is not an attack.** A Mac
+waking or roaming probes for its address and then announces it in a burst, an
+Apple TV acting as Bonjour Sleep Proxy announces a sleeping Mac's address, and
+a device whose ARP cache expired asks again for a dozen neighbours at once. On
+one home LAN with no scanner and no spoofer that was about 80 urgent security
+events a day, all at the threshold. `gratuitous_arp` now counts only an
+announcement that conflicts with a live holder's binding (or claims the
+gateway's address, or an address nobody is known to hold); a known sleep proxy
+is a MAC that advertised `_sleep-proxy._udp` over mDNS in the last day.
+`arp_scan` counts, for an ordinary host, only addresses it has not asked about
+in `neighbour_memory`, with `gateway_threshold` distinct addresses in one
+window as a backstop; and a MAC seen routing keeps the router threshold for
+`router_memory`. The analyzers' module documentation has the full rules.
+
 **They are stateless across restarts.** A detector that trusted state written
 before a crash would be trusting state written by whatever caused it. The cost is
 that `rogue_dhcp` re-learns the legitimate server after a restart; set
-`security.rogue_dhcp.known_servers` to close that window.
+`security.rogue_dhcp.known_servers` to close that window. Likewise
+`gratuitous_arp` re-learns who holds each address and which MACs are sleep
+proxies, and `arp_scan` re-learns each host's neighbours, so in the first hour
+after a restart a device waking can still raise one of them.
 
 **Security events are delivered by their class.** They are recorded and
 delivered during a learning window, they ignore the per-device `notify` toggle,
