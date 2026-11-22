@@ -387,8 +387,8 @@ attaches names, vendors and row ids afterwards.
 
 Every analyzer holds itself back with a cooldown, so a condition that persists
 for an hour produces alerts at a bounded rate rather than one per packet. That is
-not the notification dispatcher's debounce, which security events deliberately
-bypass; it is the detector declining to say the same thing twice.
+not the notification dispatcher's pooling (see Alert classes and pooling); it is
+the detector declining to say the same thing twice.
 
 ### The gateway is worked out passively
 
@@ -494,6 +494,126 @@ rank's evidence in the order the signals were stored, most recently confirmed
 first, so the device type was whichever service the device announced last.
 Within a rank the table now decides, which is the precedence the tables were
 always documented to have.
+
+## Alert classes and pooling
+
+Security events used to skip quiet hours, the debounce and the batch window
+outright, which made "security always alerts" true and also made one router on
+a real network about 20,000 `arp_scan` alerts in a week, with 31 devices adding
+about 160 `identity_change` alerts each. The dispatcher now treats every type
+the same way: each type belongs to one **class**, and the class decides.
+
+| Class | Types | Delivery | Quiet hours |
+|---|---|---|---|
+| `intrusion` | `arp_spoof`, `rogue_dhcp` | push | ignored |
+| `anomaly` | `arp_scan`, `ip_conflict` | push | respected |
+| `identity` | `identity_change`, `gratuitous_arp` | digest | respected |
+| `presence` | `new_device`, `returned`, `went_offline`, `person_arrived`, `person_departed` | push | respected |
+
+These apply when `netgrasp.toml` names no class. They live in code
+(`config::default_classes`) rather than in `NotifyConfig::default`, because
+figment merges tables: a default table plus one class from the file would put
+the same type in two classes. So naming any class replaces the whole table.
+
+| Key | Default |
+|---|---|
+| `notify.classes.<name>.event_types` | the table above |
+| `notify.classes.<name>.delivery` | `"push"` (`push`, `digest` or `off`) |
+| `notify.classes.<name>.instant_count` | `3` |
+| `notify.classes.<name>.pool_period` | `"1h"` |
+| `notify.classes.<name>.backoff_after` | `"24h"` |
+| `notify.classes.<name>.backoff_period` | `"24h"` |
+| `notify.classes.<name>.quiet_reset` | `"1h"` |
+| `notify.classes.<name>.respect_quiet_hours` | `true` (`false` for `intrusion`) |
+| `notify.digest_time` | `"08:00"`, local |
+| `notify.approved_quiet_types` | `["identity_change", "gratuitous_arp", "ip_conflict"]` |
+
+**Rules at load.** A type in two classes is an error. A type in no class is
+`off`, except a security type, which falls back to `anomaly` so that a missing
+line cannot silence an attack; both log a warning naming the type. The four
+never-delivered informational types are not warned about. `arp_spoof` and
+`rogue_dhcp` in `approved_quiet_types` is an error. The three retired
+`[security.notifications].bypass_*` keys still parse, because the live
+`netgrasp.toml` sets them, and log a warning that they do nothing.
+
+**Order in the dispatcher.** Master switch and security switch; the per-event
+rule (`DeviceEvent::deliverable`, unchanged); approved-quiet; the
+lifecycle allowlist; the class (`off` stops, `digest` is counted); quiet hours
+for a class that respects them; the per-device debounce for lifecycle and person
+events only; pooling; the batch window.
+
+**Pooling** is keyed by (class, event type, MAC) and is the repeat limiter for
+security events in place of the debounce. The debounce dropped repeats; a pool
+counts every one, which is what lets a summary say how many there were.
+
+1. Events 1 to `instant_count` from a source are instant. The last of them
+   carries `More alerts like this from d0:21:f9:dc:a1:19 will be pooled: one
+   summary every hour.`, and the first summary is due one `pool_period` later.
+2. After that, events are held, and each summary gives the count, the first and
+   last time, and when the next is due: `57 more alerts like this from
+   d0:21:f9:dc:a1:19 between 09:03 and 09:58. Next summary at 10:58 if it
+   continues.` An event at the very second a summary falls due goes in the next
+   one.
+3. The first summary at or past `backoff_after` from the start of the run
+   switches to `backoff_period` and says so.
+4. `quiet_reset` with no event closes the pool. Anything held goes out in a
+   closing summary, and the next event is instant again.
+5. With `instant_count = 0` the first event waits for a summary at the end of its
+   period.
+
+A summary due in quiet hours, for a class that respects them, waits for them to
+end. Events arriving in quiet hours are dropped for such a class, as before, and
+are not counted.
+
+**Digest.** A `digest` class is counted, never pushed, and one message goes out
+at `notify.digest_time` with counts by class, type and source. The time is
+evaluated at the dispatcher's fixed UTC offset, like quiet hours (see open
+question 4). If quiet hours cover it and a class in the digest respects them, it
+waits for them to end.
+
+**State is in memory.** A restart forgets every pool and the digest so far. The
+cost is at most `instant_count` extra instant alerts per active source after a
+restart, and held events that are never summarised; they remain in `ng_events`.
+Persisting it was out of scope.
+
+**Approved devices.** The schema has no approved flag, so `DeviceEvent::approved`
+is the union of the user-owned signals that a person vouched for a device: an
+owner (`ng_devices.owner_item_id`, or a `[[people]]` entry, both through the
+people registry, handed to `Manager::set_owned` at startup and on every
+reconcile), a `display_name` a person set, or `notify` on. `baseline` is
+deliberately not one of them: it is what the learning window saw, and an
+attacker present during learning would be on it. An approved device never
+delivers or pools the types in `approved_quiet_types`; the events are still
+recorded.
+
+```toml
+[notify]
+digest_time = "08:00"
+approved_quiet_types = ["identity_change", "gratuitous_arp", "ip_conflict"]
+
+[notify.classes.intrusion]
+event_types = ["arp_spoof", "rogue_dhcp"]
+respect_quiet_hours = false
+
+[notify.classes.anomaly]
+event_types = ["arp_scan", "ip_conflict"]
+instant_count = 3
+pool_period = "1h"
+backoff_after = "24h"
+backoff_period = "24h"
+quiet_reset = "1h"
+
+[notify.classes.identity]
+event_types = ["identity_change", "gratuitous_arp"]
+delivery = "digest"
+
+[notify.classes.presence]
+event_types = ["new_device", "returned", "went_offline", "person_arrived", "person_departed"]
+```
+
+Replayed through this dispatcher, the live 1.1.0 day from 2026-11-18T08:03:25Z
+projects 34 pushes: 29 instant `arp_scan` alerts, 4 pooled summaries and 1
+digest of 75 `gratuitous_arp` events.
 
 ## IPv6 addressing, revisited
 

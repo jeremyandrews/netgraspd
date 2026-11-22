@@ -1004,7 +1004,7 @@ What reaches your phone, once the learning window is over:
 | `new_device` | always, whatever the device's `notify` says: nobody has chosen anything about a device that has only just appeared |
 | `returned`, `went_offline` | only for a device whose `notify` a person turned on in Trovato; it starts off |
 | `person_arrived`, `person_departed` | when the person's `notify_arrive` or `notify_depart` is on; they start off |
-| security events | always, under `[security.notifications]` (below) |
+| security events | by their class (below); never silenced by a learning window or by `notify` |
 | `ip_changed`, `name_updated`, `device_location_changed`, `person_location_changed` | never |
 
 Everything is recorded in `ng_events` either way. `notify.event_types` is a
@@ -1014,10 +1014,12 @@ lets a device you chose be heard both coming and going.
 
 All rate limiting lives in the dispatcher, not in any notifier:
 
-- per-device debounce, five minutes by default;
-- batching, so ten or more devices appearing inside a minute collapse into one
-  summary rather than a storm (this is what makes a router reboot one message);
-- quiet hours, evaluated in local time;
+- alert classes, which decide push, digest or off for each type, and pool a
+  source that keeps repeating (below);
+- per-device debounce for coming and going, five minutes by default;
+- batching, so ten or more alerts inside a minute collapse into one summary
+  rather than a storm (this is what makes a router reboot one message);
+- quiet hours, evaluated in local time, for every class that respects them;
 - a per-device `notify` toggle you set from Trovato, off until you turn it on.
 
 The batch window costs up to `notify.batch_window` of latency on every
@@ -1025,7 +1027,7 @@ notification. Set `notify.batch_threshold = 0` to turn batching off if you would
 rather have them instantly.
 
 Two categories skip the `notify.event_types` allowlist because they are governed
-elsewhere: security events by `[security.notifications]`, and person events by
+elsewhere: security events by their class, and person events by
 `notify_arrive` and `notify_depart` on the person row. Requiring them in two
 places would make a silent misconfiguration look like a working setup.
 
@@ -1051,6 +1053,118 @@ topic, the server or the token:
   at 18:43.") and marks each one handled with an `outcome` of `sent`, `failed`
   or `not_configured`. The outcome is a word and never the transport's error,
   because that error names the URL and the URL contains the topic.
+
+### Alert classes and pooling
+
+Every event type that can reach a phone belongs to one **class**, and the class
+decides how it is delivered. With no `[notify.classes.*]` table in the file,
+these four apply:
+
+| Class | Types | Delivery | Quiet hours |
+|---|---|---|---|
+| `intrusion` | `arp_spoof`, `rogue_dhcp` | push | ignored |
+| `anomaly` | `arp_scan`, `ip_conflict` | push | respected |
+| `identity` | `identity_change`, `gratuitous_arp` | digest | respected |
+| `presence` | `new_device`, `returned`, `went_offline`, `person_arrived`, `person_departed` | push | respected |
+
+`presence` keeps every rule in the table above: a class never makes an event
+deliverable that the per-event rule refuses.
+
+- **`push`** sends to the phone, pooled per source (below).
+- **`digest`** sends nothing as it happens. Once a day at `notify.digest_time`
+  one message lists the counts by class, then type, then source. When quiet
+  hours cover the digest time and a class in it respects them, the digest waits
+  for them to end.
+- **`off`** records in `ng_events` and never delivers.
+
+Naming any class replaces the whole built-in table, so a file that defines
+classes defines all of them. A type in two classes stops the daemon at load. A
+type in no class is `off`, except a security type, which falls back to the class
+named `anomaly` (or to the built-in `anomaly` settings when there is none) so
+that a missing line can never silence an attack. Either way the daemon logs a
+warning at load naming the type. `ip_changed`, `name_updated`,
+`device_location_changed` and `person_location_changed` are never delivered, so
+leaving them out is not warned about.
+
+**Pooling.** A push class counts events per source: per class, event type and
+MAC. For a router sending `arp_scan` every half minute, with the defaults:
+
+1. The first three alerts go out as they happen.
+2. The third ends with the line `More alerts like this from d0:21:f9:dc:a1:19
+   will be pooled: one summary every hour.`
+3. After that, one summary an hour: `ARP scan from Router (57 more)`, with
+   `57 more alerts like this from d0:21:f9:dc:a1:19 between 09:03 and 09:58.
+   Next summary at 10:58 if it continues.`
+4. Once the source has repeated for 24 hours without a quiet hour, summaries
+   slow to one a day, and the summary that switches says `It has repeated for
+   24 hours without a break of an hour, so summaries now come once every 24
+   hours.`
+5. An hour with no event from that source closes its pool. Anything held goes
+   out in a last summary that says so, and the next event alerts at once again.
+
+With `instant_count = 0` there are no instant alerts: the first event waits for
+a summary at the end of its period.
+
+Pooling state lives in memory. **A restart resets it**, so a source that was
+being pooled can send up to `instant_count` instant alerts again after a
+restart, and what was held for a summary or for the digest is not sent. Those
+events are still in `ng_events`.
+
+Every key, with its default:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `notify.classes.<name>.event_types` | (see the table) | the types in the class |
+| `notify.classes.<name>.delivery` | `"push"` | `push`, `digest` or `off` |
+| `notify.classes.<name>.instant_count` | `3` | alerts per source before pooling starts |
+| `notify.classes.<name>.pool_period` | `"1h"` | one summary per this, while pooled |
+| `notify.classes.<name>.backoff_after` | `"24h"` | repeating this long without a break slows summaries |
+| `notify.classes.<name>.backoff_period` | `"24h"` | one summary per this, once backed off |
+| `notify.classes.<name>.quiet_reset` | `"1h"` | this long with no event starts the source over |
+| `notify.classes.<name>.respect_quiet_hours` | `true` (`false` for `intrusion`) | whether `notify.quiet_hours` holds the class |
+| `notify.digest_time` | `"08:00"` | when the daily digest goes out, local time |
+| `notify.approved_quiet_types` | `["identity_change", "gratuitous_arp", "ip_conflict"]` | types an approved device never alerts for |
+
+Durations take the same `30m`, `1h`, `24h`, `1d` forms as everywhere else.
+
+```toml
+[notify]
+digest_time = "08:00"
+approved_quiet_types = ["identity_change", "gratuitous_arp", "ip_conflict"]
+
+[notify.classes.intrusion]
+event_types = ["arp_spoof", "rogue_dhcp"]
+delivery = "push"
+respect_quiet_hours = false
+
+[notify.classes.anomaly]
+event_types = ["arp_scan", "ip_conflict"]
+delivery = "push"
+instant_count = 3
+pool_period = "1h"
+backoff_after = "24h"
+backoff_period = "24h"
+quiet_reset = "1h"
+
+[notify.classes.identity]
+event_types = ["identity_change", "gratuitous_arp"]
+delivery = "digest"
+
+[notify.classes.presence]
+event_types = ["new_device", "returned", "went_offline", "person_arrived", "person_departed"]
+delivery = "push"
+```
+
+**Approved devices stay quiet about routine behaviour.** A device counts as
+approved when a person has vouched for it in any of three ways: it has an owner
+(`ng_devices.owner_item_id`, or a `[[people]]` entry in this file), a person
+gave it a name (`ng_devices.display_name`), or its `notify` is on. The learned
+baseline does not count, because it is what Netgrasp happened to see first and
+not something anybody chose. An approved device never delivers or pools the
+types in `notify.approved_quiet_types`: a Mac waking up and re-announcing its
+address is not news. The events are still recorded. `arp_spoof` and
+`rogue_dhcp` alert whatever the device's state, and listing either there stops
+the daemon at load.
 
 ## Security analyzers
 
@@ -1079,12 +1193,18 @@ before a crash would be trusting state written by whatever caused it. The cost i
 that `rogue_dhcp` re-learns the legitimate server after a restart; set
 `security.rogue_dhcp.known_servers` to close that window.
 
-**Security events play by different notification rules.** They are recorded
-during a learning window, they ignore the per-device `notify` toggle, they do not
-have to appear in `notify.event_types`, and by default they bypass quiet hours,
-the debounce and the batch window. The one thing they do not bypass is
-`notify.enabled`, because a master switch with an exception is not a master
-switch.
+**Security events are delivered by their class.** They are recorded and
+delivered during a learning window, they ignore the per-device `notify` toggle,
+and they do not have to appear in `notify.event_types`. Their class decides the
+rest (see [Alert classes and pooling](#alert-classes-and-pooling)): by default
+an ARP spoof or a rogue DHCP server pushes even in quiet hours, a scan or an
+address conflict pushes outside them, and identity changes and gratuitous ARP
+floods go in the daily digest. Their repeats are pooled per source rather than
+debounced. The one thing they do not bypass is `notify.enabled`, because a
+master switch with an exception is not a master switch. The old
+`[security.notifications]` keys `bypass_quiet_hours`, `bypass_debounce` and
+`bypass_batch_window` are still accepted and have no effect; loading one logs a
+warning.
 
 The gateway is worked out without asking, because several analyzers treat it
 differently. `security.gateway_ip` wins if set. Otherwise the daemon reads its

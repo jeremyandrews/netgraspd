@@ -269,6 +269,11 @@ impl Registry {
         self.owner.insert(mac, item_id.into());
     }
 
+    /// Every device somebody owns, from the database or from configuration.
+    pub fn owned_macs(&self) -> impl Iterator<Item = MacAddr> + '_ {
+        self.owner.keys().copied()
+    }
+
     /// Records that configuration, rather than the database, says a device
     /// belongs to a person.
     ///

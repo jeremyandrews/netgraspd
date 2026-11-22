@@ -143,6 +143,21 @@ impl Notifier for NtfyNotifier {
         .await
     }
 
+    async fn send_noted(&self, event: &DeviceEvent, note: &str) -> Result<()> {
+        self.post(
+            &title_in(event, &self.time_zone),
+            &format!("{}\n\n{note}", body_in(event, &self.time_zone)),
+            tags_for(event.event_type),
+            self.header_priority(event.priority),
+        )
+        .await
+    }
+
+    async fn send_report(&self, title: &str, body: &str, priority: EventPriority) -> Result<()> {
+        self.post(title, body, "hourglass", self.header_priority(priority))
+            .await
+    }
+
     async fn send_batch(&self, events: &[DeviceEvent]) -> Result<()> {
         match events {
             [] => Ok(()),
@@ -156,7 +171,7 @@ impl Notifier for NtfyNotifier {
                     .max()
                     .unwrap_or(EventPriority::Normal);
                 self.post(
-                    &format!("{} devices appeared", many.len()),
+                    &batch_title(many),
                     &summary_body(many),
                     "satellite",
                     self.header_priority(priority),
@@ -447,6 +462,18 @@ pub fn summary_body(events: &[DeviceEvent]) -> String {
     lines.join("\n")
 }
 
+/// Title of a collapsed batch window: "12 devices appeared" when every one of
+/// them is a new device, which is the network-restart case it was built for,
+/// and "12 alerts" otherwise.
+#[must_use]
+pub fn batch_title(events: &[DeviceEvent]) -> String {
+    if events.iter().all(|e| e.event_type == EventType::NewDevice) {
+        format!("{} devices appeared", events.len())
+    } else {
+        format!("{} alerts", events.len())
+    }
+}
+
 /// How many devices a summary lists before it starts counting instead.
 const SUMMARY_LIST_LIMIT: usize = 15;
 
@@ -501,6 +528,7 @@ mod tests {
             baseline: false,
             during_learning: false,
             notify: true,
+            approved: false,
             priority: crate::types::EventPriority::Normal,
             details: serde_json::Value::Null,
         }

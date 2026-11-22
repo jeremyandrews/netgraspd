@@ -18,6 +18,8 @@ use figment::providers::{Env, Format, Serialized, Toml};
 use figment::{Figment, value::Value};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::types::EventType;
+
 /// Default file consulted when `--config` is not given.
 pub const DEFAULT_CONFIG_FILE: &str = "netgrasp.toml";
 
@@ -606,22 +608,34 @@ impl Default for LearningConfig {
 pub struct NotifyConfig {
     /// Master switch. Off means events are still recorded, just not delivered.
     pub enabled: bool,
-    /// Minimum gap between two notifications about the same device.
+    /// Minimum gap between two notifications about the same device coming or
+    /// going. Security events are not debounced: their repeats are what the
+    /// class pooling below is for.
     pub debounce: HumanDuration,
-    /// How many devices appearing inside `batch_window` collapse into one
-    /// summary notification. Covers the network-restart case.
+    /// How many alerts inside `batch_window` collapse into one summary
+    /// notification. Covers the network-restart case.
     pub batch_threshold: usize,
     /// The window over which `batch_threshold` is counted.
     pub batch_window: HumanDuration,
-    /// Which event types are worth a notification at all.
+    /// Which device lifecycle event types are worth a notification at all.
     ///
     /// A filter on top of the per-event rule, never a way round it: `returned`
     /// and `went_offline` still need the device's `notify` on, and
     /// `ip_changed`, `name_updated` and `device_location_changed` are never
-    /// delivered whether listed or not.
+    /// delivered whether listed or not. Security and person events are not
+    /// governed by this list; their class is.
     pub event_types: Vec<String>,
     /// Optional daily quiet period.
     pub quiet_hours: Option<QuietHours>,
+    /// Alert classes, keyed by name. Empty means the built-in four; see
+    /// [`NotifyConfig::effective_classes`].
+    pub classes: BTreeMap<String, AlertClass>,
+    /// When the daily digest of every `digest` class goes out, local time.
+    pub digest_time: ClockTime,
+    /// Event types that never deliver or pool for an approved device: one with
+    /// an owner, a name a person gave it, or `notify` turned on. They are still
+    /// recorded in `ng_events`. `arp_spoof` and `rogue_dhcp` cannot be listed.
+    pub approved_quiet_types: Vec<String>,
     /// ntfy.sh delivery settings. Absent means no notifier is configured.
     pub ntfy: Option<NtfyConfig>,
 }
@@ -639,8 +653,275 @@ impl Default for NotifyConfig {
                 "went_offline".into(),
             ],
             quiet_hours: None,
+            classes: BTreeMap::new(),
+            digest_time: ClockTime { hour: 8, minute: 0 },
+            approved_quiet_types: DEFAULT_APPROVED_QUIET_TYPES
+                .iter()
+                .map(|t| (*t).to_string())
+                .collect(),
             ntfy: None,
         }
+    }
+}
+
+/// The default `notify.approved_quiet_types`.
+pub const DEFAULT_APPROVED_QUIET_TYPES: [&str; 3] =
+    ["identity_change", "gratuitous_arp", "ip_conflict"];
+
+/// Event types that alert whatever the device's state, and so can never be in
+/// `notify.approved_quiet_types`: somebody poisoning the ARP table or handing
+/// out addresses is news even from a device a person knows.
+pub const ALWAYS_ALERT_TYPES: [EventType; 2] = [EventType::ArpSpoof, EventType::RogueDhcp];
+
+/// The class an unclassified security type falls back to.
+pub const FALLBACK_SECURITY_CLASS: &str = "anomaly";
+
+/// How an alert class reaches somebody.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClassDelivery {
+    /// Straight to the phone, pooled per source when it repeats.
+    Push,
+    /// Counted, and listed once a day at `notify.digest_time`.
+    Digest,
+    /// Recorded in `ng_events` and never delivered.
+    Off,
+}
+
+impl ClassDelivery {
+    /// The word used in the configuration.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ClassDelivery::Push => "push",
+            ClassDelivery::Digest => "digest",
+            ClassDelivery::Off => "off",
+        }
+    }
+}
+
+/// One alert class: a set of event types and how they are delivered.
+///
+/// Pooling is per source: per (class, event type, MAC). The first
+/// `instant_count` events from a source are delivered as they happen, the last
+/// of them saying that pooling starts; after that one summary per
+/// `pool_period`, or per `backoff_period` once the source has repeated for
+/// `backoff_after` without a gap of `quiet_reset`. A gap of `quiet_reset` with
+/// no event starts over.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AlertClass {
+    /// The event types in this class, as `ng_events.event_type` names them.
+    pub event_types: Vec<String>,
+    /// `push`, `digest` or `off`.
+    pub delivery: ClassDelivery,
+    /// How many events from one source are delivered one by one before
+    /// pooling starts. Zero pools from the first.
+    pub instant_count: u32,
+    /// How often a pooled source gets a summary.
+    pub pool_period: HumanDuration,
+    /// How long a source may repeat without a break before its summaries slow
+    /// down to `backoff_period`.
+    pub backoff_after: HumanDuration,
+    /// How often a backed-off source gets a summary.
+    pub backoff_period: HumanDuration,
+    /// How long a source must stay quiet for its next event to be instant
+    /// again.
+    pub quiet_reset: HumanDuration,
+    /// Whether `notify.quiet_hours` holds this class's alerts. Off means it
+    /// delivers inside quiet hours too.
+    pub respect_quiet_hours: bool,
+}
+
+impl Default for AlertClass {
+    fn default() -> Self {
+        AlertClass {
+            event_types: Vec::new(),
+            delivery: ClassDelivery::Push,
+            instant_count: 3,
+            pool_period: HumanDuration::from_secs(3600),
+            backoff_after: HumanDuration::from_secs(24 * 3600),
+            backoff_period: HumanDuration::from_secs(24 * 3600),
+            quiet_reset: HumanDuration::from_secs(3600),
+            respect_quiet_hours: true,
+        }
+    }
+}
+
+impl AlertClass {
+    fn built_in(types: &[&str], delivery: ClassDelivery, respect_quiet_hours: bool) -> Self {
+        AlertClass {
+            event_types: types.iter().map(|t| (*t).to_string()).collect(),
+            delivery,
+            respect_quiet_hours,
+            ..AlertClass::default()
+        }
+    }
+}
+
+/// The classes used when the configuration names none.
+#[must_use]
+pub fn default_classes() -> BTreeMap<String, AlertClass> {
+    BTreeMap::from([
+        (
+            "intrusion".to_string(),
+            AlertClass::built_in(&["arp_spoof", "rogue_dhcp"], ClassDelivery::Push, false),
+        ),
+        (
+            FALLBACK_SECURITY_CLASS.to_string(),
+            AlertClass::built_in(&["arp_scan", "ip_conflict"], ClassDelivery::Push, true),
+        ),
+        (
+            "identity".to_string(),
+            AlertClass::built_in(
+                &["identity_change", "gratuitous_arp"],
+                ClassDelivery::Digest,
+                true,
+            ),
+        ),
+        (
+            "presence".to_string(),
+            AlertClass::built_in(
+                &[
+                    "new_device",
+                    "returned",
+                    "went_offline",
+                    "person_arrived",
+                    "person_departed",
+                ],
+                ClassDelivery::Push,
+                true,
+            ),
+        ),
+    ])
+}
+
+/// Event types that are never delivered whatever their class, so leaving them
+/// out of every class is not worth a warning.
+const NEVER_DELIVERED: [EventType; 4] = [
+    EventType::IpChanged,
+    EventType::NameUpdated,
+    EventType::DeviceLocationChanged,
+    EventType::PersonLocationChanged,
+];
+
+impl NotifyConfig {
+    /// The classes in force: the configured ones, or the built-in four when the
+    /// configuration names none.
+    #[must_use]
+    pub fn effective_classes(&self) -> BTreeMap<String, AlertClass> {
+        if self.classes.is_empty() {
+            default_classes()
+        } else {
+            self.classes.clone()
+        }
+    }
+
+    /// The class an event type belongs to, by name, with its settings.
+    ///
+    /// A type in no class is `None` when it is not a security type, which means
+    /// `off`. A security type in no class falls back to the class named
+    /// `anomaly`, or to the built-in `anomaly` settings when there is no class
+    /// of that name.
+    #[must_use]
+    pub fn class_of(&self, kind: EventType) -> Option<(String, AlertClass)> {
+        let classes = self.effective_classes();
+        if let Some((name, class)) = classes
+            .iter()
+            .find(|(_, c)| c.event_types.iter().any(|t| t == kind.as_str()))
+        {
+            return Some((name.clone(), class.clone()));
+        }
+        if !kind.is_security() {
+            return None;
+        }
+        let fallback = classes
+            .get(FALLBACK_SECURITY_CLASS)
+            .cloned()
+            .or_else(|| default_classes().remove(FALLBACK_SECURITY_CLASS))?;
+        Some((FALLBACK_SECURITY_CLASS.to_string(), fallback))
+    }
+
+    /// Whether an approved device stays quiet about this event type.
+    #[must_use]
+    pub fn approved_quiet(&self, kind: EventType) -> bool {
+        self.approved_quiet_types.iter().any(|t| t == kind.as_str())
+    }
+
+    /// Warnings about the class table that do not stop the daemon: each event
+    /// type that could be delivered but is in no class, and what happens to it
+    /// instead.
+    #[must_use]
+    pub fn class_warnings(&self) -> Vec<String> {
+        let classes = self.effective_classes();
+        let mut out = Vec::new();
+        for kind in EventType::ALL {
+            if NEVER_DELIVERED.contains(&kind)
+                || classes
+                    .values()
+                    .any(|c| c.event_types.iter().any(|t| t == kind.as_str()))
+            {
+                continue;
+            }
+            if kind.is_security() {
+                out.push(format!(
+                    "event type {kind} is in no notify class; it falls back to the \
+                     {FALLBACK_SECURITY_CLASS} class"
+                ));
+            } else {
+                out.push(format!(
+                    "event type {kind} is in no notify class, so it is never delivered"
+                ));
+            }
+        }
+        out
+    }
+
+    /// Rejects a class table that cannot mean anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown event type, a type in two classes, a
+    /// zero pooling period, or an always-alert type in
+    /// `approved_quiet_types`.
+    pub fn validate(&self) -> Result<()> {
+        let mut owner: BTreeMap<&str, &str> = BTreeMap::new();
+        for (name, class) in &self.classes {
+            for t in &class.event_types {
+                if EventType::from_name(t).is_none() {
+                    bail!("notify.classes.{name}.event_types names unknown event type {t:?}");
+                }
+                if let Some(other) = owner.insert(t.as_str(), name.as_str())
+                    && other != name
+                {
+                    bail!(
+                        "event type {t:?} is in two notify classes, {other} and {name}; \
+                         a type belongs to one class"
+                    );
+                }
+            }
+            for (key, value) in [
+                ("pool_period", class.pool_period),
+                ("backoff_period", class.backoff_period),
+                ("quiet_reset", class.quiet_reset),
+            ] {
+                if value.as_secs() == 0 {
+                    bail!("notify.classes.{name}.{key} must be at least 1s");
+                }
+            }
+        }
+        for t in &self.approved_quiet_types {
+            let Some(kind) = EventType::from_name(t) else {
+                bail!("notify.approved_quiet_types names unknown event type {t:?}");
+            };
+            if ALWAYS_ALERT_TYPES.contains(&kind) {
+                bail!(
+                    "notify.approved_quiet_types cannot list {t}: it alerts whatever the \
+                     device's state"
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1012,10 +1293,14 @@ impl Default for GratuitousArpConfig {
 
 /// How security events are delivered.
 ///
-/// Security events are not device-lifecycle events and the dispatcher's rules
-/// for the latter are wrong for them. A rate limit that holds "somebody is
-/// poisoning your ARP table" for five minutes because the same device was
-/// mentioned recently is not a rate limit, it is a failure.
+/// Since alert classes, security events go through the class rules like every
+/// other event: the class decides push or digest, pooling, and whether quiet
+/// hours apply (see `notify.classes`). What is left here is the switch for all
+/// of them and the priority they are pushed at.
+///
+/// The three `bypass_*` keys are still accepted so that an existing
+/// `netgrasp.toml` keeps loading, and have no effect; loading one logs a
+/// warning naming it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SecurityNotifyConfig {
@@ -1024,12 +1309,15 @@ pub struct SecurityNotifyConfig {
     pub enabled: bool,
     /// Priority to deliver them at, when the transport understands priority.
     pub priority: crate::types::EventPriority,
-    /// Deliver during quiet hours.
-    pub bypass_quiet_hours: bool,
-    /// Ignore the per-device debounce.
-    pub bypass_debounce: bool,
-    /// Deliver immediately rather than waiting for the batch window to close.
-    pub bypass_batch_window: bool,
+    /// No longer has any effect: `respect_quiet_hours` on the class decides.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bypass_quiet_hours: Option<bool>,
+    /// No longer has any effect: class pooling limits repeats instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bypass_debounce: Option<bool>,
+    /// No longer has any effect: every pushed alert shares the batch window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bypass_batch_window: Option<bool>,
 }
 
 impl Default for SecurityNotifyConfig {
@@ -1037,10 +1325,31 @@ impl Default for SecurityNotifyConfig {
         SecurityNotifyConfig {
             enabled: true,
             priority: crate::types::EventPriority::Urgent,
-            bypass_quiet_hours: true,
-            bypass_debounce: true,
-            bypass_batch_window: true,
+            bypass_quiet_hours: None,
+            bypass_debounce: None,
+            bypass_batch_window: None,
         }
+    }
+}
+
+impl SecurityNotifyConfig {
+    /// One warning per retired `bypass_*` key that is set.
+    #[must_use]
+    pub fn retired_key_warnings(&self) -> Vec<String> {
+        [
+            ("bypass_quiet_hours", self.bypass_quiet_hours),
+            ("bypass_debounce", self.bypass_debounce),
+            ("bypass_batch_window", self.bypass_batch_window),
+        ]
+        .into_iter()
+        .filter(|(_, v)| v.is_some())
+        .map(|(key, _)| {
+            format!(
+                "security.notifications.{key} no longer has any effect; \
+                 notify.classes decides how security alerts are delivered"
+            )
+        })
+        .collect()
     }
 }
 
@@ -1420,6 +1729,9 @@ impl Config {
             .extract()
             .context("failed to assemble configuration")?;
         config.validate()?;
+        for warning in config.warnings() {
+            tracing::warn!("{warning}");
+        }
         Ok((config, source))
     }
 
@@ -1448,6 +1760,15 @@ impl Config {
         hide(&mut unifi.username);
         hide(&mut unifi.password);
         hide(&mut unifi.api_key);
+        out
+    }
+
+    /// What is worth a warning at load but does not stop the daemon: an event
+    /// type in no notify class, and a retired key that is still set.
+    #[must_use]
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = self.notify.class_warnings();
+        out.extend(self.security.notifications.retired_key_warnings());
         out
     }
 
@@ -1499,6 +1820,7 @@ impl Config {
                 bail!("notify.ntfy.server is empty");
             }
         }
+        self.notify.validate()?;
         self.capture.unknown_sample.validate()?;
         self.security.validate()?;
         self.enrichment.unifi.validate()?;
@@ -2055,5 +2377,266 @@ mod tests {
             ClockTime::try_from("07:05".to_string()).expect("valid"),
             ClockTime { hour: 7, minute: 5 }
         );
+    }
+
+    #[test]
+    fn with_no_classes_configured_the_four_built_in_classes_apply() {
+        let notify = NotifyConfig::default();
+        assert!(
+            notify.classes.is_empty(),
+            "the defaults live outside the file layers"
+        );
+        let class = |kind: EventType| notify.class_of(kind).map(|(name, c)| (name, c.delivery));
+        let push = ClassDelivery::Push;
+        assert_eq!(class(EventType::ArpSpoof), Some(("intrusion".into(), push)));
+        assert_eq!(
+            class(EventType::RogueDhcp),
+            Some(("intrusion".into(), push))
+        );
+        assert_eq!(class(EventType::ArpScan), Some(("anomaly".into(), push)));
+        assert_eq!(class(EventType::IpConflict), Some(("anomaly".into(), push)));
+        let digest = ClassDelivery::Digest;
+        assert_eq!(
+            class(EventType::IdentityChange),
+            Some(("identity".into(), digest))
+        );
+        assert_eq!(
+            class(EventType::GratuitousArp),
+            Some(("identity".into(), digest))
+        );
+        for kind in [
+            EventType::NewDevice,
+            EventType::Returned,
+            EventType::WentOffline,
+            EventType::PersonArrived,
+            EventType::PersonDeparted,
+        ] {
+            assert_eq!(class(kind), Some(("presence".into(), push)), "{kind}");
+        }
+        assert_eq!(class(EventType::IpChanged), None, "informational is off");
+        let classes = notify.effective_classes();
+        assert!(!classes["intrusion"].respect_quiet_hours);
+        for name in ["anomaly", "identity", "presence"] {
+            assert!(classes[name].respect_quiet_hours, "{name}");
+        }
+        let anomaly = &classes["anomaly"];
+        assert_eq!(anomaly.instant_count, 3);
+        assert_eq!(anomaly.pool_period.to_human(), "1h");
+        assert_eq!(anomaly.backoff_after.to_human(), "1d");
+        assert_eq!(anomaly.backoff_period.to_human(), "1d");
+        assert_eq!(anomaly.quiet_reset.to_human(), "1h");
+        assert_eq!(String::from(notify.digest_time), "08:00");
+        assert_eq!(
+            notify.approved_quiet_types,
+            ["identity_change", "gratuitous_arp", "ip_conflict"]
+        );
+        assert!(
+            notify.class_warnings().is_empty(),
+            "{:?}",
+            notify.class_warnings()
+        );
+    }
+
+    #[test]
+    fn a_custom_class_replaces_the_built_in_table() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "netgrasp.toml",
+                r#"
+                [notify]
+                digest_time = "07:30"
+                [notify.classes.loud]
+                event_types = ["arp_spoof", "rogue_dhcp", "arp_scan"]
+                delivery = "push"
+                instant_count = 1
+                pool_period = "30m"
+                respect_quiet_hours = false
+                [notify.classes.quiet]
+                event_types = ["identity_change", "gratuitous_arp", "ip_conflict", "new_device"]
+                delivery = "digest"
+                "#,
+            )?;
+            let config = Config::load(None, &[]).expect("load");
+            let notify = &config.notify;
+            assert_eq!(notify.classes.len(), 2, "only what the file names");
+            let (name, loud) = notify.class_of(EventType::ArpScan).expect("classified");
+            assert_eq!(name, "loud");
+            assert_eq!(loud.instant_count, 1);
+            assert_eq!(loud.pool_period.as_secs(), 1800);
+            assert_eq!(
+                loud.backoff_after.as_secs(),
+                86_400,
+                "unset keys take defaults"
+            );
+            assert!(!loud.respect_quiet_hours);
+            let (name, quiet) = notify.class_of(EventType::NewDevice).expect("classified");
+            assert_eq!(
+                (name.as_str(), quiet.delivery),
+                ("quiet", ClassDelivery::Digest)
+            );
+            assert_eq!(
+                notify.class_of(EventType::Returned),
+                None,
+                "returned is in none"
+            );
+            assert_eq!(String::from(notify.digest_time), "07:30");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn a_type_in_two_classes_is_rejected_at_load() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "netgrasp.toml",
+                r#"
+                [notify.classes.a]
+                event_types = ["arp_scan"]
+                [notify.classes.b]
+                event_types = ["arp_scan", "arp_spoof"]
+                "#,
+            )?;
+            let err = Config::load(None, &[]).expect_err("two classes");
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("\"arp_scan\" is in two notify classes, a and b"),
+                "{message}"
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn a_class_naming_an_unknown_type_or_a_zero_period_is_rejected() {
+        let mut notify = NotifyConfig::default();
+        notify.classes.insert(
+            "x".into(),
+            AlertClass {
+                event_types: vec!["arp_scam".into()],
+                ..AlertClass::default()
+            },
+        );
+        assert!(format!("{:#}", notify.validate().expect_err("unknown")).contains("arp_scam"));
+        notify.classes.insert(
+            "x".into(),
+            AlertClass {
+                event_types: vec!["arp_scan".into()],
+                pool_period: HumanDuration::from_secs(0),
+                ..AlertClass::default()
+            },
+        );
+        assert!(
+            format!("{:#}", notify.validate().expect_err("zero"))
+                .contains("notify.classes.x.pool_period")
+        );
+    }
+
+    #[test]
+    fn an_unclassified_security_type_falls_back_to_anomaly_with_a_warning() {
+        let mut notify = NotifyConfig::default();
+        notify.classes.insert(
+            "anomaly".into(),
+            AlertClass {
+                event_types: vec!["arp_scan".into()],
+                instant_count: 5,
+                ..AlertClass::default()
+            },
+        );
+        notify.classes.insert(
+            "presence".into(),
+            AlertClass {
+                event_types: ["new_device", "returned", "went_offline", "person_arrived"]
+                    .map(String::from)
+                    .to_vec(),
+                ..AlertClass::default()
+            },
+        );
+        let (name, class) = notify.class_of(EventType::ArpSpoof).expect("falls back");
+        assert_eq!(name, "anomaly");
+        assert_eq!(class.instant_count, 5, "the configured anomaly class");
+        let warnings = notify.class_warnings();
+        for kind in [
+            "arp_spoof",
+            "rogue_dhcp",
+            "ip_conflict",
+            "identity_change",
+            "gratuitous_arp",
+        ] {
+            assert!(
+                warnings.iter().any(|w| w.contains(&format!(
+                    "event type {kind} is in no notify class; it falls back to the anomaly class"
+                ))),
+                "{kind}: {warnings:?}"
+            );
+        }
+        assert!(
+            warnings.iter().any(|w| w
+                == "event type person_departed is in no notify class, so it is never delivered"),
+            "{warnings:?}"
+        );
+        assert_eq!(
+            warnings.len(),
+            6,
+            "never-delivered types are not warned about: {warnings:?}"
+        );
+
+        // With no class named anomaly, the built-in anomaly settings apply.
+        notify.classes.remove("anomaly");
+        let (name, class) = notify.class_of(EventType::ArpScan).expect("falls back");
+        assert_eq!((name.as_str(), class.instant_count), ("anomaly", 3));
+    }
+
+    #[test]
+    fn arp_spoof_and_rogue_dhcp_cannot_be_quiet_for_an_approved_device() {
+        for kind in ["arp_spoof", "rogue_dhcp"] {
+            let notify = NotifyConfig {
+                approved_quiet_types: vec![kind.into()],
+                ..NotifyConfig::default()
+            };
+            let message = format!("{:#}", notify.validate().expect_err(kind));
+            assert!(message.contains("whatever the device's state"), "{message}");
+        }
+    }
+
+    #[test]
+    fn the_retired_security_bypass_keys_still_load_and_warn() {
+        // The live netgrasp.toml sets all three; refusing it would stop the
+        // daemon on upgrade.
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "netgrasp.toml",
+                "[security.notifications]\nbypass_quiet_hours = true\n\
+                 bypass_debounce = true\nbypass_batch_window = true\n",
+            )?;
+            let config = Config::load(None, &[]).expect("still loads");
+            let warnings = config.warnings();
+            assert_eq!(warnings.len(), 3, "{warnings:?}");
+            assert!(warnings[0].contains("security.notifications.bypass_quiet_hours"));
+            Ok(())
+        });
+        assert!(Config::default().warnings().is_empty());
+    }
+
+    #[test]
+    fn the_documented_sample_block_is_exactly_the_built_in_table() {
+        // The block README and ARCHITECTURE show, and the commented-out block in
+        // netgrasp.toml.example with its comment markers taken off.
+        let example = include_str!("../netgrasp.toml.example");
+        let start = example
+            .find("# [notify.classes.intrusion]")
+            .expect("the example has the class block");
+        let block: String = example[start..]
+            .lines()
+            .take_while(|line| line.starts_with('#'))
+            .map(|line| line.trim_start_matches('#').trim_start())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Jail::expect_with(|jail| {
+            jail.create_file("netgrasp.toml", &format!("[notify]\n{block}\n"))?;
+            let config = Config::load(None, &[]).expect("the sample loads");
+            assert_eq!(config.notify.classes, default_classes());
+            assert!(config.warnings().is_empty(), "{:?}", config.warnings());
+            Ok(())
+        });
     }
 }

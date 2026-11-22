@@ -295,6 +295,7 @@ async fn an_arrival_reaches_ntfy_in_words() {
         baseline: false,
         during_learning: false,
         notify: true,
+        approved: false,
         priority: netgraspd::types::EventPriority::Normal,
         details: serde_json::json!({
             "person": "Jamie",

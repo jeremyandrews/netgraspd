@@ -128,6 +128,13 @@ pub struct DeviceEvent {
     /// Off until a person turns it on: a device nobody has chosen comes and
     /// goes without an alert.
     pub notify: bool,
+    /// True when a person has vouched for the device: it has an owner (from
+    /// `ng_devices.owner_item_id` or a `[[people]]` entry), a name a person gave
+    /// it (`ng_devices.display_name`), or its `notify` turned on. An approved
+    /// device raises no alert for the types in `notify.approved_quiet_types`.
+    /// The learned baseline does not count: it is what Netgrasp saw first, not
+    /// something anybody chose.
+    pub approved: bool,
     /// How loudly to deliver this, when the transport understands priority.
     pub priority: EventPriority,
     /// Structured detail for `ng_events.details`.
@@ -356,6 +363,9 @@ struct Entry {
     current_location: Option<String>,
     baseline: bool,
     notify: bool,
+    /// Whether somebody owns the device, by the people registry; see
+    /// [`Manager::set_owned`].
+    owned: bool,
     /// How many times this device has been seen to go offline **since the
     /// daemon started**. The behavioural classifier reads it, and it is not
     /// persisted: a restart resets it to zero, which makes the weakest
@@ -366,6 +376,16 @@ struct Entry {
 }
 
 impl Entry {
+    /// Whether a person has vouched for this device; see [`DeviceEvent::approved`].
+    fn approved(&self) -> bool {
+        self.owned
+            || self.notify
+            || self
+                .display_name
+                .as_deref()
+                .is_some_and(|name| !name.trim().is_empty())
+    }
+
     fn snapshot(&self) -> DeviceSnapshot {
         DeviceSnapshot {
             mac: self.mac,
@@ -735,6 +755,9 @@ pub struct Manager {
     /// When each MAC last sent mDNS proving it speaks for other hosts; see
     /// [`SPOKE_FOR_OTHERS_MEMORY`].
     spoke_for_others: HashMap<MacAddr, Timestamp>,
+    /// The MACs somebody owns, by the people registry; see
+    /// [`Manager::set_owned`].
+    owned: HashSet<MacAddr>,
 }
 
 impl Manager {
@@ -750,6 +773,7 @@ impl Manager {
             unattributed_claims: 0,
             host_aliases: HashSet::new(),
             spoke_for_others: HashMap::new(),
+            owned: HashSet::new(),
         }
     }
 
@@ -985,6 +1009,7 @@ impl Manager {
                     current_location: record.current_location.filter(|_| placed),
                     baseline: record.baseline,
                     notify: record.notify,
+                    owned: self.owned.contains(&record.mac),
                     offline_transitions: 0,
                     observations_since_flush: 0,
                     dirty: false,
@@ -1031,6 +1056,20 @@ impl Manager {
             }
         }
         changes
+    }
+
+    /// Tells the manager which devices somebody owns: the people registry's
+    /// whole ownership map, from `ng_devices.owner_item_id` and from
+    /// `[[people]]`. A complete set rather than a delta, so a device whose owner
+    /// was removed stops counting as owned.
+    ///
+    /// Ownership is one of the ways a device counts as approved; see
+    /// [`DeviceEvent::approved`].
+    pub fn set_owned(&mut self, owned: impl IntoIterator<Item = MacAddr>) {
+        self.owned = owned.into_iter().collect();
+        for entry in self.devices.values_mut() {
+            entry.owned = self.owned.contains(&entry.mac);
+        }
     }
 
     /// One device's lifecycle state and last sighting, when it is known.
@@ -1172,6 +1211,7 @@ impl Manager {
                 baseline: entry.baseline,
                 during_learning: learning,
                 notify: entry.notify,
+                approved: entry.approved(),
                 priority: EventPriority::Normal,
                 details: json!({ "source": obs.source, "interface": obs.interface }),
             })));
@@ -1220,6 +1260,7 @@ impl Manager {
                         baseline: entry.baseline,
                         during_learning: learning,
                         notify: entry.notify,
+                        approved: entry.approved(),
                         priority: EventPriority::Normal,
                         details: json!({
                             "previous_ip": previous,
@@ -1271,6 +1312,7 @@ impl Manager {
                 baseline: entry.baseline,
                 during_learning: learning,
                 notify: entry.notify,
+                approved: entry.approved(),
                 priority: EventPriority::Normal,
                 details: json!({
                     "previous_name": previous.display_name,
@@ -1341,12 +1383,14 @@ impl Manager {
             // The column default. Nobody has chosen this device yet, so it
             // comes and goes without an alert until somebody turns it on.
             notify: false,
+            owned: self.owned.contains(&obs.mac),
             offline_transitions: 0,
             observations_since_flush: 0,
             dirty: true,
         };
         let vendor = entry.best(SignalKind::Vendor);
         let snapshot = entry.snapshot();
+        let approved = entry.approved();
         let learning = self.learning;
         self.devices.insert(obs.mac, entry);
 
@@ -1376,6 +1420,7 @@ impl Manager {
             during_learning: learning,
             // Recorded as it is; a new device is delivered whatever it says.
             notify: false,
+            approved,
             priority: EventPriority::Normal,
             details: json!({
                 "source": obs.source,
@@ -1419,6 +1464,7 @@ impl Manager {
                 baseline: entry.baseline,
                 during_learning: learning,
                 notify: entry.notify,
+                approved: entry.approved(),
                 priority: EventPriority::Normal,
                 details: json!({
                     "previous_name": previous.display_name,
@@ -1514,6 +1560,7 @@ impl Manager {
                 baseline: entry.baseline,
                 during_learning: learning,
                 notify: entry.notify,
+                approved: entry.approved(),
                 priority: EventPriority::Normal,
                 details,
             })),
@@ -1555,6 +1602,7 @@ impl Manager {
             // knowing; the window is about which *devices* are normal.
             during_learning: false,
             notify: event.notify,
+            approved: entry.is_some_and(Entry::approved),
             priority: EventPriority::Normal,
             details,
         }))]
@@ -1602,6 +1650,7 @@ impl Manager {
             // Never suppressed by a learning window; see DeviceEvent::deliverable.
             during_learning: false,
             notify: true,
+            approved: entry.is_some_and(Entry::approved),
             priority: alert.priority,
             details,
         }))]
@@ -1653,6 +1702,7 @@ impl Manager {
                     baseline: entry.baseline,
                     during_learning: self.learning,
                     notify: entry.notify,
+                    approved: entry.approved(),
                     priority: EventPriority::Normal,
                     details: json!({
                         "last_seen_at": entry.last_seen_at,
@@ -1764,9 +1814,46 @@ mod tests {
             baseline: false,
             during_learning: false,
             notify: true,
+            approved: false,
             priority: EventPriority::Normal,
             details,
         }
+    }
+
+    #[test]
+    fn a_device_counts_as_approved_once_somebody_owns_names_or_chose_it() {
+        let alert_for = |m: &Manager| {
+            let alert = crate::analyze::SecurityAlert::new(
+                EventType::GratuitousArp,
+                mac("3c:22:fb:00:00:01"),
+                at(10),
+                EventPriority::High,
+                json!({}),
+            );
+            event(&m.security_event(&alert), EventType::GratuitousArp)
+        };
+        let mut m = Manager::new(config(), false);
+        let _ = m.observe(&obs_at("3c:22:fb:00:00:01", Some("192.168.1.10"), at(0)));
+        assert!(!alert_for(&m).approved, "new, unowned, unnamed, notify off");
+
+        // An owner, from the people registry.
+        m.set_owned([mac("3c:22:fb:00:00:01")]);
+        assert!(alert_for(&m).approved);
+        m.set_owned([]);
+        assert!(!alert_for(&m).approved, "ownership removed");
+
+        // A name a person gave it.
+        m.devices
+            .get_mut(&mac("3c:22:fb:00:00:01"))
+            .expect("known")
+            .display_name = Some("Studio".into());
+        assert!(alert_for(&m).approved);
+
+        // The learned baseline alone is not approval.
+        let mut m = Manager::new(config(), true);
+        let _ = m.observe(&obs_at("3c:22:fb:00:00:01", Some("192.168.1.10"), at(0)));
+        let e = alert_for(&m);
+        assert!(e.baseline && !e.approved);
     }
 
     #[test]
