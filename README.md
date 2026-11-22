@@ -25,13 +25,15 @@ suite asserts it.
 
 ## Status
 
-Version 1.1.0. 1.0.0 was milestone 3, which closes v1, plus the reconcile tick
-that makes an edit in Trovato reach a running daemon. 1.1.0 adds delivery status
-and a test alert the web side can ask for, the profile and `export` for a
-network you do not own, schema version 5 (which only adds), and the fixes from
-running on a real home network. `CHANGELOG.md` has the history and the
-versioning rule, which from 1.0.0 is semantic versioning over the command line,
-the configuration file and the `ng_` schema.
+Version 1.2.0. 1.0.0 was milestone 3, which closes v1, plus the reconcile tick
+that makes an edit in Trovato reach a running daemon. 1.1.0 added delivery
+status and a test alert the web side can ask for, the profile and `export` for a
+network you do not own, and schema version 5. 1.2.0 makes alerts safe to switch
+on (alert classes, pooling per source, `notify` off by default), makes presence
+opt in, quietens the ARP detectors and device names, and brings schema versions
+6 and 7. `CHANGELOG.md` has the history and the versioning rule, which from
+1.0.0 is semantic versioning over the command line, the configuration file and
+the `ng_` schema.
 
 **No real UniFi controller has ever been contacted**, and the daemon has not yet
 run unattended on a real network for longer than an evening. Read
@@ -96,23 +98,23 @@ and point `database.url` at it:
 ### The image
 
 ```sh
-docker pull ghcr.io/jeremyandrews/netgraspd:1.1.0
+docker pull ghcr.io/jeremyandrews/netgraspd:1.2.0
 
 # The example configuration ships inside the image.
-docker run --rm --entrypoint cat ghcr.io/jeremyandrews/netgraspd:1.1.0 \
+docker run --rm --entrypoint cat ghcr.io/jeremyandrews/netgraspd:1.2.0 \
     /usr/share/netgraspd/netgrasp.toml.example > netgrasp.toml
 $EDITOR netgrasp.toml          # at minimum, database.url
 ```
 
 Then run it as [Docker](#docker) below describes, substituting
-`ghcr.io/jeremyandrews/netgraspd:1.1.0` for the locally built `netgraspd`, or
-with [Compose](#compose). Tags are the version (`1.1.0`), the minor line
-(`1.1`) and `latest`; pin the version.
+`ghcr.io/jeremyandrews/netgraspd:1.2.0` for the locally built `netgraspd`, or
+with [Compose](#compose). Tags are the version (`1.2.0`), the minor line
+(`1.2`) and `latest`; pin the version.
 
 ### The binary, under systemd
 
 ```sh
-v=1.1.0
+v=1.2.0
 arch=x86_64-unknown-linux-gnu          # or aarch64-unknown-linux-gnu
 base=https://github.com/jeremyandrews/netgraspd/releases/download/v$v
 curl -fLO "$base/netgraspd-$v-$arch"
@@ -172,6 +174,7 @@ have to agree on one thing, the `ng_` tables.
 
 | netgraspd | netgrasp-trovato | `ng_` schema | Trovato kernel |
 |---|---|---|---|
+| 1.2.0 | 1.2.0 | version 7 (`V7__presence_opt_in.sql`) | 0.102.0 or a later 0.x |
 | 1.1.0 | 1.1.0 | version 5 (`V5__people_epochs_event_person_daemon_status.sql`) | 0.102.0 or a later 0.x |
 | 1.0.0 | 1.0.0 | version 3 (`V3__enrichment_location_people.sql`) | 0.102.0 or a later 0.x |
 
@@ -180,11 +183,14 @@ Alerts page and its Send test) and none of version 5's yet; it names the columns
 it reads, so it runs on version 5 unchanged, and a plugin built for version 3
 keeps working too. Migrate the daemon to 1.1.0 first, then upgrade the plugin.
 
-Version 6 (unreleased) adds no table and no column: it changes
+Versions 6 and 7 rename, drop and retype nothing. Version 6 changes
 `ng_devices.notify` to `DEFAULT FALSE` and sets it `FALSE` on every existing
-device. Every column keeps its name, type and nullability, so plugin 1.1.0 runs
-on it unchanged. The plugin's test fixture, `daemon_schema.sql`, still declares
-`DEFAULT TRUE`; bringing it up to date is a follow up on the plugin side.
+device. Version 7 adds `ng_devices.counts_for_presence`,
+`ng_people.track_presence` and `ng_daemon_status.presence_tracking`, makes
+`untracked` the default of `ng_people.state` and sets every existing person to
+it. Plugin 1.2.0 is built for version 7: it writes the two presence settings
+and shows an untracked person as "Not tracked", where an older plugin would
+show them as away. Migrate the daemon to 1.2.0 first, then upgrade the plugin.
 
 **The rule.** A daemon and a plugin pair when they are built for the same `ng_`
 schema version, which is the highest migration under `migrations/` here.
@@ -815,7 +821,7 @@ netgrasp_trip` and delete the run directory. Nothing else was written.
   capability, the trip directory mounted as the working directory so the
   relative paths land in it. The profile and `export` are in 1.1.0 and later.
   `netgraspd` below is a local tag: `docker pull
-  ghcr.io/jeremyandrews/netgraspd:1.1.0` and `docker tag` it, or build one from
+  ghcr.io/jeremyandrews/netgraspd:1.2.0` and `docker tag` it, or build one from
   this repository (`docker build -t netgraspd .`, as in [Docker](#docker)):
 
   ```sh
