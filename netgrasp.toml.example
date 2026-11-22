@@ -128,7 +128,8 @@ duration = "5m"
 [notify]
 enabled = true
 
-# Minimum gap between two notifications about the same device.
+# Minimum gap between two notifications about the same device coming or going.
+# Security events are not debounced: their class pools them instead.
 debounce = "5m"
 
 # Events are held for batch_window; a window that accumulated at least
@@ -149,10 +150,63 @@ batch_window = "60s"
 # - ip_changed, name_updated and device_location_changed are recorded and never
 #   delivered, whether they are listed here or not.
 #
-# Security events are NOT governed by this list. They are governed by
-# [security.notifications] below, so that a missing entry here cannot silently
-# disable them.
+# Security and person events are NOT governed by this list. Their class below
+# governs them, so that a missing entry here cannot silently disable them.
 event_types = ["new_device", "returned", "went_offline"]
+
+# When the daily digest of every digest class goes out, local time.
+digest_time = "08:00"
+
+# A device counts as approved when it has an owner (from Trovato or a
+# [[people]] entry), a name a person gave it, or its notify turned on. The
+# learned baseline does not count. An approved device never alerts for these
+# types; they are still recorded. arp_spoof and rogue_dhcp cannot be listed:
+# they alert whatever the device's state.
+approved_quiet_types = ["identity_change", "gratuitous_arp", "ip_conflict"]
+
+# Alert classes. Each event type belongs to one class, and the class decides:
+#
+# - delivery: "push" to the phone, "digest" (counted, then one message a day at
+#   digest_time listing counts by class, type and source) or "off".
+# - Pooling per source, that is per class, event type and MAC: the first
+#   instant_count alerts go out at once, the last of them saying "More alerts
+#   like this from d0:21:f9:dc:a1:19 will be pooled: one summary every hour."
+#   Then one summary per pool_period. A source that repeats for backoff_after
+#   without a gap of quiet_reset slows to one summary per backoff_period, and
+#   the summary that switches says so. A gap of quiet_reset starts it over.
+#   instant_count = 0 pools from the first event.
+# - respect_quiet_hours: false means it delivers inside quiet hours too.
+#
+# Pooling state is in memory: a restart resets it, so an active source can send
+# up to instant_count instant alerts again after a restart.
+#
+# Leave these commented out and exactly this table applies. Naming any class
+# replaces the whole table. A type in two classes stops the daemon. A type in
+# no class is off, except a security type, which falls back to anomaly; both
+# log a warning at startup.
+#
+# [notify.classes.intrusion]
+# event_types = ["arp_spoof", "rogue_dhcp"]
+# delivery = "push"
+# respect_quiet_hours = false
+#
+# [notify.classes.anomaly]
+# event_types = ["arp_scan", "ip_conflict"]
+# delivery = "push"
+# instant_count = 3
+# pool_period = "1h"
+# backoff_after = "24h"
+# backoff_period = "24h"
+# quiet_reset = "1h"
+# respect_quiet_hours = true
+#
+# [notify.classes.identity]
+# event_types = ["identity_change", "gratuitous_arp"]
+# delivery = "digest"
+#
+# [notify.classes.presence]
+# event_types = ["new_device", "returned", "went_offline", "person_arrived", "person_departed"]
+# delivery = "push"
 
 # Optional. Local time, and the period may wrap midnight.
 # [notify.quiet_hours]
@@ -275,13 +329,9 @@ enabled = true
 # normal, high or urgent. Maps onto notify.ntfy.priority and urgent_priority.
 priority = "urgent"
 
-# The dispatcher's rate limiting exists to stop a monitor being annoying about
-# devices coming and going. Applied to an attack in progress it stops being rate
-# limiting and becomes a failure, so security events bypass it by default. Turn
-# these off if you run a noisy lab and would rather have them batched.
-bypass_quiet_hours = true
-bypass_debounce = true
-bypass_batch_window = true
+# How each security type is delivered is decided by its class under
+# [notify.classes]. The old bypass_quiet_hours, bypass_debounce and
+# bypass_batch_window keys are still accepted, do nothing, and log a warning.
 
 # ---------------------------------------------------------------------------
 # Enrichment: the facts passive capture cannot see.

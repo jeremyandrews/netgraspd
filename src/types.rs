@@ -685,7 +685,7 @@ impl fmt::Display for EventPriority {
 /// single test for that, and everything downstream that treats them differently
 /// (priority, quiet-hours bypass, learning-window suppression) asks it rather
 /// than keeping its own list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventType {
     /// A MAC never seen before appeared.
@@ -781,6 +781,13 @@ impl EventType {
                 | EventType::IpConflict
                 | EventType::GratuitousArp
         )
+    }
+
+    /// The event type an `ng_events.event_type` string names, or `None` for a
+    /// string that names none.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        EventType::ALL.into_iter().find(|t| t.as_str() == name)
     }
 
     /// Every event type, for exhaustiveness tests.

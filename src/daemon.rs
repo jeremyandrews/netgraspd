@@ -169,6 +169,7 @@ pub async fn run(
         let registry = build_registry(&client, config, &records).await;
         let learning = opts.learn || (config.learning.on_first_run && count == 0);
         let mut manager = Manager::new(config.state.clone(), learning);
+        manager.set_owned(registry.owned_macs());
         manager.restore(records, signals);
         (manager, persister, registry, count)
     };
@@ -1225,6 +1226,7 @@ pub async fn reconcile_user_state(db: &Db, manager: &mut Manager, registry: &mut
         .map(|setting| (setting.mac, setting.owner_item_id.clone()))
         .collect();
     let changes = registry.reconcile(people, &owners);
+    manager.set_owned(registry.owned_macs());
     for change in &changes {
         match change {
             people::RegistryChange::PersonAdded { item_id, name } => {
@@ -1485,6 +1487,11 @@ fn after_learning_notice(notify: &crate::config::NotifyConfig) -> &'static str {
         "New devices from now on are recorded; no notifier is configured to deliver them."
     } else if !notify.event_types.iter().any(|t| t == "new_device") {
         "New devices from now on are recorded; new_device is not in notify.event_types."
+    } else if notify
+        .class_of(crate::types::EventType::NewDevice)
+        .is_none_or(|(_, class)| class.delivery != crate::config::ClassDelivery::Push)
+    {
+        "New devices from now on are recorded; new_device is in no push class under notify.classes."
     } else {
         "New devices from now on will notify. A device comes and goes without an alert until its notify is turned on."
     }
@@ -1564,6 +1571,19 @@ mod tests {
 
         notify.event_types = vec!["returned".into()];
         assert!(after_learning_notice(&notify).contains("not in notify.event_types"));
+
+        // Listed, but its class does not push.
+        notify.event_types = vec!["new_device".into()];
+        notify.classes.insert(
+            "presence".into(),
+            crate::config::AlertClass {
+                event_types: vec!["new_device".into()],
+                delivery: crate::config::ClassDelivery::Digest,
+                ..crate::config::AlertClass::default()
+            },
+        );
+        assert!(after_learning_notice(&notify).contains("in no push class"));
+        notify.classes.clear();
 
         notify.event_types = vec!["new_device".into()];
         notify.ntfy = None;
