@@ -168,6 +168,48 @@ pub async fn rebuild_schema(db: &TestDb) {
         .expect("rebuilding the test schema");
 }
 
+/// A scratch database beside the test one, migrated to `version` by this
+/// build's own migrations, as an earlier release would have left it.
+///
+/// For proving an upgrade without disturbing the shared test database. The
+/// caller holds [`test_db`]'s lock, so two of these never race, and drops it
+/// with [`drop_scratch_database`]. `None` when no Postgres is reachable.
+pub async fn scratch_database(name: &str, version: u32) -> Option<String> {
+    let admin = test_url();
+    let (client, connection) = tokio_postgres::connect(&admin, tokio_postgres::NoTls)
+        .await
+        .ok()?;
+    tokio::spawn(connection);
+    // Two statements, not one batch: a multi-statement batch is one implicit
+    // transaction, and DROP DATABASE refuses to run inside one.
+    client
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+        .await
+        .expect("dropping a leftover scratch database");
+    client
+        .batch_execute(&format!("CREATE DATABASE {name}"))
+        .await
+        .expect("creating a scratch database");
+    let (base, _) = admin.rsplit_once('/').expect("a URL with a database name");
+    let url = format!("{base}/{name}");
+    Db::migrate_to(&url, version)
+        .await
+        .expect("migrating the scratch database");
+    Some(url)
+}
+
+/// Drops a database [`scratch_database`] made.
+pub async fn drop_scratch_database(name: &str) {
+    let (admin, connection) = tokio_postgres::connect(&test_url(), tokio_postgres::NoTls)
+        .await
+        .expect("the admin connection");
+    tokio::spawn(connection);
+    admin
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+        .await
+        .expect("dropping the scratch database");
+}
+
 impl TestDb {
     /// Inserts a device directly, returning its id.
     ///

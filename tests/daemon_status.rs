@@ -301,31 +301,6 @@ async fn a_time_zone_postgres_does_not_know_is_refused_by_name() {
     assert!(message.contains("timezone"), "{message}");
 }
 
-/// A scratch database, migrated to `version` by this build's own migrations.
-async fn scratch_database(name: &str, version: u32) -> Option<String> {
-    let admin = common::test_url();
-    let (client, connection) = tokio_postgres::connect(&admin, tokio_postgres::NoTls)
-        .await
-        .ok()?;
-    tokio::spawn(connection);
-    // Two statements, not one batch: a multi-statement batch is one implicit
-    // transaction, and DROP DATABASE refuses to run inside one.
-    client
-        .batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
-        .await
-        .expect("dropping a leftover scratch database");
-    client
-        .batch_execute(&format!("CREATE DATABASE {name}"))
-        .await
-        .expect("creating a scratch database");
-    let (base, _) = admin.rsplit_once('/').expect("a URL with a database name");
-    let url = format!("{base}/{name}");
-    Db::migrate_to(&url, version)
-        .await
-        .expect("migrating the scratch database");
-    Some(url)
-}
-
 #[tokio::test]
 async fn person_events_recorded_before_the_column_existed_are_backfilled() {
     // Holds the shared lock, so it does not race the other tests, and skips
@@ -333,7 +308,7 @@ async fn person_events_recorded_before_the_column_existed_are_backfilled() {
     let Some(_db) = common::test_db().await else {
         return;
     };
-    let Some(url) = scratch_database("netgrasp_backfill_test", 4).await else {
+    let Some(url) = common::scratch_database("netgrasp_backfill_test", 4).await else {
         return;
     };
     let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
@@ -405,7 +380,7 @@ async fn presence_upgrade_from(version: u32) {
         return;
     };
     let name = format!("netgrasp_presence_upgrade_v{version}");
-    let Some(url) = scratch_database(&name, version).await else {
+    let Some(url) = common::scratch_database(&name, version).await else {
         return;
     };
     let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)

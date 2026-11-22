@@ -22,6 +22,14 @@ shipped rather than a release that was tagged at the time.
 
 ## [Unreleased]
 
+### Added
+
+- **Schema V8: three partial indexes on `ng_events`, so the web side's Activity, new devices, Alerts "Recently sent" and deep security pages stop reading the whole event log.** The root cause: no index on `ng_events` covered `event_type` outside the six security types, none covered `notified`, and the security index (`event_type, "timestamp"`) gives security events in time order only one type at a time. So Activity and `/events/new-devices` scanned every row to find the rare ones they list (171 `new_device` events in 4.1 million, 95% of the log `ip_changed`), "Recently sent" scanned every row for `notified`, and a deep `/events/security` page walked the time index past every other event. V8 adds `ng_events_type_time_idx` on `(event_type, "timestamp" DESC) WHERE event_type <> 'ip_changed'`, `ng_events_notified_time_idx` on `("timestamp" DESC) WHERE notified`, and `ng_events_security_time_idx` on `("timestamp" DESC)` over the six security types (asked for by netgrasp-trovato's security pager change). Each is `CREATE INDEX IF NOT EXISTS`, so one an operator built by hand is kept. Nothing else in the schema changes, and the plugin needs no change to use them. On a 4.1 million row copy with the live type mix, the plugin's statements go from 80 to 160 ms each to under 0.2 ms, and page 200 of `/events/security` from 141 ms to 3 ms.
+
+### Upgrade note
+
+- **V8 blocks writes to `ng_events` while it builds, for about half a second per 4 million events.** refinery runs each migration in a transaction, so the indexes cannot be built `CONCURRENTLY`: each `CREATE INDEX` holds a `SHARE` lock on `ng_events` until V8 commits. Reads carry on; inserts and updates wait. The daemon migrates at startup before it records anything, so it loses nothing. Measured on a 4.1 million row copy: 0.56 s for the whole migration (0.19 s, 0.11 s and 0.20 s for the three builds), warm cache. A slower disk or a cold cache costs more, since each build reads the whole table once.
+
 ## [1.2.0] - 2026-11-22
 
 Pairs with netgrasp-trovato 1.2.0 on schema version 7. Migrate the daemon first, then upgrade the plugin.

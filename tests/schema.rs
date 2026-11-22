@@ -1090,3 +1090,274 @@ async fn the_upgrade_turns_notify_off_on_every_existing_device() {
         .await
         .expect("the contract still holds");
 }
+
+// ===========================================================================
+// V8: the event indexes the web side's pages read
+// ===========================================================================
+
+/// The indexes V8 adds, as Postgres reports them in `pg_indexes.indexdef`.
+///
+/// The web side's plan tests name these indexes, so a rename or a changed
+/// predicate here is a broken page there.
+const EVENT_INDEXES: [(&str, &str); 3] = [
+    (
+        "ng_events_type_time_idx",
+        "CREATE INDEX ng_events_type_time_idx ON public.ng_events USING btree \
+         (event_type, \"timestamp\" DESC) WHERE (event_type <> 'ip_changed'::text)",
+    ),
+    (
+        "ng_events_notified_time_idx",
+        "CREATE INDEX ng_events_notified_time_idx ON public.ng_events USING btree \
+         (\"timestamp\" DESC) WHERE notified",
+    ),
+    (
+        "ng_events_security_time_idx",
+        "CREATE INDEX ng_events_security_time_idx ON public.ng_events USING btree \
+         (\"timestamp\" DESC) WHERE (event_type = ANY (ARRAY['arp_scan'::text, \
+         'arp_spoof'::text, 'rogue_dhcp'::text, 'identity_change'::text, \
+         'ip_conflict'::text, 'gratuitous_arp'::text]))",
+    ),
+];
+
+/// Each statement the indexes are for, and the index its plan must read.
+/// Shaped as the web side runs them: Activity's notable types, the new device
+/// list, "Recently sent", and the security log in one time order.
+const INDEXED_READS: [(&str, &str); 4] = [
+    (
+        "SELECT id FROM ng_events
+          WHERE event_type IN ('person_arrived', 'person_departed', 'new_device',
+                               'arp_spoof', 'ip_conflict', 'rogue_dhcp')
+          ORDER BY \"timestamp\" DESC LIMIT 50",
+        "ng_events_type_time_idx",
+    ),
+    (
+        "SELECT id FROM ng_events WHERE event_type = 'new_device'
+          ORDER BY \"timestamp\" DESC LIMIT 100",
+        "ng_events_type_time_idx",
+    ),
+    (
+        "SELECT id FROM ng_events WHERE notified ORDER BY \"timestamp\" DESC LIMIT 20",
+        "ng_events_notified_time_idx",
+    ),
+    (
+        "SELECT id FROM ng_events
+          WHERE event_type IN ('arp_scan', 'arp_spoof', 'rogue_dhcp', 'identity_change',
+                               'ip_conflict', 'gratuitous_arp')
+          ORDER BY \"timestamp\" DESC LIMIT 50 OFFSET 100",
+        "ng_events_security_time_idx",
+    ),
+];
+
+/// The definitions of V8's indexes present in the database `client` is on,
+/// by name. Only valid indexes count: a failed build leaves an invalid one.
+async fn event_indexes(client: &tokio_postgres::Client) -> Vec<(String, String)> {
+    let names: Vec<&str> = EVENT_INDEXES.iter().map(|(name, _)| *name).collect();
+    client
+        .query(
+            "SELECT i.indexname::text, i.indexdef
+               FROM pg_indexes i
+               JOIN pg_class c ON c.relname = i.indexname
+               JOIN pg_index x ON x.indexrelid = c.oid
+              WHERE i.tablename = 'ng_events' AND i.indexname = ANY($1)
+                AND x.indisvalid
+              ORDER BY array_position($1, i.indexname::text)",
+            &[&names],
+        )
+        .await
+        .expect("reading ng_events's indexes")
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect()
+}
+
+/// Asserts every V8 index exists with exactly its definition.
+async fn assert_event_indexes(client: &tokio_postgres::Client) {
+    let expected: Vec<(String, String)> = EVENT_INDEXES
+        .iter()
+        .map(|(name, def)| ((*name).to_string(), (*def).to_string()))
+        .collect();
+    assert_eq!(event_indexes(client).await, expected);
+}
+
+/// The plan of `sql` with sequential scans priced out, so that a handful of
+/// test rows still plan the way millions do: through whichever index serves
+/// the statement best.
+async fn plan_of(client: &mut tokio_postgres::Client, sql: &str) -> String {
+    let tx = client.transaction().await.expect("a transaction");
+    tx.batch_execute("SET LOCAL enable_seqscan = off")
+        .await
+        .expect("pricing out the scan");
+    let plan: Vec<String> = tx
+        .query(&format!("EXPLAIN {sql}"), &[])
+        .await
+        .unwrap_or_else(|err| panic!("EXPLAIN {sql}: {err}"))
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    tx.rollback().await.expect("rolling back");
+    plan.join("\n")
+}
+
+#[tokio::test]
+async fn a_migrated_database_has_the_event_indexes() {
+    let Some(db) = common::test_db().await else {
+        return;
+    };
+    let client = db.client().await;
+    assert_event_indexes(&client).await;
+}
+
+#[test]
+fn the_security_time_index_covers_exactly_the_daemons_security_types() {
+    use netgraspd::types::EventType;
+    let (_, definition) = EVENT_INDEXES[2];
+    for event_type in EventType::ALL {
+        let quoted = format!("'{}'::text", event_type.as_str());
+        assert_eq!(
+            definition.contains(&quoted),
+            event_type.is_security(),
+            "{} and ng_events_security_time_idx disagree",
+            event_type.as_str()
+        );
+    }
+}
+
+/// Proves V8 from a database left at `version`: none of its indexes before,
+/// all of them after, the reads they are for plan onto them, and the daemon's
+/// two writes to `ng_events`, recording an event and marking it notified,
+/// work and are found through them.
+async fn event_index_upgrade_from(version: u32) {
+    let Some(_db) = common::test_db().await else {
+        return;
+    };
+    let name = format!("netgrasp_event_index_upgrade_v{version}");
+    let Some(url) = common::scratch_database(&name, version).await else {
+        return;
+    };
+    let (mut client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .expect("the scratch database");
+    tokio::spawn(connection);
+    assert!(
+        event_indexes(&client).await.is_empty(),
+        "V{version} has none of V8's indexes"
+    );
+    // Rows as the earlier release recorded them: mostly ip_changed.
+    client
+        .batch_execute(
+            "INSERT INTO ng_events (event_type, \"timestamp\", notified)
+                  SELECT 'ip_changed', now() - make_interval(secs => g), FALSE
+                    FROM generate_series(1, 200) g;
+             INSERT INTO ng_events (event_type, \"timestamp\", notified) VALUES
+                 ('new_device', now() - interval '1 hour', TRUE),
+                 ('arp_scan', now() - interval '2 hours', FALSE),
+                 ('returned', now() - interval '3 hours', TRUE);",
+        )
+        .await
+        .expect("seeding events as the earlier release left them");
+
+    Db::migrate(&url).await.expect("the upgrade applies");
+    assert_event_indexes(&client).await;
+    client
+        .batch_execute("ANALYZE ng_events")
+        .await
+        .expect("analyze");
+    for (sql, index) in INDEXED_READS {
+        let plan = plan_of(&mut client, sql).await;
+        assert!(plan.contains(index), "{sql}\n{plan}");
+    }
+
+    // The daemon's writes after the upgrade.
+    let event = queries::NewEvent {
+        device_id: None,
+        event_type: netgraspd::types::EventType::NewDevice,
+        timestamp: Timestamp::now(),
+        details: serde_json::json!({}),
+        notified: false,
+        person_item_id: None,
+    };
+    let new_device = queries::insert_event(&client, &event)
+        .await
+        .expect("recording an event after V8");
+    let ip_changed = queries::insert_event(
+        &client,
+        &queries::NewEvent {
+            event_type: netgraspd::types::EventType::IpChanged,
+            ..event
+        },
+    )
+    .await
+    .expect("recording an ip_changed event after V8");
+    queries::mark_event_notified(&client, new_device)
+        .await
+        .expect("marking an event notified after V8");
+
+    let ids = |rows: Vec<tokio_postgres::Row>| -> Vec<i64> {
+        rows.iter().map(|row| row.get(0)).collect()
+    };
+    let tx = client.transaction().await.expect("a transaction");
+    tx.batch_execute("SET LOCAL enable_seqscan = off")
+        .await
+        .expect("pricing out the scan");
+    let (newest_new_device, _) = INDEXED_READS[1];
+    let found = ids(tx.query(newest_new_device, &[]).await.expect("new devices"));
+    assert_eq!(found.first(), Some(&new_device), "{found:?}");
+    assert!(!found.contains(&ip_changed));
+    let (recently_sent, _) = INDEXED_READS[2];
+    let found = ids(tx.query(recently_sent, &[]).await.expect("recently sent"));
+    assert_eq!(
+        found.len(),
+        3,
+        "the two seeded and the one just sent: {found:?}"
+    );
+    assert_eq!(found.first(), Some(&new_device), "{found:?}");
+    tx.rollback().await.expect("rolling back");
+
+    schema::preflight(&client)
+        .await
+        .expect("the upgraded schema matches the contract");
+    drop(client);
+    common::drop_scratch_database(&name).await;
+}
+
+#[tokio::test]
+async fn the_event_indexes_upgrade_from_the_1_1_0_schema() {
+    event_index_upgrade_from(5).await;
+}
+
+#[tokio::test]
+async fn the_event_indexes_upgrade_from_the_v6_schema() {
+    event_index_upgrade_from(6).await;
+}
+
+#[tokio::test]
+async fn the_event_indexes_upgrade_from_the_1_2_0_schema() {
+    event_index_upgrade_from(7).await;
+}
+
+#[tokio::test]
+async fn the_event_indexes_apply_over_ones_an_operator_built_by_hand() {
+    let Some(_db) = common::test_db().await else {
+        return;
+    };
+    let name = "netgrasp_event_index_by_hand";
+    let Some(url) = common::scratch_database(name, 7).await else {
+        return;
+    };
+    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .expect("the scratch database");
+    tokio::spawn(connection);
+    // An operator who read the web side's note and built one early.
+    client
+        .batch_execute(
+            "CREATE INDEX ng_events_notified_time_idx ON ng_events (\"timestamp\" DESC)
+              WHERE notified",
+        )
+        .await
+        .expect("building one by hand");
+    Db::migrate(&url).await.expect("V8 applies over it");
+    assert_event_indexes(&client).await;
+    drop(client);
+    common::drop_scratch_database(name).await;
+}
