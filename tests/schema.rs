@@ -1042,8 +1042,13 @@ async fn the_upgrade_turns_notify_off_on_every_existing_device() {
     // and every device has it on.
     db.execute("ALTER TABLE ng_devices ALTER COLUMN notify SET DEFAULT TRUE")
         .await;
+    // Every later migration is rewound with it, because refinery refuses a
+    // history with a later version applied and an earlier one not. V7 adds its
+    // columns IF NOT EXISTS and runs again harmlessly.
     db.execute(&format!(
-        "DELETE FROM refinery_schema_history WHERE name = '{NOTIFY_OFF_MIGRATION}'"
+        "DELETE FROM refinery_schema_history
+          WHERE version >= (SELECT version FROM refinery_schema_history
+                             WHERE name = '{NOTIFY_OFF_MIGRATION}')"
     ))
     .await;
     db.seed_device("3c:22:fb:00:00:06", "online").await;

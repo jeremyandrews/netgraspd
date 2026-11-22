@@ -318,9 +318,11 @@ async fn notify_tables_the_plugin_created_first_do_not_stop_the_daemon_migrating
     let Some(db) = common::test_db().await else {
         return;
     };
-    // Back to a V3 site whose plugin already created V4's tables: V5 and V6 are
+    // Back to a V3 site whose plugin already created V4's tables: V5 to V7 are
     // undone first, because refinery refuses a history with a later version
-    // applied and V4 not. V6 created nothing, and runs again harmlessly.
+    // applied and V4 not. V6 created nothing, and runs again harmlessly. V7's
+    // columns are left in place on purpose: the plugin's guarded copy may have
+    // added them first, and V7 must apply over them.
     db.execute(
         "INSERT INTO ng_notify_requests (requested_by) VALUES ('before the upgrade');
          DROP TABLE IF EXISTS ng_enrichment_status, ng_daemon_status;

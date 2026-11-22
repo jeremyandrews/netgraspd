@@ -389,8 +389,8 @@ Who owns which column:
 
 | Table | Daemon writes | Plugin writes |
 |---|---|---|
-| `ng_devices` | identity, state, addresses, location | `display_name`, `notes`, `hidden`, `notify`, `owner_item_id`, `trovato_item_id` |
-| `ng_people` | `state`, `current_location`, `last_arrived_at`, `last_departed_at` | `item_id`, `name`, `notes`, `notify_arrive`, `notify_depart` |
+| `ng_devices` | identity, state, addresses, location | `display_name`, `notes`, `hidden`, `notify`, `owner_item_id`, `counts_for_presence`, `trovato_item_id` |
+| `ng_people` | `state`, `current_location`, `last_arrived_at`, `last_departed_at` | `item_id`, `name`, `notes`, `notify_arrive`, `notify_depart`, `track_presence` |
 | `ng_notify_requests` | `handled_at`, `outcome` | inserts the row (`requested_by`, `requested_at`) |
 | everything else | all of it | nothing |
 
@@ -431,7 +431,9 @@ created is renamed, dropped or retyped. Everything below is daemon owned.
   `details ->> 'person_item_id'` for every person event already recorded, and
   leaves a value that is not a UUID null rather than failing the upgrade.
 - **`ng_daemon_status`**, one row: `version`, `timezone`, `timezone_source`
-  (`config` or `database`), `started_at` and `updated_at`, with epoch twins.
+  (`config` or `database`), `started_at` and `updated_at`, with epoch twins,
+  and `presence_tracking` (V7), the daemon's `presence_tracking` setting, so the
+  web side can say that nobody is tracked because it is off.
   Rewritten every `runtime.status_interval`, so an `updated_at` that has stopped
   moving means the daemon has stopped.
 - **`ng_enrichment_status`**, one row per enricher this build knows (`unifi`,
@@ -561,6 +563,7 @@ The blocks this milestone adds:
 | `[maintenance]` | when the nightly jobs run, and how long presence and events are kept |
 | `[runtime]` | where the daemon publishes the counters `netgraspd stats` reads |
 | `timezone` | top-level key: the IANA zone published in `ng_daemon_status` for day boundaries |
+| `presence_tracking` | top-level key, default `false`: whether anybody's presence is tracked at all; published in `ng_daemon_status.presence_tracking` |
 
 `[enrichment.unifi.locations]` is a TOML table, so it must come after every
 plain key in `[enrichment.unifi]`.
@@ -584,16 +587,38 @@ movement:
 | edge → edge | still outside |
 | nothing → anywhere | unknown; a device already here when the daemon started has not arrived |
 
-The person rules are deliberately simple, because every elaboration anybody has
-tried produces a system that announces you have left the house while you are
-sitting in it:
+**Presence is off unless somebody switches it on**, for the install and for
+each person. A person is **untracked** (no location, never home or away, no
+person events) unless all three hold:
 
-- A person is **home** when any device they own is online.
-- The first owned device online after all were offline is an **arrival**.
-- The last owned device going offline is a **departure**.
-- A person's **location** is that of their most recently active device. Not the
-  first, not an average: the phone in your pocket is talking and the tablet in
-  the drawer is not.
+- the top-level `presence_tracking = true` is set in `netgrasp.toml`;
+- their own `track_presence` is on: "Track whether they are home" on their
+  Trovato person page (`ng_people.track_presence`), or `track_presence = true`
+  in their `[[people]]` entry;
+- they own at least one device that **counts**.
+
+**Only devices a person carries count.** A device counts when it is classified
+as a `phone` or a `wearable`; a laptop, desktop, tablet, TV or a device of
+unknown type does not. `ng_devices.counts_for_presence`, set per device from
+the Trovato device page, overrides that: `TRUE` counts, `FALSE` does not,
+`NULL` decides by type. Before this, every owned device counted alike, so a
+laptop left at home kept its owner home all day and their location followed it.
+
+A change to any of those settings is acted on at the next reconcile tick: the
+person is re-evaluated from the devices that count now and their new state is
+written without an event, because changing a setting is not somebody arriving
+or leaving. A restart re-evaluates everybody the same way, silently.
+
+For a tracked person the rules are deliberately simple, because every
+elaboration anybody has tried produces a system that announces you have left the
+house while you are sitting in it:
+
+- A person is **home** when any device of theirs that counts is online.
+- The first counting device online after all were offline is an **arrival**.
+- The last counting device going offline is a **departure**.
+- A person's **location** is that of their most recently active device that
+  counts. Not the first, not an average: the phone in your pocket is talking and
+  the laptop on the desk is not.
 
 Edge crossings do not change those rules; they supply the *evidence*, so an
 arrival reads "through the Driveway" rather than just "arrived". A departure is

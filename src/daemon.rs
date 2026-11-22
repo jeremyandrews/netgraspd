@@ -20,7 +20,7 @@
 //!   minute runs the job when it wakes rather than skipping a day.
 //! - **status** rewrites the runtime file `netgraspd stats` reads.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{IsTerminal, Write};
 use std::time::Duration;
 
@@ -146,6 +146,7 @@ pub async fn run(
             version: env!("CARGO_PKG_VERSION").to_string(),
             timezone,
             started_at: Timestamp::now(),
+            presence_tracking: config.presence_tracking,
         }
     };
 
@@ -166,7 +167,21 @@ pub async fn run(
             Err(err) => tracing::warn!(%err, "could not close stale location stays"),
         }
 
-        let registry = build_registry(&client, config, &records).await;
+        let mut registry = build_registry(&client, config, &records).await;
+        // Everybody is re-evaluated from the devices, the global switch and
+        // their own, in silence: a restart is not the household arriving, and
+        // switching tracking off in the config is not the household leaving.
+        let settled = registry.settle_all();
+        write_person_updates(&client, &settled.updates).await;
+        tracing::info!(
+            presence_tracking = config.presence_tracking,
+            tracked = registry
+                .people()
+                .iter()
+                .filter(|p| p.state != people::PersonState::Untracked)
+                .count(),
+            "presence tracking settled"
+        );
         let learning = opts.learn || (config.learning.on_first_run && count == 0);
         let mut manager = Manager::new(config.state.clone(), learning);
         manager.set_owned(registry.owned_macs());
@@ -703,20 +718,7 @@ async fn record_people(
         return 0;
     }
     if let Ok(client) = db.client().await {
-        for update in &outcome.updates {
-            if let Err(err) = queries::update_person(
-                &client,
-                &update.item_id,
-                update.state.as_str(),
-                update.current_location.as_deref(),
-                update.last_arrived_at,
-                update.last_departed_at,
-            )
-            .await
-            {
-                tracing::warn!(person = %update.item_id, %err, "could not update a person");
-            }
-        }
+        write_person_updates(&client, &outcome.updates).await;
     } else {
         tracing::warn!("could not write people: no database connection");
     }
@@ -733,6 +735,24 @@ async fn record_people(
         recorded += apply(db, persister, bus, &effects).await;
     }
     recorded
+}
+
+/// Writes the daemon-owned columns of each person given.
+async fn write_person_updates(client: &queries::Client, updates: &[people::PersonUpdate]) {
+    for update in updates {
+        if let Err(err) = queries::update_person(
+            client,
+            &update.item_id,
+            update.state.as_str(),
+            update.current_location.as_deref(),
+            update.last_arrived_at,
+            update.last_departed_at,
+        )
+        .await
+        {
+            tracing::warn!(person = %update.item_id, %err, "could not update a person");
+        }
+    }
 }
 
 /// What one round of enrichment produced.
@@ -1029,11 +1049,16 @@ async fn build_registry(
     let mut owners: Vec<(MacAddr, String)> = Vec::new();
     let mut config_owners: Vec<(MacAddr, String)> = Vec::new();
 
+    let mut config_tracked: Vec<String> = Vec::new();
+
     for person in &config.people {
         let name = person.name.trim();
         match queries::ensure_person(client, name, person.notify_arrive, person.notify_depart).await
         {
             Ok(item_id) => {
+                if person.track_presence {
+                    config_tracked.push(item_id.clone());
+                }
                 for mac in person.macs() {
                     owners.push((mac, item_id.clone()));
                     config_owners.push((mac, item_id.clone()));
@@ -1065,6 +1090,24 @@ async fn build_registry(
         config_owners,
     }
     .into_registry();
+    registry.set_tracking(config.presence_tracking);
+    for item_id in config_tracked {
+        registry.set_config_tracked(item_id);
+    }
+    // Which devices count: the person's override where there is one, the
+    // classified type where there is not. A failed read leaves every override
+    // at "by type", which is the default anyway.
+    let overrides: HashMap<MacAddr, Option<bool>> = match queries::load_user_settings(client).await
+    {
+        Ok(settings) => settings
+            .into_iter()
+            .map(|s| (s.mac, s.counts_for_presence))
+            .collect(),
+        Err(err) => {
+            tracing::warn!(%err, "could not read which devices count for presence; deciding by type");
+            HashMap::new()
+        }
+    };
     // Seed device states without announcing anything: the whole household being
     // home is not news every time the daemon restarts.
     for record in records {
@@ -1072,6 +1115,16 @@ async fn build_registry(
             record.mac,
             record.state != DeviceState::Offline,
             record.last_seen_at,
+        );
+        registry.restore_location(
+            record.mac,
+            record.current_ap.clone(),
+            record.current_location.clone(),
+        );
+        registry.set_presence_settings(
+            record.mac,
+            overrides.get(&record.mac).copied().flatten(),
+            record.device_type.clone(),
         );
     }
     registry
@@ -1225,8 +1278,21 @@ pub async fn reconcile_user_state(db: &Db, manager: &mut Manager, registry: &mut
         .iter()
         .map(|setting| (setting.mac, setting.owner_item_id.clone()))
         .collect();
-    let changes = registry.reconcile(people, &owners);
+    let mut changes = registry.reconcile(people, &owners);
     manager.set_owned(registry.owned_macs());
+    // The type is the daemon's own and newer in memory than in the row; the
+    // override is the person's and only in the row.
+    let presence: Vec<(MacAddr, Option<bool>, Option<String>)> = settings
+        .iter()
+        .map(|setting| {
+            (
+                setting.mac,
+                setting.counts_for_presence,
+                manager.device_type_of(setting.mac),
+            )
+        })
+        .collect();
+    changes.extend(registry.reconcile_presence(&presence));
     for change in &changes {
         match change {
             people::RegistryChange::PersonAdded { item_id, name } => {
@@ -1265,8 +1331,39 @@ pub async fn reconcile_user_state(db: &Db, manager: &mut Manager, registry: &mut
                     registry.restore_device(*mac, state != DeviceState::Offline, last_seen_at);
                 }
             }
+            people::RegistryChange::PresenceSettingChanged {
+                mac,
+                column,
+                from,
+                to,
+            } => {
+                tracing::info!(%mac, column, %from, %to, "a presence setting changed");
+            }
         }
     }
+
+    // Re-evaluate everybody whose presence inputs changed, on this tick, from
+    // the devices that count now. Their devices are reseeded from the device
+    // table first, silently, because the registry's own view of a device that
+    // did not count, or of a person who was not tracked, may be stale. What
+    // comes out is written as their new state and announced to nobody.
+    for mac in registry.unsettled_devices() {
+        if let Some((state, last_seen_at)) = manager.state_of(mac) {
+            registry.restore_device(mac, state != DeviceState::Offline, last_seen_at);
+            let (ap, location) = manager.place_of(mac);
+            registry.restore_location(mac, ap, location);
+        }
+    }
+    let settled = registry.settle();
+    for update in &settled.updates {
+        tracing::info!(
+            person = %update.item_id,
+            state = %update.state,
+            "a person's presence was re-evaluated after a settings change"
+        );
+    }
+    write_person_updates(&client, &settled.updates).await;
+
     if changes.is_empty() {
         tracing::debug!(
             devices = settings.len(),
@@ -1283,6 +1380,7 @@ fn person_from_record(row: queries::PersonRecord) -> people::Person {
         name: row.name,
         notify_arrive: row.notify_arrive,
         notify_depart: row.notify_depart,
+        track_presence: row.track_presence,
         state: people::PersonState::from_db(&row.state),
         current_location: row.current_location,
         last_arrived_at: row.last_arrived_at,

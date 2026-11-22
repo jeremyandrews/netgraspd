@@ -78,7 +78,11 @@ impl Harness {
         Harness {
             manager: Manager::new(state_config(), false),
             persister: Persister::new(),
-            registry: Registry::new(),
+            registry: {
+                let mut registry = Registry::new();
+                registry.set_tracking(true);
+                registry
+            },
             map: house(),
             person_events: Vec::new(),
         }
@@ -188,14 +192,31 @@ impl Harness {
             name: name.to_string(),
             notify_arrive: true,
             notify_depart: true,
-            state: PersonState::Away,
+            track_presence: true,
+            // As the row is created: untracked until settled.
+            state: PersonState::Untracked,
             current_location: None,
             last_arrived_at: None,
             last_departed_at: None,
         });
+        // Switched on in the database too, so a reconcile reads the same.
+        client
+            .execute(
+                "UPDATE ng_people SET track_presence = TRUE WHERE item_id = ($1::text)::uuid",
+                &[&item_id],
+            )
+            .await
+            .expect("switching tracking on");
         for m in macs {
             self.registry.set_owner(mac(m), item_id.clone());
+            // The devices here are seen over ARP alone, so nothing classifies
+            // them: each counts because somebody said so, as the plugin's
+            // "Counts" choice does.
+            self.registry
+                .set_presence_settings(mac(m), Some(true), None);
         }
+        let settled = self.registry.settle();
+        self.record(db, settled).await;
         item_id
     }
 
@@ -595,7 +616,7 @@ async fn the_daemon_never_writes_a_plugin_owned_person_column() {
     client
         .execute(
             "UPDATE ng_people SET name = 'Jeremiah', notes = 'edited in the admin UI',
-                                  notify_arrive = FALSE
+                                  notify_arrive = FALSE, track_presence = TRUE
               WHERE item_id = ($1::text)::uuid",
             &[&item_id],
         )
@@ -619,6 +640,7 @@ async fn the_daemon_never_writes_a_plugin_owned_person_column() {
         "the daemon did not undo the rename"
     );
     assert!(!people[0].notify_arrive, "nor the notification choice");
+    assert!(people[0].track_presence, "nor the tracking choice");
     assert_eq!(people[0].state, "home");
     assert_eq!(people[0].current_location.as_deref(), Some("Kitchen"));
 }
@@ -725,7 +747,9 @@ async fn a_person_renamed_in_trovato_is_announced_under_the_new_name_without_a_r
     client
         .batch_execute(&format!(
             "UPDATE ng_people SET name = 'Jeremy Andrews' WHERE item_id = '{person}'::uuid;
-             UPDATE ng_devices SET owner_item_id = '{person}'::uuid WHERE mac = '{PHONE}';"
+             UPDATE ng_devices SET owner_item_id = '{person}'::uuid,
+                                   counts_for_presence = TRUE
+              WHERE mac = '{PHONE}';"
         ))
         .await
         .expect("the plugin's write");
@@ -745,4 +769,126 @@ async fn a_person_renamed_in_trovato_is_announced_under_the_new_name_without_a_r
         panic!("a person event is one recordable event: {effects:?}");
     };
     assert_eq!(event.display_name, "Jeremy Andrews");
+}
+
+/// The person state and location as `ng_people` holds them.
+async fn stored_state(db: &common::TestDb, item_id: &str) -> (String, Option<String>) {
+    let client = db.client().await;
+    let row = client
+        .query_one(
+            "SELECT state, current_location FROM ng_people WHERE item_id = ($1::text)::uuid",
+            &[&item_id],
+        )
+        .await
+        .expect("the person row");
+    (row.get(0), row.get(1))
+}
+
+/// How many person events `ng_events` holds.
+async fn person_event_count(db: &common::TestDb) -> i64 {
+    db.scalar("SELECT COUNT(*) FROM ng_events WHERE event_type LIKE 'person\\_%'")
+        .await
+}
+
+#[tokio::test]
+async fn a_laptop_switched_off_as_a_presence_device_settles_its_owner_away_on_the_next_tick() {
+    let Some(db) = common::test_db().await else {
+        return;
+    };
+    let mut h = Harness::new();
+    let person = h.add_person(&db, "Alex", &[PHONE, LAPTOP]).await;
+    h.see(&db, PHONE, base()).await;
+    h.see(&db, LAPTOP, at(10)).await;
+    assert_eq!(h.kinds(), vec![EventType::PersonArrived]);
+
+    // What the plugin holds: both devices theirs, both switched on.
+    let client = db.client().await;
+    client
+        .batch_execute(&format!(
+            "UPDATE ng_devices SET owner_item_id = '{person}'::uuid, counts_for_presence = TRUE
+              WHERE mac IN ('{PHONE}', '{LAPTOP}')"
+        ))
+        .await
+        .expect("the plugin's write");
+    netgraspd::daemon::reconcile_user_state(&db.db, &mut h.manager, &mut h.registry).await;
+
+    // The phone leaves; the laptop keeps them home because it counts.
+    h.see(&db, LAPTOP, at(19_000)).await;
+    h.sweep(&db, at(20_000)).await;
+    assert_eq!(stored_state(&db, &person).await.0, "home");
+    let events_before = person_event_count(&db).await;
+    let departed_before = queries::load_people(&client).await.expect("people")[0].last_departed_at;
+
+    // Somebody says the laptop does not count, and the next tick acts on it.
+    client
+        .batch_execute(&format!(
+            "UPDATE ng_devices SET counts_for_presence = FALSE WHERE mac = '{LAPTOP}'"
+        ))
+        .await
+        .expect("the plugin's write");
+    netgraspd::daemon::reconcile_user_state(&db.db, &mut h.manager, &mut h.registry).await;
+
+    assert_eq!(stored_state(&db, &person).await, ("away".to_string(), None));
+    assert_eq!(
+        h.registry.person(&person).expect("the person").state,
+        PersonState::Away
+    );
+    assert_eq!(
+        person_event_count(&db).await,
+        events_before,
+        "a settings change is nobody leaving: no event, so nothing to deliver"
+    );
+    assert_eq!(
+        queries::load_people(&client).await.expect("people")[0].last_departed_at,
+        departed_before,
+        "and no departure time either"
+    );
+}
+
+#[tokio::test]
+async fn switching_a_person_s_tracking_off_makes_them_untracked_and_silent() {
+    let Some(db) = common::test_db().await else {
+        return;
+    };
+    let mut h = Harness::new();
+    let person = h.add_person(&db, "Alex", &[PHONE]).await;
+    h.see(&db, PHONE, base()).await;
+    let client = db.client().await;
+    client
+        .batch_execute(&format!(
+            "UPDATE ng_devices SET owner_item_id = '{person}'::uuid, counts_for_presence = TRUE
+              WHERE mac = '{PHONE}';
+             UPDATE ng_people SET track_presence = FALSE WHERE item_id = '{person}'::uuid;"
+        ))
+        .await
+        .expect("the plugin's write");
+    let events_before = person_event_count(&db).await;
+    netgraspd::daemon::reconcile_user_state(&db.db, &mut h.manager, &mut h.registry).await;
+    assert_eq!(
+        stored_state(&db, &person).await,
+        ("untracked".to_string(), None)
+    );
+
+    // Going and coming back says nothing about somebody nobody is tracking.
+    h.sweep(&db, at(20_000)).await;
+    h.see(&db, PHONE, at(20_100)).await;
+    assert_eq!(person_event_count(&db).await, events_before);
+    assert_eq!(stored_state(&db, &person).await.0, "untracked");
+}
+
+#[tokio::test]
+async fn with_presence_tracking_off_for_the_install_nobody_is_tracked() {
+    let Some(db) = common::test_db().await else {
+        return;
+    };
+    let mut h = Harness::new();
+    let person = h.add_person(&db, "Alex", &[PHONE]).await;
+    h.registry.set_tracking(false);
+    let settled = h.registry.settle();
+    h.record(&db, settled).await;
+    assert_eq!(stored_state(&db, &person).await.0, "untracked");
+    h.see(&db, PHONE, base()).await;
+    h.sweep(&db, at(20_000)).await;
+    assert_eq!(person_event_count(&db).await, 0);
+    assert_eq!(stored_state(&db, &person).await.0, "untracked");
 }

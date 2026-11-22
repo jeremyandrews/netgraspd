@@ -279,6 +279,18 @@ pub struct Config {
     ///
     /// A top-level key, so in a TOML file it goes above the first `[section]`.
     pub timezone: Option<String>,
+    /// Whether the daemon keeps track of who is home at all. Off unless set.
+    ///
+    /// With this off every person is `untracked`: no location, never home or
+    /// away, and no `person_arrived`, `person_departed` or
+    /// `person_location_changed` events. With it on, a person is tracked only
+    /// when their own `track_presence` is on as well (set from the Trovato
+    /// person page, or `track_presence = true` in their `[[people]]` entry) and
+    /// they own a device that counts. Published in
+    /// `ng_daemon_status.presence_tracking` so the web side can say it is off.
+    ///
+    /// A top-level key, so in a TOML file it goes above the first `[section]`.
+    pub presence_tracking: bool,
     /// Postgres connection and pool settings.
     pub database: DatabaseConfig,
     /// Which interfaces and protocols to listen to.
@@ -1729,6 +1741,10 @@ pub struct PersonConfig {
     pub notify_arrive: bool,
     /// Notify when they leave.
     pub notify_depart: bool,
+    /// Keep track of whether they are home. Either this or the person's
+    /// `ng_people.track_presence` switches it on; the install's
+    /// `presence_tracking` has to be on too.
+    pub track_presence: bool,
 }
 
 impl PersonConfig {

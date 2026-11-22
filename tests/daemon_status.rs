@@ -221,6 +221,7 @@ async fn a_configured_time_zone_is_published_and_a_day_is_measured_in_it() {
         version: env!("CARGO_PKG_VERSION").to_string(),
         timezone: zone,
         started_at: at(0),
+        presence_tracking: true,
     };
     status::write_daemon_status(&client, &daemon, at(10))
         .await
@@ -229,6 +230,12 @@ async fn a_configured_time_zone_is_published_and_a_day_is_measured_in_it() {
         .await
         .expect("writing it again");
     assert_eq!(db.count("ng_daemon_status").await, 1, "one row, rewritten");
+    assert_eq!(
+        db.scalar("SELECT COUNT(*) FROM ng_daemon_status WHERE presence_tracking")
+            .await,
+        1,
+        "the presence switch is published for the web side"
+    );
     assert_eq!(
         db.scalar("SELECT updated_at_epoch FROM ng_daemon_status")
             .await,
@@ -388,4 +395,101 @@ async fn person_events_recorded_before_the_column_existed_are_backfilled() {
         .batch_execute("DROP DATABASE IF EXISTS netgrasp_backfill_test WITH (FORCE)")
         .await
         .expect("dropping the scratch database");
+}
+
+/// Proves the V7 upgrade from a database left at `version`: every existing
+/// person becomes untracked with no location, every device decides by type, and
+/// the schema still matches the contract.
+async fn presence_upgrade_from(version: u32) {
+    let Some(_db) = common::test_db().await else {
+        return;
+    };
+    let name = format!("netgrasp_presence_upgrade_v{version}");
+    let Some(url) = scratch_database(&name, version).await else {
+        return;
+    };
+    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .expect("the scratch database");
+    tokio::spawn(connection);
+    client
+        .batch_execute(
+            "INSERT INTO ng_people (item_id, name, state, current_location, last_arrived_at)
+                 VALUES ('11111111-2222-3333-4444-555555555555', 'Alex', 'home', 'Kitchen', now()),
+                        ('66666666-7777-8888-9999-000000000000', 'Sam', 'away', NULL, NULL);
+             INSERT INTO ng_devices (mac, state, first_seen_at, last_seen_at, device_type,
+                                     owner_item_id)
+                 VALUES ('3c:22:fb:00:00:01', 'online', now(), now(), 'phone',
+                         '11111111-2222-3333-4444-555555555555'),
+                        ('3c:22:fb:00:00:02', 'online', now(), now(), 'computer',
+                         '11111111-2222-3333-4444-555555555555');
+             INSERT INTO ng_daemon_status (version, timezone, timezone_source, started_at,
+                                           updated_at)
+                 VALUES ('1.1.0', 'UTC', 'database', now(), now());",
+        )
+        .await
+        .expect("seeding rows as the earlier release left them");
+
+    Db::migrate(&url).await.expect("the upgrade applies");
+
+    let count = |sql: &'static str| {
+        let client = &client;
+        async move {
+            let row = client.query_one(sql, &[]).await.expect(sql);
+            row.get::<_, i64>(0)
+        }
+    };
+    assert_eq!(
+        count("SELECT COUNT(*) FROM ng_people WHERE state = 'untracked'").await,
+        2,
+        "everybody is untracked: the new default is off"
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM ng_people WHERE current_location IS NOT NULL").await,
+        0
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM ng_people WHERE track_presence").await,
+        0
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM ng_devices WHERE counts_for_presence IS NULL").await,
+        2,
+        "every device decides by type"
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM ng_daemon_status WHERE NOT presence_tracking").await,
+        1
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM ng_people WHERE last_arrived_at IS NOT NULL").await,
+        1,
+        "history is left alone"
+    );
+    // A person the plugin creates afterwards starts untracked as well.
+    client
+        .batch_execute(
+            "INSERT INTO ng_people (item_id, name)
+                 VALUES ('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', 'Robin')",
+        )
+        .await
+        .expect("a new person");
+    assert_eq!(
+        count("SELECT COUNT(*) FROM ng_people WHERE state = 'untracked' AND NOT track_presence")
+            .await,
+        3
+    );
+    netgraspd::db::schema::preflight(&client)
+        .await
+        .expect("the upgraded schema matches the contract");
+}
+
+#[tokio::test]
+async fn the_presence_upgrade_from_the_1_1_0_schema_leaves_everybody_untracked() {
+    presence_upgrade_from(5).await;
+}
+
+#[tokio::test]
+async fn the_presence_upgrade_from_the_previous_schema_leaves_everybody_untracked() {
+    presence_upgrade_from(6).await;
 }

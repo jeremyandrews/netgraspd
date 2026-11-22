@@ -111,6 +111,7 @@ pub const EXPECTED: &[(&str, &[ExpectedColumn])] = &[
             null("owner_item_id", "uuid"),
             null("first_seen_at_epoch", "bigint"),
             null("last_seen_at_epoch", "bigint"),
+            null("counts_for_presence", "boolean"),
         ],
     ),
     (
@@ -194,6 +195,7 @@ pub const EXPECTED: &[(&str, &[ExpectedColumn])] = &[
             null("last_departed_at", TS),
             null("last_arrived_at_epoch", "bigint"),
             null("last_departed_at_epoch", "bigint"),
+            not_null("track_presence", "boolean"),
         ],
     ),
     (
@@ -207,6 +209,7 @@ pub const EXPECTED: &[(&str, &[ExpectedColumn])] = &[
             not_null("updated_at", TS),
             null("started_at_epoch", "bigint"),
             null("updated_at_epoch", "bigint"),
+            not_null("presence_tracking", "boolean"),
         ],
     ),
     (

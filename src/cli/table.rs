@@ -161,19 +161,29 @@ pub fn event_table(events: &[EventRecord], now: Timestamp) -> String {
 
 /// Renders the table shown by `netgraspd people`.
 ///
-/// Ordered home first, then by name, because the question somebody types this to
-/// answer is "who is in".
+/// Ordered home first, then away, then untracked, then by name, because the
+/// question somebody types this to answer is "who is in". An untracked person
+/// is shown as "not tracked" with no location and no "since": they are neither
+/// in nor out.
 #[must_use]
 pub fn people_table(people: &[PersonRecord], now: Timestamp) -> String {
+    let rank = |state: &str| match state {
+        "home" => 0,
+        "untracked" => 2,
+        _ => 1,
+    };
     let mut sorted: Vec<&PersonRecord> = people.iter().collect();
     sorted.sort_by(|a, b| {
-        (a.state != "home")
-            .cmp(&(b.state != "home"))
+        rank(&a.state)
+            .cmp(&rank(&b.state))
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
     let rows: Vec<Vec<String>> = sorted
         .iter()
         .map(|p| {
+            if p.state == "untracked" {
+                return vec![p.name.clone(), "not tracked".into(), "-".into(), "-".into()];
+            }
             let since = if p.state == "home" {
                 p.last_arrived_at
             } else {
@@ -417,5 +427,41 @@ mod tests {
     fn non_object_details_do_not_panic() {
         assert_eq!(detail_summary(&serde_json::Value::Null), "");
         assert_eq!(detail_summary(&serde_json::json!([1, 2, 3])), "");
+    }
+
+    fn person_record(name: &str, state: &str) -> PersonRecord {
+        PersonRecord {
+            item_id: format!("id-{name}"),
+            name: name.into(),
+            notify_arrive: false,
+            notify_depart: false,
+            track_presence: state != "untracked",
+            state: state.into(),
+            current_location: (state == "home").then(|| "Kitchen".to_string()),
+            last_arrived_at: Some(now() - SignedDuration::from_secs(600)),
+            last_departed_at: Some(now() - SignedDuration::from_secs(3600)),
+        }
+    }
+
+    #[test]
+    fn an_untracked_person_is_listed_last_as_not_tracked_and_never_as_away() {
+        let table = people_table(
+            &[
+                person_record("Robin", "untracked"),
+                person_record("Sam", "away"),
+                person_record("Alex", "home"),
+            ],
+            now(),
+        );
+        let lines: Vec<&str> = table.lines().collect();
+        assert!(lines[2].starts_with("Alex"), "{table}");
+        assert!(lines[3].starts_with("Sam"), "{table}");
+        assert!(lines[4].starts_with("Robin"), "{table}");
+        assert!(lines[4].contains("not tracked"), "{table}");
+        assert!(!lines[4].contains("away"), "{table}");
+        assert!(
+            !lines[4].contains("ago"),
+            "no since for somebody untracked: {table}"
+        );
     }
 }
